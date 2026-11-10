@@ -29,7 +29,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::sdpd::DeviceEvent;
 
@@ -217,7 +217,7 @@ fn sync_paired(i: &mut Inner) {
 /// Rows carrying a persistent pairing bond — authority for
 /// `generic_agent_get_paired_devices` (consumers read `entries[]` /
 /// `pairedDevices`, e.g. gaPairBoundStatus).
-pub fn paired_rows() -> Vec<Value> {
+pub fn paired_rows() -> Vec<DeviceRow> {
     let mut i = inner().lock().expect("devices lock poisoned");
     refresh_ephemeral(&mut i);
     sync_paired(&mut i);
@@ -227,9 +227,7 @@ pub fn paired_rows() -> Vec<Value> {
         .filter(|r| r.is_paired && !usb_hidden(r, usb_lane_on()))
         .collect();
     rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-    rows.iter()
-        .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
-        .collect()
+    rows.into_iter().cloned().collect()
 }
 
 /// User-initiated device removal (`generic_agent_settings_remove_device`,
@@ -367,12 +365,23 @@ pub fn tick() {
     rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
     drop(i);
     for row in rows {
-        let row_json = serde_json::to_value(&row).unwrap_or_default();
+        let frame = BusEventFrame {
+            event: PUSH_EVENT,
+            data: &row,
+        };
         crate::gui::bus_publish(
             RENDERER_EVENT_CHANNEL,
-            json!({ "event": PUSH_EVENT, "data": row_json }),
+            serde_json::to_value(&frame).unwrap_or_default(),
         );
     }
+}
+
+/// One bus row push: `{event, data}` with `data` as a JSON object (never
+/// a stringified blob — consumers iterate it).
+#[derive(Serialize)]
+struct BusEventFrame<'a> {
+    event: &'static str,
+    data: &'a DeviceRow,
 }
 
 const RENDERER_EVENT_CHANNEL: &str = "ipc_renderer_event";
@@ -400,31 +409,26 @@ pub fn is_subscribed(name: &str) -> bool {
 /// Rows for `ipc_invoke`/bus routes and `/__devices`.
 pub fn rows_json() -> Value {
     let mut i = inner().lock().expect("devices lock poisoned");
-    Value::Array(visible_rows(&mut i))
+    serde_json::to_value(visible_rows(&mut i)).unwrap_or_else(|_| Value::Array(Vec::new()))
 }
 
 /// Serializable visible rows (sorted, ephemeral flags refreshed, stale
-/// rows pruned).
-fn visible_rows(i: &mut Inner) -> Vec<Value> {
+/// rows pruned) as typed rows — the API surface; `rows_json` is its
+/// serialization boundary.
+pub fn visible_device_rows() -> Vec<DeviceRow> {
+    let mut i = inner().lock().expect("devices lock poisoned");
+    visible_rows(&mut i)
+}
+
+fn visible_rows(i: &mut Inner) -> Vec<DeviceRow> {
     visible_rows_gated(i, usb_lane_on())
 }
 
-fn visible_rows_gated(i: &mut Inner, usb_on: bool) -> Vec<Value> {
+fn visible_rows_gated(i: &mut Inner, usb_on: bool) -> Vec<DeviceRow> {
     refresh_ephemeral(i);
     let mut rows: Vec<&DeviceRow> = i.rows.values().filter(|r| !usb_hidden(r, usb_on)).collect();
     rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-    rows.iter()
-        .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
-        .collect()
-}
-
-/// Backend lane status for the `lplus_sidecar_status` probe. `logTailing`
-/// keeps its historical field name but now names the presence lane.
-pub fn sidecar_status() -> Value {
-    json!({
-        "running": crate::gui::backend_up(),
-        "logTailing": "in-process backend",
-    })
+    rows.into_iter().cloned().collect()
 }
 
 // ------------------------------------------------------------------ events
@@ -932,21 +936,21 @@ mod tests {
         let rows = visible_rows(&mut i);
         assert_eq!(rows.len(), 1, "exactly the phone is visible: {rows:?}");
         let row = &rows[0];
-        assert_eq!(row["deviceId"], "192-0-2-2");
-        assert_eq!(row["protcol_device_id"], "192-0-2-2");
-        assert_eq!(row["deviceName"], "CPH2745");
-        assert_eq!(row["isConnected"], true);
-        assert_eq!(row["isDiscovered"], true);
+        assert_eq!(row.device_id, "192-0-2-2");
+        assert_eq!(row.protcol_device_id, "192-0-2-2");
+        assert_eq!(row.device_name, "CPH2745");
+        assert!(row.is_connected);
+        assert!(row.is_discovered);
 
         // epi close flips connected off but keeps the row (presence TTL).
         ev(&mut i, "epi", "192.0.2.2", None, false);
         let rows = visible_rows(&mut i);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["isConnected"], false);
+        assert!(!rows[0].is_connected);
 
         // KMS session traffic also drives the connected flag.
         ev(&mut i, "kms", "192.0.2.2", None, true);
-        assert_eq!(visible_rows(&mut i)[0]["isConnected"], true);
+        assert!(visible_rows(&mut i)[0].is_connected);
     }
 
     #[test]
@@ -960,7 +964,7 @@ mod tests {
         ev(&mut i, "announce", "192.0.2.6", None, false);
         let rows = visible_rows(&mut i);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["deviceId"], "192-0-2-2");
+        assert_eq!(rows[0].device_id, "192-0-2-2");
         assert!(!i.rows.contains_key("192.0.2.6"));
     }
 
@@ -990,11 +994,11 @@ mod tests {
         let mut i = Inner::default();
         // epi mints the row with a Phone fallback…
         ev(&mut i, "epi", "192.0.2.2", None, true);
-        assert_eq!(visible_rows(&mut i)[0]["deviceName"], "Phone 2");
+        assert_eq!(visible_rows(&mut i)[0].device_name, "Phone 2");
         // …scp_sync supplies the real model, and junk never overwrites it.
         ev(&mut i, "scp_sync", "192.0.2.2", Some("CPH2745"), true);
         ev(&mut i, "scp_sync", "192.0.2.2", Some("ok"), true);
-        assert_eq!(visible_rows(&mut i)[0]["deviceName"], "CPH2745");
+        assert_eq!(visible_rows(&mut i)[0].device_name, "CPH2745");
     }
 
     #[test]
@@ -1013,7 +1017,7 @@ mod tests {
     fn connected_flag_requires_fresh_link_evidence() {
         let mut i = Inner::default();
         ev(&mut i, "epi", "192.0.2.7", None, true);
-        assert_eq!(visible_rows(&mut i)[0]["isConnected"], true);
+        assert!(visible_rows(&mut i)[0].is_connected);
         // Silent beyond the window (phone vanished without a FIN): the
         // row stays inside the TTL but must stop claiming Connected.
         for row in i.rows.values_mut() {
@@ -1021,10 +1025,10 @@ mod tests {
         }
         let rows = visible_rows(&mut i);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["isConnected"], false);
+        assert!(!rows[0].is_connected);
         // Fresh link evidence re-asserts it.
         ev(&mut i, "epi", "192.0.2.7", None, true);
-        assert_eq!(visible_rows(&mut i)[0]["isConnected"], true);
+        assert!(visible_rows(&mut i)[0].is_connected);
     }
 
     #[test]
@@ -1034,16 +1038,20 @@ mod tests {
         assert!(usb_hidden(&usb_row("B", true), false));
         assert!(!usb_hidden(&usb_row("B", true), true));
         let mut i = Inner::default();
-        i.rows.insert("usb:BONDED".to_string(), usb_row("BONDED", true));
+        i.rows
+            .insert("usb:BONDED".to_string(), usb_row("BONDED", true));
         ev(&mut i, "epi", "192.0.2.8", None, true);
         let rows = visible_rows_gated(&mut i, false);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["deviceId"], "192-0-2-8");
-        assert!(i.rows.contains_key("usb:BONDED"), "bond must persist hidden");
+        assert_eq!(rows[0].device_id, "192-0-2-8");
+        assert!(
+            i.rows.contains_key("usb:BONDED"),
+            "bond must persist hidden"
+        );
         // Lane on: the row shows again, untouched.
         let rows = visible_rows_gated(&mut i, true);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows.iter().filter(|r| r["connectType"] == 128).count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.connect_type == 128).count(), 1);
     }
 
     #[test]

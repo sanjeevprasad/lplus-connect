@@ -14,8 +14,15 @@ use std::collections::VecDeque;
 
 #[cfg(test)]
 use base64::{Engine as _, engine::general_purpose};
-use serde_json::{Value, json};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use strum::{Display, EnumIter, EnumString};
+
+use crate::gui::api::{self, ConnectAck, DeviceRow};
+use crate::ui::stores::connection::Device;
 
 /// Every IPC channel the ported UI invokes. `Display`/`FromStr` (strum)
 /// carry the vendor wire names — the same ones the Electron renderer sends
@@ -96,25 +103,67 @@ fn pairing_url_base() -> String {
 /// empty and the phone's pre-dial gate chain fills the rest. `Type` "4" is
 /// `ConnectType::WLAN` (§5.3).
 #[cfg(test)]
+#[derive(Serialize)]
+struct Synergy {
+    #[serde(rename = "Mac")]
+    mac: String,
+    #[serde(rename = "BluetoothMac")]
+    bluetooth_mac: String,
+    #[serde(rename = "Ssid")]
+    ssid: String,
+    #[serde(rename = "Pwd")]
+    pwd: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "ServerIp")]
+    server_ip: String,
+    #[serde(rename = "ServerPort")]
+    server_port: String,
+    #[serde(rename = "Type")]
+    conn_type: String,
+    #[serde(rename = "DeviceType")]
+    device_type: String,
+    #[serde(rename = "DeviceId")]
+    device_id: String,
+    #[serde(rename = "DeviceKsc")]
+    device_ksc: String,
+    #[serde(rename = "DeviceKscAlias")]
+    device_ksc_alias: String,
+    #[serde(rename = "ModelId")]
+    model_id: String,
+    #[serde(rename = "AdvFreq")]
+    adv_freq: String,
+    ver: u8,
+}
+
+#[cfg(test)]
 fn pairing_qr_param(host: &str) -> String {
-    let bean = json!({ "HeySynergy": {
-        "Mac": "",
-        "BluetoothMac": "",
-        "Ssid": "",
-        "Pwd": "",
-        "Name": host,
-        "ServerIp": std::env::var("LPLUS_VIP").unwrap_or_default(),
-        "ServerPort": std::env::var("LPLUS_CSP").unwrap_or_else(|_| "10152".to_string()),
-        "Type": "4",
-        "DeviceType": "SYNERGY_PC",
-        "DeviceId": std::env::var("LPLUS_PC_DEVICE_ID").unwrap_or_default(),
-        "DeviceKsc": "",
-        "DeviceKscAlias": "",
-        "ModelId": "",
-        "AdvFreq": "",
-        "ver": 1,
-    }});
-    general_purpose::STANDARD.encode(bean.to_string())
+    let bean = Synergy {
+        mac: String::new(),
+        bluetooth_mac: String::new(),
+        ssid: String::new(),
+        pwd: String::new(),
+        name: host.to_string(),
+        server_ip: std::env::var("LPLUS_VIP").unwrap_or_default(),
+        server_port: std::env::var("LPLUS_CSP").unwrap_or_else(|_| "10152".to_string()),
+        conn_type: "4".into(),
+        device_type: "SYNERGY_PC".into(),
+        device_id: std::env::var("LPLUS_PC_DEVICE_ID").unwrap_or_default(),
+        device_ksc: String::new(),
+        device_ksc_alias: String::new(),
+        model_id: String::new(),
+        adv_freq: String::new(),
+        ver: 1,
+    };
+    // Vendor GSON binds the wrapper `{"HeySynergy": <bean>}` with the
+    // declared field spellings.
+    #[derive(Serialize)]
+    struct HeySynergy<'a> {
+        #[serde(rename = "HeySynergy")]
+        bean: &'a Synergy,
+    }
+    let wrapper = HeySynergy { bean: &bean };
+    general_purpose::STANDARD.encode(serde_json::to_string(&wrapper).expect("synergy bean"))
 }
 
 /// Stateful fake vendor "main" — **test builds only**. Serves the two canned
@@ -132,6 +181,85 @@ pub struct MockMain {
 }
 
 #[cfg(test)]
+fn mock_wire<T: Serialize>(v: &T) -> Value {
+    serde_json::to_value(v).expect("mock response serializes")
+}
+
+/// Mock device row: the `DeviceRow` contract plus the demo `battery` the
+/// cards render (the daemon's real rows carry no battery yet).
+#[cfg(test)]
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MockDeviceRow {
+    device_id: String,
+    device_name: String,
+    ip: String,
+    is_connected: bool,
+    is_discovered: bool,
+    connect_type: u8,
+    device_type: u8,
+    last_seen: u64,
+    last_session: u64,
+    battery: u8,
+}
+
+#[cfg(test)]
+#[derive(Serialize)]
+struct MockDevices {
+    ok: bool,
+    devices: Vec<MockDeviceRow>,
+}
+
+#[cfg(test)]
+#[derive(Serialize)]
+struct MockPaired {
+    ok: bool,
+    entries: Vec<api::PairEntry>,
+    devices: Vec<MockDeviceRow>,
+    #[serde(rename = "pairedDevices")]
+    paired_devices: Vec<MockDeviceRow>,
+}
+
+#[cfg(test)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockHostName {
+    ok: bool,
+    host_name: String,
+}
+
+#[cfg(test)]
+#[derive(Serialize)]
+struct MockRepl {
+    ok: bool,
+    out: String,
+}
+
+#[cfg(test)]
+#[derive(Serialize)]
+struct MockCastPush {
+    ok: bool,
+    key: Value,
+}
+
+/// `get_general_config` demo answer shape (mock-only panel config probe).
+#[cfg(test)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockGeneralConfigBody {
+    language: String,
+    launch_at_login: bool,
+    auto_update: bool,
+}
+
+#[cfg(test)]
+#[derive(Serialize)]
+struct MockGeneralConfig {
+    ok: bool,
+    config: MockGeneralConfigBody,
+}
+
+#[cfg(test)]
 impl MockMain {
     pub fn new() -> Self {
         Self {
@@ -146,116 +274,182 @@ impl MockMain {
     pub fn invoke(&mut self, channel: Channel, args: Value) -> Value {
         match channel {
             Channel::ConnectedDeviceInfoList | Channel::UpdateDeviceInfo => {
-                let devices: Vec<Value> = self
+                let devices: Vec<MockDeviceRow> = self
                     .connected_ids
                     .iter()
-                    .filter_map(|id| Self::device_json(id.as_str()))
+                    .filter_map(|id| Self::device_row(id.as_str()))
                     .collect();
-                json!({ "ok": true, "devices": devices })
+                mock_wire(&MockDevices { ok: true, devices })
             }
-            Channel::DeviceFoundList => json!({
-                "ok": true,
-                "devices": [Self::mock_device("mock-phone-1", "OnePlus 12", false),
-                             Self::mock_device("mock-pad-1", "OnePlus Pad 2", false)]
+            Channel::DeviceFoundList => mock_wire(&MockDevices {
+                ok: true,
+                devices: vec![
+                    Self::mock_row("mock-phone-1", "OnePlus 12", false),
+                    Self::mock_row("mock-pad-1", "OnePlus Pad 2", false),
+                ],
             }),
             Channel::ConnectDevice => {
-                let Some(id) = args.get("deviceId").and_then(Value::as_str) else {
-                    return json!({ "ok": false, "error": "deviceId required" });
-                };
+                let parsed: api::ConnectArgs = serde_json::from_value(args).unwrap_or_default();
+                let id = parsed.device_id;
+                if id.is_empty() {
+                    return mock_wire(&ConnectAck {
+                        ok: false,
+                        ip: None,
+                        error: Some("deviceId required".into()),
+                        code_success: None,
+                    });
+                }
                 if !id.starts_with("mock-") {
-                    return json!({ "ok": false, "error": format!("unknown device {id}") });
+                    return mock_wire(&ConnectAck {
+                        ok: false,
+                        ip: None,
+                        error: Some(format!("unknown device {id}")),
+                        code_success: None,
+                    });
                 }
-                if !self.connected_ids.contains(&id.to_string()) {
-                    self.connected_ids.push(id.to_string());
+                if !self.connected_ids.contains(&id) {
+                    self.connected_ids.push(id);
                 }
-                json!({ "ok": true, "code_success": true })
+                mock_wire(&ConnectAck {
+                    ok: true,
+                    ip: None,
+                    error: None,
+                    code_success: Some(true),
+                })
             }
             Channel::DisconnectDevice => {
-                if let Some(id) = args.get("deviceId").and_then(Value::as_str) {
-                    self.connected_ids.retain(|c| c != id);
-                }
-                json!({ "ok": true })
+                let parsed: api::ConnectArgs = serde_json::from_value(args).unwrap_or_default();
+                self.connected_ids.retain(|c| *c != parsed.device_id);
+                mock_wire(&api::OkFlag::ok())
             }
-            Channel::OdmfStart => {
-                json!({ "ok": true, "listen": "0.0.0.0:7536", "rtp_port": "7537" })
-            }
-            Channel::OdmfStop => json!({ "ok": true }),
-            Channel::CastPush => {
-                json!({ "ok": true, "key": args.get("key").cloned().unwrap_or(Value::Null) })
-            }
-            Channel::GetGeneralConfig => json!({
-                "ok": true,
-                "config": { "language": "en", "launchAtLogin": false, "autoUpdate": true }
+            Channel::OdmfStart => mock_wire(&api::OdmfStartResp {
+                ok: true,
+                id: None,
+                pushes: None,
+                queued: None,
+                listen: Some("0.0.0.0:7536".into()),
+                rtp_port: Some("7537".into()),
+                error: None,
             }),
-            Channel::SettingsGetHostName => json!({ "ok": true, "hostName": self.host_name }),
-            Channel::SettingsSetHostName => match args
-                .get("hostName")
-                .or_else(|| args.get("name"))
-                .and_then(Value::as_str)
-            {
-                Some(name) if !name.trim().is_empty() => {
-                    self.host_name = name.trim().to_string();
-                    json!({ "ok": true })
+            Channel::OdmfStop => mock_wire(&api::OkFlag::ok()),
+            Channel::CastPush => mock_wire(&MockCastPush {
+                ok: true,
+                key: args.get("key").cloned().unwrap_or(Value::Null),
+            }),
+            Channel::GetGeneralConfig => mock_wire(&MockGeneralConfig {
+                ok: true,
+                config: MockGeneralConfigBody {
+                    language: "en".into(),
+                    launch_at_login: false,
+                    auto_update: true,
+                },
+            }),
+            Channel::SettingsGetHostName => mock_wire(&MockHostName {
+                ok: true,
+                host_name: self.host_name.clone(),
+            }),
+            Channel::SettingsSetHostName => {
+                let parsed: api::SetHostNameArgs = serde_json::from_value(args).unwrap_or_default();
+                let name = parsed.host_name.trim().to_string();
+                if name.is_empty() {
+                    mock_wire(&api::OkFlag::err("hostName required"))
+                } else {
+                    self.host_name = name;
+                    mock_wire(&api::OkFlag::ok())
                 }
-                _ => json!({ "ok": false, "error": "hostName required" }),
-            },
-            Channel::LplusStatus => json!({
-                "ok": true,
-                "backend_up": true,
-                "kms_listening": true,
-                "odmf": { "enabled": true, "listen": "0.0.0.0:7536" }
+            }
+            Channel::LplusStatus => mock_wire(&api::LplusStatus {
+                ok: true,
+                backend_up: true,
+                repl_port: crate::gui::cast::DEFAULT_REPL_PORT,
+                repl_enabled: true,
+                kms_listening: true,
+                odmf: api::OdmfInfo {
+                    enabled: true,
+                    listen: "0.0.0.0:7536".into(),
+                    rtp_port: "7537".into(),
+                    out_dir: String::new(),
+                    session_bin: api::FileInfo {
+                        exists: false,
+                        size: 0,
+                        mtime_secs: None,
+                    },
+                    video: api::FileInfo {
+                        exists: false,
+                        size: 0,
+                        mtime_secs: None,
+                    },
+                },
+                rtsp: api::RtspInfo {
+                    enabled: false,
+                    target: String::new(),
+                },
             }),
             Channel::ReplExec => {
-                json!({ "ok": true, "out": format!("(mock) {:#}", args.get("line").cloned().unwrap_or(Value::Null)) })
+                let parsed: api::ReplArgs = serde_json::from_value(args).unwrap_or_default();
+                mock_wire(&MockRepl {
+                    ok: true,
+                    out: format!("(mock) {:?}", parsed.line),
+                })
             }
-            Channel::UploadDownloadList => json!({ "ok": true, "items": [] }),
-            Channel::GetPairingQrCode => json!({
-                "ok": true,
-                "code": format!("{}?param={}", pairing_url_base(), pairing_qr_param(&self.host_name)),
+            Channel::UploadDownloadList => mock_wire(&api::UploadDownloadList {
+                ok: Some(true),
+                items: Some(Vec::new()),
             }),
-            Channel::IpcRegistry => Value::Array(self.audit.iter().map(|e| json!(e)).collect()),
-            Channel::GenericAgentEnsureRunning => json!({ "ok": true, "status": "idle" }),
+            Channel::GetPairingQrCode => mock_wire(&api::QrCode {
+                ok: Some(true),
+                code: Some(format!(
+                    "{}?param={}",
+                    pairing_url_base(),
+                    pairing_qr_param(&self.host_name)
+                )),
+            }),
+            Channel::IpcRegistry => mock_wire(&self.audit),
+            Channel::GenericAgentEnsureRunning => mock_wire(&api::EnsureRunning {
+                ok: true,
+                status: "idle".into(),
+            }),
             Channel::GenericAgentGetPairedDevices => {
-                let rows = vec![
-                    Self::mock_device("mock-phone-1", "OnePlus 12", false),
-                    Self::mock_device("mock-pad-1", "OnePlus Pad 2", false),
+                let rows: Vec<MockDeviceRow> = vec![
+                    Self::mock_row("mock-phone-1", "OnePlus 12", false),
+                    Self::mock_row("mock-pad-1", "OnePlus Pad 2", false),
                 ]
                 .into_iter()
-                .filter(|r| {
-                    !self
-                        .unpaired_ids
-                        .iter()
-                        .any(|u| Some(u.as_str()) == r["deviceId"].as_str())
-                })
-                .collect::<Vec<_>>();
-                let entries: Vec<Value> = rows
+                .filter(|r| !self.unpaired_ids.contains(&r.device_id))
+                .collect();
+                let entries = rows
                     .iter()
-                    .map(|r| {
-                        json!({
-                            "deviceId": r["deviceId"],
-                            "displayName": r["deviceName"],
-                        })
+                    .map(|r| api::PairEntry {
+                        device_id: r.device_id.clone(),
+                        display_name: r.device_name.clone(),
                     })
                     .collect();
-                json!({
-                    "ok": true,
-                    "entries": entries,
-                    "devices": rows.clone(),
-                    "pairedDevices": rows,
+                mock_wire(&MockPaired {
+                    ok: true,
+                    entries,
+                    devices: rows.clone(),
+                    paired_devices: rows,
                 })
             }
-            Channel::GenericAgentGetLocalDeviceId => json!("mock-pc-001"),
-            Channel::GenericAgentGetCloudBind => {
-                json!({ "ok": true, "bound": false, "record": null })
-            }
+            Channel::GenericAgentGetLocalDeviceId => Value::String("mock-pc-001".into()),
+            Channel::GenericAgentGetCloudBind => mock_wire(&api::CloudBind {
+                ok: true,
+                bound: false,
+                record: None,
+            }),
             Channel::GenericAgentSettingsRemoveDevice => {
-                let id = args.get("device_id").and_then(Value::as_str).unwrap_or("");
-                let served = matches!(id, "mock-phone-1" | "mock-pad-1")
-                    && !self.unpaired_ids.iter().any(|u| u == id);
+                let parsed: api::RemoveDeviceArgs =
+                    serde_json::from_value(args).unwrap_or_default();
+                let id = parsed.device_id;
+                let served = matches!(id.as_str(), "mock-phone-1" | "mock-pad-1")
+                    && !self.unpaired_ids.contains(&id);
                 if served {
-                    self.unpaired_ids.push(id.to_string());
+                    self.unpaired_ids.push(id.clone());
                 }
-                json!({ "ok": served, "deviceId": id })
+                mock_wire(&api::RemoveDeviceResp {
+                    ok: served,
+                    device_id: id,
+                })
             }
             // Pending channels keep the vendor contract: typed unhandled + audit.
             pending => {
@@ -269,7 +463,7 @@ impl MockMain {
     fn unhandled(&mut self, channel: Channel) -> Value {
         let name = channel.to_string();
         self.record_unhandled(&name);
-        json!({ "ok": false, "__unhandled": name })
+        mock_wire(&api::Unhandled::new(name))
     }
 
     /// Raw-name entry point for channels outside the typed set; keeps the
@@ -279,7 +473,7 @@ impl MockMain {
             Ok(channel) => self.invoke(channel, args),
             Err(_) => {
                 self.record_unhandled(name);
-                json!({ "ok": false, "__unhandled": name })
+                mock_wire(&api::Unhandled::new(name))
             }
         }
     }
@@ -296,28 +490,30 @@ impl MockMain {
         self.audit.iter().cloned().collect()
     }
 
-    fn mock_device(id: &str, name: &str, connected: bool) -> Value {
-        json!({
-            "deviceId": id,
-            "deviceName": name,
-            "ip": "192.0.2.3",
-            "isConnected": connected,
-            "isDiscovered": true,
-            "connectType": 2,   // P2P per vendor CONNECT_TYPE
-            "deviceType": if id.contains("pad") { 10 } else { 8 }, // PAD:10 PHONE:8
-            "lastSeen": 0,
-            "lastSession": 0,
-            "battery": 78,
-        })
+    fn mock_row(id: &str, name: &str, connected: bool) -> MockDeviceRow {
+        MockDeviceRow {
+            device_id: id.to_string(),
+            device_name: name.to_string(),
+            ip: "192.0.2.3".into(),
+            is_connected: connected,
+            is_discovered: true,
+            // P2P per vendor CONNECT_TYPE
+            connect_type: 2,
+            // vendor DEVICE_TYPE: PAD:10 PHONE:8
+            device_type: if id.contains("pad") { 10 } else { 8 },
+            last_seen: 0,
+            last_session: 0,
+            battery: 78,
+        }
     }
 
-    fn device_json(id: &str) -> Option<Value> {
+    fn device_row(id: &str) -> Option<MockDeviceRow> {
         let name = match id {
             "mock-phone-1" => "OnePlus 12",
             "mock-pad-1" => "OnePlus Pad 2",
             _ => return None,
         };
-        Some(Self::mock_device(id, name, true))
+        Some(Self::mock_row(id, name, true))
     }
 }
 
@@ -337,17 +533,28 @@ pub struct HttpBackend {
     pub addr: SocketAddr,
 }
 
+/// `POST /__ipc` request envelope (`{cmd,args}`), typed both directions
+/// of the client edge.
+#[derive(Serialize)]
+struct IpcEnvelope<'a, A: Serialize + ?Sized> {
+    cmd: &'a str,
+    args: &'a A,
+}
+
 impl HttpBackend {
     fn post(&self, channel: &str, args: &Value) -> std::io::Result<Value> {
-        let direct = self.post_raw(json!({ "cmd": channel, "args": args }))?;
+        let direct = self.post_raw(&IpcEnvelope { cmd: channel, args })?;
         if direct.get("__unhandled").is_some() {
             // Vendor renderer channels live under the backend's `ipc_invoke`
             // registry; a direct miss has no side effects, so one retry is
             // safe (managed cmds like odmf_start answer directly, once).
-            let via = self.post_raw(json!({
-                "cmd": "ipc_invoke",
-                "args": { "channel": channel, "payload": args }
-            }))?;
+            let via = self.post_raw(&IpcEnvelope {
+                cmd: "ipc_invoke",
+                args: &api::IpcInvokeArgs {
+                    channel: channel.to_string(),
+                    payload: args.clone(),
+                },
+            })?;
             if via.get("__unhandled").is_none() {
                 return Ok(via);
             }
@@ -355,8 +562,9 @@ impl HttpBackend {
         Ok(direct)
     }
 
-    fn post_raw(&self, body_json: Value) -> std::io::Result<Value> {
-        let body = body_json.to_string();
+    fn post_raw<T: Serialize>(&self, body_json: &T) -> std::io::Result<Value> {
+        let body = serde_json::to_string(body_json)
+            .map_err(|e| std::io::Error::other(format!("bad request: {e}")))?;
         let req = format!(
             "POST /__ipc HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -405,7 +613,11 @@ impl Transport {
                 if direct.get("__unhandled").is_some() {
                     let via = crate::gui::ipc::dispatch(
                         "ipc_invoke",
-                        json!({ "channel": channel, "payload": args }),
+                        serde_json::to_value(api::IpcInvokeArgs {
+                            channel: channel.to_string(),
+                            payload: args.clone(),
+                        })
+                        .expect("typed invoke args"),
                     );
                     if via.get("__unhandled").is_none() {
                         return Ok(via);
@@ -574,7 +786,7 @@ impl Ipc {
             // contract and audit it for the audit page / probe.
             self.last_served = "none";
             self.record(&format!("unhandled-invoke:{channel}"));
-            json!({ "ok": false, "__unhandled": channel })
+            serde_json::to_value(api::Unhandled::new(channel)).expect("unhandled is serializable")
         }
     }
 
@@ -587,33 +799,22 @@ impl Ipc {
         matches!(self.backend.as_ref(), Some(Transport::Direct)) && !self.backend_down
     }
 
-    /// Typed host-name read. Direct dispatch calls the daemon API with no
-    /// JSON round-trip; over http/mock the reply is parsed, accepting both
-    /// the daemon's bare-string answer and the mock's `{ok, hostName}`.
-    pub fn host_name(&mut self) -> Option<String> {
-        if self.using_direct() {
-            return Some(crate::gui::api::host_name().host_name);
-        }
-        let v = self.invoke(Channel::SettingsGetHostName, Value::Null);
-        v.as_str().map(str::to_string).or_else(|| {
-            v.get("hostName")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+    /// Typed-args invoke: arguments are serde structs, never hand-built
+    /// JSON; the reply stays `Value` (edge) for `invoke_typed` to parse.
+    fn invoke_ser<S: Serialize>(&mut self, channel: Channel, args: &S) -> Value {
+        let payload = serde_json::to_value(args).expect("typed args serialize");
+        self.invoke(channel, payload)
     }
 
-    /// Typed host-name write; `false` on rejection (blank name, unhandled).
-    /// Sends both vendor key spellings so mock (`hostName`) and daemon
-    /// (`name`) answer without a second round-trip.
-    pub fn set_host_name(&mut self, name: &str) -> bool {
-        if self.using_direct() {
-            return crate::gui::api::set_host_name(name).is_ok();
-        }
-        let v = self.invoke(
-            Channel::SettingsSetHostName,
-            json!({ "hostName": name, "name": name }),
-        );
-        v.get("ok").and_then(Value::as_bool) == Some(true)
+    /// Typed reply parse; `None` when the answer is not this channel's
+    /// typed shape (unhandled marker, garbage).
+    fn invoke_typed<T: DeserializeOwned>(
+        &mut self,
+        channel: Channel,
+        args: &impl Serialize,
+    ) -> Option<T> {
+        let v = self.invoke_ser(channel, args);
+        serde_json::from_value(v).ok()
     }
 
     /// `Some` while the real backend is configured and healthy.
@@ -639,6 +840,261 @@ impl Ipc {
         #[cfg(test)]
         let base = base.chain(self.mock.audit());
         base.collect()
+    }
+}
+
+/// Device-list wire shapes: the real backend answers some channels with a
+/// bare vendor array, the mock wraps in `{ok, devices}` — one untagged
+/// type accepts both.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DevicesWire {
+    Bare(Vec<Device>),
+    Wrapped { devices: Vec<Device> },
+}
+
+/// Host name answers: the daemon replies a bare string, the mock
+/// `{ok, hostName}`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HostNameWire {
+    Bare(String),
+    Wrapped {
+        #[serde(rename = "hostName")]
+        host_name: String,
+    },
+}
+
+/// Remove ack: `{ok, deviceId}` from a served lane, or the unhandled
+/// marker (which the UI treats as "already gone" = success).
+#[derive(Deserialize)]
+struct RemoveOutcome {
+    #[serde(default)]
+    ok: Option<bool>,
+    #[serde(rename = "__unhandled", default)]
+    unhandled: Option<String>,
+}
+
+fn rows_to_devices(rows: Vec<DeviceRow>) -> Vec<Device> {
+    rows.into_iter()
+        .map(|r| Device {
+            device_id: r.device_id,
+            device_name: r.device_name,
+            ip: r.ip,
+            is_connected: r.is_connected,
+            is_discovered: r.is_discovered,
+            is_paired: r.is_paired,
+            connect_type: r.connect_type,
+            device_type: r.device_type,
+            // Daemon rows carry no battery reading yet.
+            battery: None,
+        })
+        .collect()
+}
+
+/// The service surface `AppState` calls. Implementing it as a trait keeps
+/// the mock/daemon contract compile-checked: any second impl (test fakes)
+/// must cover every method.
+pub trait ConnectApi {
+    fn connected_devices(&mut self) -> Option<Vec<Device>>;
+    fn paired_devices(&mut self) -> Option<Vec<Device>>;
+    fn found_devices(&mut self) -> Option<Vec<Device>>;
+    fn ensure_running(&mut self) -> Option<api::EnsureRunning>;
+    fn local_device_id(&mut self) -> Option<String>;
+    fn cloud_bound(&mut self) -> Option<bool>;
+    fn qr_code(&mut self) -> Option<String>;
+    /// `true` when unbound (or the lane is unhandled — already gone).
+    fn remove_device(&mut self, device_id: &str) -> bool;
+    fn connect(&mut self, device_id: &str, ip: &str) -> ConnectAck;
+    fn disconnect(&mut self, device_id: &str, ip: &str) -> ConnectAck;
+    /// Started sink address (`listen`) when ok.
+    fn odmf_start(&mut self) -> Option<String>;
+    fn odmf_stop(&mut self);
+    fn crossfile(&mut self, category: &str) -> Option<Vec<api::CrossFile>>;
+    fn run_ai_search(&mut self, query: &str);
+    fn upload_items(&mut self) -> Option<Vec<api::UploadItem>>;
+    fn host_name(&mut self) -> Option<String>;
+    fn set_host_name(&mut self, name: &str) -> bool;
+    fn last_served(&self) -> &'static str;
+}
+
+impl ConnectApi for Ipc {
+    fn connected_devices(&mut self) -> Option<Vec<Device>> {
+        if self.using_direct() {
+            return Some(rows_to_devices(api::connected_devices()));
+        }
+        self.invoke_typed::<DevicesWire>(Channel::ConnectedDeviceInfoList, &api::NoArgs {})
+            .map(|w| match w {
+                DevicesWire::Bare(d) | DevicesWire::Wrapped { devices: d } => d,
+            })
+    }
+
+    fn paired_devices(&mut self) -> Option<Vec<Device>> {
+        if self.using_direct() {
+            return Some(rows_to_devices(api::paired_devices().devices));
+        }
+        self.invoke_typed::<DevicesWire>(Channel::GenericAgentGetPairedDevices, &api::NoArgs {})
+            .map(|w| match w {
+                DevicesWire::Bare(d) | DevicesWire::Wrapped { devices: d } => d,
+            })
+    }
+
+    fn found_devices(&mut self) -> Option<Vec<Device>> {
+        if self.using_direct() {
+            return Some(rows_to_devices(api::device_found_list().devices));
+        }
+        self.invoke_typed::<DevicesWire>(Channel::DeviceFoundList, &api::NoArgs {})
+            .map(|w| match w {
+                DevicesWire::Bare(d) | DevicesWire::Wrapped { devices: d } => d,
+            })
+    }
+
+    fn ensure_running(&mut self) -> Option<api::EnsureRunning> {
+        if self.using_direct() {
+            return Some(api::ensure_running());
+        }
+        self.invoke_typed(Channel::GenericAgentEnsureRunning, &api::NoArgs {})
+    }
+
+    fn local_device_id(&mut self) -> Option<String> {
+        if self.using_direct() {
+            return Some(api::local_device_id());
+        }
+        self.invoke_typed(Channel::GenericAgentGetLocalDeviceId, &api::NoArgs {})
+    }
+
+    fn cloud_bound(&mut self) -> Option<bool> {
+        if self.using_direct() {
+            return Some(api::cloud_bind().bound);
+        }
+        self.invoke_typed::<api::CloudBind>(Channel::GenericAgentGetCloudBind, &api::NoArgs {})
+            .map(|b| b.bound)
+    }
+
+    fn qr_code(&mut self) -> Option<String> {
+        self.invoke_typed::<api::QrCode>(Channel::GetPairingQrCode, &api::NoArgs {})?
+            .code
+    }
+
+    fn remove_device(&mut self, device_id: &str) -> bool {
+        let args = api::RemoveDeviceArgs {
+            device_id: device_id.to_string(),
+            remove_state_dir: true,
+        };
+        if self.using_direct() {
+            return api::remove_device(&args).ok;
+        }
+        match self.invoke_typed::<RemoveOutcome>(Channel::GenericAgentSettingsRemoveDevice, &args) {
+            Some(o) => o.unhandled.is_some() || o.ok == Some(true),
+            None => true,
+        }
+    }
+
+    fn connect(&mut self, device_id: &str, ip: &str) -> ConnectAck {
+        if self.using_direct() {
+            let a = api::device_action(true, ip);
+            return ConnectAck {
+                ok: a.ok,
+                ip: (!a.ip.is_empty()).then_some(a.ip),
+                error: a.error,
+                code_success: None,
+            };
+        }
+        let args = api::ConnectArgs {
+            device_id: device_id.to_string(),
+            ip: ip.to_string(),
+        };
+        self.invoke_typed(Channel::ConnectDevice, &args)
+            .unwrap_or(ConnectAck {
+                ok: false,
+                ip: None,
+                error: Some("phone unreachable".into()),
+                code_success: None,
+            })
+    }
+
+    fn disconnect(&mut self, device_id: &str, ip: &str) -> ConnectAck {
+        if self.using_direct() {
+            let a = api::device_action(false, ip);
+            return ConnectAck {
+                ok: a.ok,
+                ip: (!a.ip.is_empty()).then_some(a.ip),
+                error: a.error,
+                code_success: None,
+            };
+        }
+        let args = api::ConnectArgs {
+            device_id: device_id.to_string(),
+            ip: ip.to_string(),
+        };
+        self.invoke_typed(Channel::DisconnectDevice, &args)
+            .unwrap_or(ConnectAck {
+                ok: false,
+                ip: None,
+                error: Some("phone unreachable".into()),
+                code_success: None,
+            })
+    }
+
+    fn odmf_start(&mut self) -> Option<String> {
+        if self.using_direct() {
+            let r = crate::gui::cast::odmf_start();
+            return r.ok.then_some(r.listen).flatten();
+        }
+        let r = self.invoke_typed::<api::OdmfStartResp>(Channel::OdmfStart, &api::NoArgs {})?;
+        r.ok.then_some(r.listen).flatten()
+    }
+
+    fn odmf_stop(&mut self) {
+        self.invoke_ser(Channel::OdmfStop, &api::NoArgs {});
+    }
+
+    fn crossfile(&mut self, category: &str) -> Option<Vec<api::CrossFile>> {
+        let args = api::CrossFileArgs {
+            category: category.to_string(),
+        };
+        let resp = self.invoke_typed::<api::CrossFileListResp>(Channel::CrossFileList, &args)?;
+        (resp.ok == Some(true)).then(|| resp.files.unwrap_or_default())
+    }
+
+    fn run_ai_search(&mut self, query: &str) {
+        let args = api::AiSearchArgs {
+            query: query.to_string(),
+        };
+        self.invoke_ser(Channel::AiSearchExecute, &args);
+    }
+
+    fn upload_items(&mut self) -> Option<Vec<api::UploadItem>> {
+        self.invoke_typed::<api::UploadDownloadList>(Channel::UploadDownloadList, &api::NoArgs {})
+            .and_then(|l| l.items)
+    }
+
+    fn host_name(&mut self) -> Option<String> {
+        if self.using_direct() {
+            return Some(api::host_name().host_name);
+        }
+        self.invoke_typed::<HostNameWire>(Channel::SettingsGetHostName, &api::NoArgs {})
+            .map(|w| match w {
+                HostNameWire::Bare(s) => s,
+                HostNameWire::Wrapped { host_name } => host_name,
+            })
+    }
+
+    fn set_host_name(&mut self, name: &str) -> bool {
+        if self.using_direct() {
+            return api::set_host_name(name).is_ok();
+        }
+        // One typed arg type; the daemon reads `name`, the mock `hostName`
+        // — the alias on `SetHostNameArgs` binds both.
+        let args = api::SetHostNameArgs {
+            host_name: name.to_string(),
+        };
+        self.invoke_typed::<api::OkFlag>(Channel::SettingsSetHostName, &args)
+            .is_some_and(|r| r.ok)
+    }
+
+    fn last_served(&self) -> &'static str {
+        self.last_served
     }
 }
 
@@ -685,6 +1141,32 @@ mod tests {
         let mut ipc = Ipc::http(addr);
         assert!(ipc.set_host_name("desk-2"));
         assert_eq!(ipc.last_served(), "mock");
+    }
+
+    #[test]
+    fn connect_api_service_surface_through_mock() {
+        let mut ipc = Ipc::mock_only();
+        let found = ipc.found_devices().expect("found list typed");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].device_name, "OnePlus 12");
+        assert_eq!(found[0].device_type, 8);
+        assert_eq!(found[0].battery, Some(78));
+
+        let ack = ipc.connect("mock-phone-1", "");
+        assert!(ack.ok && ack.code_success == Some(true) && ack.ip.is_none());
+        assert!(ipc.connected_devices().is_some_and(|d| d.len() == 1));
+        let bad = ipc.connect("nope", "");
+        assert!(!bad.ok && bad.error.as_deref() == Some("unknown device nope"));
+
+        assert!(ipc.remove_device("mock-pad-1"));
+        assert!(ipc.paired_devices().is_some_and(|p| p.len() == 1));
+        assert_eq!(ipc.local_device_id().as_deref(), Some("mock-pc-001"));
+        assert_eq!(ipc.cloud_bound(), Some(false));
+        assert!(ipc.ensure_running().is_some_and(|r| r.status == "idle"));
+        assert!(ipc.qr_code().is_some_and(|c| c.starts_with("heycast://")));
+        assert!(ipc.odmf_start().is_some_and(|l| l == "0.0.0.0:7536"));
+        ipc.odmf_stop();
+        assert!(ipc.upload_items().is_some_and(|i| i.is_empty()));
     }
 
     #[test]
@@ -824,7 +1306,7 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod http_tests {
-    use super::{Channel, HttpBackend, Ipc, SocketAddr, ipc_spec};
+    use super::{Channel, ConnectApi, HttpBackend, Ipc, SocketAddr, ipc_spec};
     use serde_json::{Value, json};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -1003,6 +1485,35 @@ pub(crate) mod http_tests {
         assert_eq!(v["ok"], json!(true), "mock answers after the failure");
         assert!(ipc.audit().iter().any(|e| e.starts_with("backend-down:")));
         assert!(ipc.backend_addr().is_none(), "marked down, stops retrying");
+    }
+
+    #[test]
+    fn devices_wire_accepts_bare_and_wrapped_replies() {
+        // Real backend: bare vendor array, partial rows.
+        let addr = stub_backend(vec![(
+            "get_current_connected_device_info_list",
+            json!([{ "deviceId": "p1", "deviceName": "OnePlus 15", "isConnected": true }]),
+        )]);
+        let mut ipc = Ipc::http(addr);
+        let d = ipc.connected_devices().expect("bare vendor array parses");
+        assert_eq!(d[0].device_name, "OnePlus 15");
+        assert!(d[0].is_connected);
+        // Mock-shaped wrapper over the same channel.
+        let addr = stub_backend(vec![(
+            "generic_agent_get_paired_devices",
+            json!({ "ok": true, "devices": [{ "deviceId": "m1" }] }),
+        )]);
+        let mut ipc = Ipc::http(addr);
+        assert_eq!(ipc.paired_devices().map(|d| d.len()), Some(1));
+    }
+
+    #[test]
+    fn crossfile_unhandled_answer_is_typed_none() {
+        // Neither lane serves cross_file_list: the typed parse refuses the
+        // unhandled shape (ok=false), so the caller keeps its fallback.
+        let addr = stub_backend(vec![]);
+        let mut ipc = Ipc::http(addr);
+        assert!(ipc.crossfile("image").is_none());
     }
 
     #[test]

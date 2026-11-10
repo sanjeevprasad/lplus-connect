@@ -3,24 +3,16 @@
 //! `views.rs` call them and schedule a repaint.
 
 use gpui::{Context, Task};
-use serde_json::{Value, json};
 
-use crate::ui::ipc::{Channel, Ipc};
+use crate::ui::ipc::{ConnectApi, Ipc};
+
 use crate::ui::router::{Route, Router};
 use crate::ui::stores::connection::UiStore;
 use crate::ui::stores::connection::{ConnectionStore, Device};
 use crate::ui::stores::toast::{ToastKind, ToastStore};
 use crate::ui::stores::transfer::{Direction, TransferItem, TransferStatus, TransferStore};
-
-/// Accept both `{ok, devices:[…]}` (mock answer) and the bare vendor array
-/// the real backend returns for the device-list channels.
-fn devices_of(v: &Value) -> Option<Vec<Device>> {
-    let arr = v
-        .get("devices")
-        .and_then(Value::as_array)
-        .or_else(|| v.as_array())?;
-    serde_json::from_value::<Vec<Device>>(Value::Array(arr.clone())).ok()
-}
+#[cfg(test)]
+use serde_json::json;
 
 /// Screen-mirroring (`screen.js`/odmf) panel state; backend via the
 /// odmf channels, mock fallback only in `LPLUS_BACKEND=off` mode.
@@ -130,26 +122,19 @@ impl AppState {
     }
 
     /// Pull connected + found device lists through the vendor channels.
-    /// The real backend answers some of these with a bare array (vendor
-    /// shape) while the mock wraps in `{ok, devices}` — accept both.
+    /// Typed service surface (`ConnectApi`): Direct calls the daemon API
+    /// with no JSON round-trip, http/mock answers are parsed to `Device`.
+    /// Unhandled answers parse to `None` and leave the store untouched.
     pub fn refresh_devices(&mut self) {
-        let connected = self
-            .ipc
-            .invoke(Channel::ConnectedDeviceInfoList, Value::Null);
-        if let Some(devices) = devices_of(&connected) {
+        if let Some(devices) = self.ipc.connected_devices() {
             self.connection.set_connected(devices);
         }
         // Persistent pairing bonds (offline ones included) are account-
-        // local: fetched even signed out. Unhandled/mock answers parse to
-        // None and leave the list untouched.
-        let paired = self
-            .ipc
-            .invoke(Channel::GenericAgentGetPairedDevices, Value::Null);
-        if let Some(rows) = devices_of(&paired) {
+        // local: fetched even signed out.
+        if let Some(rows) = self.ipc.paired_devices() {
             self.connection.set_paired(rows);
         }
-        let found = self.ipc.invoke(Channel::DeviceFoundList, Value::Null);
-        if let Some(devices) = devices_of(&found) {
+        if let Some(devices) = self.ipc.found_devices() {
             self.connection.set_found(devices);
         }
     }
@@ -162,18 +147,13 @@ impl AppState {
         }
         self.ga_loaded = true;
         self.refresh_devices();
-        let v = self
-            .ipc
-            .invoke(Channel::GenericAgentEnsureRunning, Value::Null);
-        self.ga_status = v.get("status").and_then(Value::as_str).map(str::to_string);
-        let id = self
-            .ipc
-            .invoke(Channel::GenericAgentGetLocalDeviceId, Value::Null);
-        self.ga_local_id = id.as_str().map(str::to_string);
-        let bind = self
-            .ipc
-            .invoke(Channel::GenericAgentGetCloudBind, Value::Null);
-        self.ga_bound = bind.get("bound").and_then(Value::as_bool);
+        if let Some(status) = self.ipc.ensure_running() {
+            self.ga_status = Some(status.status);
+        }
+        if self.ga_local_id.is_none() {
+            self.ga_local_id = self.ipc.local_device_id();
+        }
+        self.ga_bound = self.ipc.cloud_bound();
     }
 
     /// "Connect manually" (`ConnectMainDialogMultiDevice` entry point).
@@ -187,8 +167,7 @@ impl AppState {
     pub fn open_connect_dialog(&mut self) {
         self.ui.open_connect_dialog();
         if self.qr_content.is_none() {
-            let v = self.ipc.invoke(Channel::GetPairingQrCode, Value::Null);
-            self.qr_content = v.get("code").and_then(Value::as_str).map(str::to_string);
+            self.qr_content = self.ipc.qr_code();
         }
     }
 
@@ -307,17 +286,13 @@ impl AppState {
             });
             self.disconnect_device(&row);
         }
-        let v = self.ipc.invoke(
-            Channel::GenericAgentSettingsRemoveDevice,
-            json!({ "device_id": id, "removeStateDir": true }),
-        );
-        let unhandled = v.get("__unhandled").is_some();
-        if !unhandled && v.get("ok").and_then(Value::as_bool) != Some(true) {
-            self.toast
-                .push(format!("Failed to unbind {name}"), ToastKind::Error);
-        } else {
+        let removed = self.ipc.remove_device(&id);
+        if removed {
             self.toast
                 .push(format!("{name} removed"), ToastKind::Success);
+        } else {
+            self.toast
+                .push(format!("Failed to unbind {name}"), ToastKind::Error);
         }
         self.connection.remove_device(&id);
     }
@@ -329,13 +304,10 @@ impl AppState {
     /// left to the authoritative device list instead of being faked here.
     pub fn connect_device(&mut self, device: &Device) {
         self.connection.begin_connect(&device.device_id);
-        let v = self.ipc.invoke(
-            Channel::ConnectDevice,
-            json!({ "deviceId": device.device_id, "ip": device.ip }),
-        );
-        if v.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        let ack = self.ipc.connect(&device.device_id, &device.ip);
+        if ack.ok {
             self.connection.mark_waiting_permission(&device.device_id);
-            if v.get("ip").is_some() {
+            if ack.ip.is_some() {
                 self.toast.push(
                     format!("{}: connecting", device.device_name),
                     ToastKind::Info,
@@ -351,11 +323,7 @@ impl AppState {
                 );
             }
         } else {
-            let reason = v
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("phone unreachable")
-                .to_string();
+            let reason = ack.error.unwrap_or_else(|| "phone unreachable".to_string());
             self.connection.mark_failed(&device.device_id, &reason);
             self.toast.push(
                 format!("{}: {reason}", device.device_name),
@@ -367,11 +335,8 @@ impl AppState {
     /// `DisconnectConfirm` accept action. Same payload contract as
     /// `connect_device`; a backend `queued` ack defers to the device list.
     pub fn disconnect_device(&mut self, device: &Device) {
-        let v = self.ipc.invoke(
-            Channel::DisconnectDevice,
-            json!({ "deviceId": device.device_id, "ip": device.ip }),
-        );
-        if v.get("ok").and_then(|v| v.as_bool()) == Some(true) && v.get("ip").is_some() {
+        let ack = self.ipc.disconnect(&device.device_id, &device.ip);
+        if ack.ok && ack.ip.is_some() {
             self.toast.push(
                 format!("{}: disconnecting", device.device_name),
                 ToastKind::Info,
@@ -388,16 +353,13 @@ impl AppState {
 
     // ------------------------------------------------------------ mirroring
     pub fn toggle_mirroring(&mut self) {
-        if let Some(listen) = self.mirroring.active_listen.take() {
-            self.ipc.invoke(Channel::OdmfStop, Value::Null);
-            let _ = listen;
+        if self.mirroring.active_listen.take().is_some() {
+            self.ipc.odmf_stop();
             self.toast.push("Mirroring stopped", ToastKind::Info);
             return;
         }
-        let v = self.ipc.invoke(Channel::OdmfStart, Value::Null);
-        if v.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-            self.mirroring.active_listen =
-                v.get("listen").and_then(|v| v.as_str()).map(str::to_string);
+        if let Some(listen) = self.ipc.odmf_start() {
+            self.mirroring.active_listen = Some(listen);
             self.toast.push("Mirroring started", ToastKind::Success);
         } else {
             self.toast
@@ -438,26 +400,11 @@ impl AppState {
         self.crossfile_category = Some(category.to_string());
         // Ask the main process first; while unimplemented this lands in the
         // audit ring and we fall back to the mock tree.
-        let v = self
+        self.crossfile_files = self
             .ipc
-            .invoke(Channel::CrossFileList, json!({ "category": category }));
-        let files: Vec<(String, u64)> = if v.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-            v.get("files")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|f| {
-                            let name = f.get("name")?.as_str()?.to_string();
-                            let size = f.get("size")?.as_u64()?;
-                            Some((name, size))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            mock_files(category)
-        };
-        self.crossfile_files = files;
+            .crossfile(category)
+            .map(|files| files.into_iter().map(|f| (f.name, f.size)).collect())
+            .unwrap_or_else(|| mock_files(category));
     }
 
     // ------------------------------------------------------------ aiSearch
@@ -471,8 +418,7 @@ impl AppState {
             self.ai_results = Vec::new();
             return;
         }
-        self.ipc
-            .invoke(Channel::AiSearchExecute, json!({ "query": q }));
+        self.ipc.run_ai_search(&q);
         self.ai_results = AI_CORPUS
             .iter()
             .filter(|f| f.to_lowercase().contains(&q))
@@ -483,32 +429,22 @@ impl AppState {
     // ------------------------------------------------------- uploadDownload
     /// MiniUploadDownload mount: pull the (mock-empty) queue.
     pub fn load_transfers(&mut self) {
-        let v = self.ipc.invoke(Channel::UploadDownloadList, Value::Null);
-        if let Some(items) = v.get("items").and_then(|v| v.as_array())
-            && let Ok(parsed) = serde_json::from_value::<Vec<serde_json::Value>>(json!(items))
-        {
-            let mut fresh = Vec::new();
-            for it in parsed {
-                let (Some(id), Some(name), Some(size)) = (
-                    it["id"].as_str().map(str::to_string),
-                    it["name"].as_str().map(str::to_string),
-                    it["size"].as_u64(),
-                ) else {
-                    continue;
-                };
-                fresh.push(TransferItem {
-                    id,
-                    name,
-                    size_bytes: size,
+        if let Some(items) = self.ipc.upload_items() {
+            let fresh = items
+                .into_iter()
+                .map(|it| TransferItem {
+                    id: it.id,
+                    name: it.name,
+                    size_bytes: it.size,
                     transferred: 0,
-                    direction: if it["direction"].as_str() == Some("download") {
+                    direction: if it.direction.as_deref() == Some("download") {
                         Direction::Download
                     } else {
                         Direction::Upload
                     },
                     status: TransferStatus::Queued,
-                });
-            }
+                })
+                .collect();
             self.transfer.set_items(fresh);
         }
     }
@@ -995,21 +931,6 @@ mod tests {
         assert!(a.connection.is_connected("usb-FAKESERIAL000001"));
         assert_eq!(a.connection.wall()[0].device_name, "OnePlus 15");
         assert_eq!(a.connection.wall()[0].connect_type, 128);
-    }
-
-    #[test]
-    fn devices_of_accepts_backend_and_mock_shapes() {
-        // Real backend: bare vendor array, partial rows.
-        let bare = json!([{ "deviceId": "p1", "deviceName": "OnePlus 15", "isConnected": true }]);
-        let devices = devices_of(&bare).expect("bare array parses");
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].device_name, "OnePlus 15");
-        assert!(devices[0].is_connected);
-        // Mock: {ok, devices}.
-        let wrapped = json!({ "ok": true, "devices": [{ "deviceId": "m1" }] });
-        assert_eq!(devices_of(&wrapped).map(|d| d.len()), Some(1));
-        // Neither shape → None (keeps previous store state).
-        assert!(devices_of(&json!({ "ok": false, "__unhandled": "x" })).is_none());
     }
 
     fn device_app() -> AppState {

@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
-use serde_json::{Value, json};
+use serde_json::json;
+
+use crate::gui::api::{CastPushResp, FileInfo, LplusStatus, OdmfInfo, OdmfStartResp, RtspInfo};
 
 /// Our fixed peer id on the DataBus session (castpush.py `PC`).
 pub const PC_ID_HEX: &str = "A1B2C3D4E5F6";
@@ -158,20 +160,29 @@ pub fn push_value(key: &str, value_json: &str) -> (Vec<u8>, bool) {
 // ----------------------------------------------------------- ipc channels
 /// `cast_push {key, value}`: inject one DbsMessage frame and report the
 /// live sink roster (best-effort REPL `list`) alongside the frame size.
-pub fn cast_push(key: &str, value: &str) -> Value {
+pub fn cast_push(key: &str, value: &str) -> CastPushResp {
     if key.trim().is_empty() {
-        return json!({ "ok": false, "error": "missing key" });
+        return CastPushResp {
+            ok: false,
+            key: None,
+            frame_bytes: None,
+            frame_hex: None,
+            queued: None,
+            repl_out: None,
+            error: Some("missing key".into()),
+        };
     }
     let (frame, queued) = push_value(key, value);
     let roster = crate::gui::ipc::repl_exec_line("list");
-    json!({
-        "ok": true,
-        "key": key,
-        "frame_bytes": frame.len(),
-        "frame_hex": hex::encode(&frame),
-        "queued": queued,
-        "repl_out": roster.get("out").cloned().unwrap_or_else(|| json!([])),
-    })
+    CastPushResp {
+        ok: true,
+        key: Some(key.to_string()),
+        frame_bytes: Some(frame.len()),
+        frame_hex: Some(hex::encode(&frame)),
+        queued: Some(queued),
+        repl_out: Some(roster.out.unwrap_or_default()),
+        error: None,
+    }
 }
 
 /// `odmf_start {}`: the two DataBus pushes that make the phone dial our
@@ -180,13 +191,21 @@ pub fn cast_push(key: &str, value: &str) -> Value {
 /// `CastDbsReceiver` looks the key up in the `CastDispatchMessage` list and
 /// anything else dispatches with type 0 and is silently dropped — the inner
 /// `msg_cmd` is what routes inside `CastSceneManager.handleReceiveData`.
-pub fn odmf_start() -> Value {
+pub fn odmf_start() -> OdmfStartResp {
     let pub_file = env_or("ODMF_PUB_FILE", "/tmp/odmf_pub.b64");
     let raw = match std::fs::read_to_string(&pub_file) {
         Ok(raw) => raw,
         Err(e) => {
             tracing::warn!("[cast] odmf_start: cannot read public key {pub_file}: {e}");
-            return json!({ "ok": false, "error": format!("missing ODMF public key ({pub_file})") });
+            return OdmfStartResp {
+                ok: false,
+                id: None,
+                pushes: None,
+                queued: None,
+                listen: None,
+                rtp_port: None,
+                error: Some(format!("missing ODMF public key ({pub_file})")),
+            };
         }
     };
     let n = next_seq();
@@ -203,16 +222,17 @@ pub fn odmf_start() -> Value {
     let (body1, body2) = odmf_bodies(&server_ip, &auth);
     let (_, q1) = push_value("cast_ability_sync", &body1);
     let (_, q2) = push_value("cast_ability_sync", &body2);
-    json!({
-        "ok": true,
-        "id": id,
-        "pushes": 2,
-        "queued": [q1, q2],
+    OdmfStartResp {
+        ok: true,
+        id: Some(id),
+        pushes: Some(2),
+        queued: Some(vec![q1, q2]),
         // The sink the phone will dial (what the GUI shows under the
         // mirroring toggle; `env_or` mirrors the sink's own defaults).
-        "listen": env_or("ODMF_LISTEN", "0.0.0.0:7236"),
-        "rtp_port": env_or("ODMF_RTP_PORT", "15550"),
-    })
+        listen: Some(env_or("ODMF_LISTEN", "0.0.0.0:7236")),
+        rtp_port: Some(env_or("ODMF_RTP_PORT", "15550")),
+        error: None,
+    }
 }
 
 /// The two CastMessage JSON bodies of the ODMF trigger (pure, for tests).
@@ -259,41 +279,48 @@ fn cast_message(msg_cmd: &str, msg_body: &str) -> String {
 /// `lplus_status {}`: env-read snapshot of backend liveness, REPL/KMS
 /// lanes, ODMF sink files and the RTSP lane. Never panics; the KMS probe
 /// is bounded to 300 ms.
-pub fn status_json() -> Value {
+pub fn status() -> LplusStatus {
     let out = out_dir();
-    json!({
-        "ok": true,
-        "backend_up": crate::gui::backend_up(),
-        "repl_port": repl_port(),
-        "repl_enabled": std::env::var("LPLUS_REPL_PORT").is_ok(),
-        "kms_listening": tcp_probe(kms_port()),
-        "odmf": {
-            "enabled": env_flag("ODMF_SINK"),
-            "listen": env_or("ODMF_LISTEN", "0.0.0.0:7236"),
-            "rtp_port": env_or("ODMF_RTP_PORT", "15550"),
-            "out_dir": out.display().to_string(),
-            "session_bin": file_info(&out.join(SESSION_BIN_NAME)),
-            "video": file_info(&out.join(VIDEO_NAME)),
+    LplusStatus {
+        ok: true,
+        backend_up: crate::gui::backend_up(),
+        repl_port: repl_port(),
+        repl_enabled: std::env::var("LPLUS_REPL_PORT").is_ok(),
+        kms_listening: tcp_probe(kms_port()),
+        odmf: OdmfInfo {
+            enabled: env_flag("ODMF_SINK"),
+            listen: env_or("ODMF_LISTEN", "0.0.0.0:7236"),
+            rtp_port: env_or("ODMF_RTP_PORT", "15550"),
+            out_dir: out.display().to_string(),
+            session_bin: file_info(&out.join(SESSION_BIN_NAME)),
+            video: file_info(&out.join(VIDEO_NAME)),
         },
-        "rtsp": {
-            "enabled": env_flag("RTSP"),
-            "target": env_or("RTSP_TARGET", ""),
+        rtsp: RtspInfo {
+            enabled: env_flag("RTSP"),
+            target: env_or("RTSP_TARGET", ""),
         },
-    })
+    }
 }
 
-fn file_info(path: &Path) -> Value {
+fn file_info(path: &Path) -> FileInfo {
     match std::fs::metadata(path) {
         Ok(md) => {
             let secs = md
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            json!({ "exists": true, "size": md.len(), "mtime_secs": secs })
+                .map(|d| d.as_secs());
+            FileInfo {
+                exists: true,
+                size: md.len(),
+                mtime_secs: secs,
+            }
         }
-        Err(_) => json!({ "exists": false, "size": 0, "time": Value::Null }),
+        Err(_) => FileInfo {
+            exists: false,
+            size: 0,
+            mtime_secs: None,
+        },
     }
 }
 
@@ -461,16 +488,17 @@ mod tests {
     }
 
     #[test]
-    fn status_json_shape_is_complete() {
-        let v = status_json();
-        assert_eq!(v["ok"], json!(true));
-        assert!(v["backend_up"].is_boolean());
-        assert!(v["repl_port"].is_number());
-        assert!(v["repl_enabled"].is_boolean());
-        assert!(v["kms_listening"].is_boolean());
-        assert!(v["odmf"]["enabled"].is_boolean());
-        assert!(v["odmf"]["session_bin"]["exists"].is_boolean());
-        assert!(v["odmf"]["video"]["exists"].is_boolean());
-        assert!(v["rtsp"]["enabled"].is_boolean());
+    fn status_shape_is_complete() {
+        let s = status();
+        assert!(s.ok);
+        assert!(s.repl_port > 0, "repl port always reported");
+        assert_eq!(
+            s.odmf.rtp_port,
+            std::env::var("ODMF_RTP_PORT").unwrap_or_else(|_| "15550".into())
+        );
+        assert_eq!(
+            s.odmf.listen,
+            std::env::var("ODMF_LISTEN").unwrap_or_else(|_| "0.0.0.0:7236".into())
+        );
     }
 }
