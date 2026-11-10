@@ -106,10 +106,16 @@ mod tests {
         set_env("ODMF_OUT", &capture.to_string_lossy());
         let p = paired_path();
         assert_eq!(p, state.join("paired.json"));
-        assert_eq!(std::fs::read_to_string(&p).expect("migrated"), "[{\"x\":1}]");
+        assert_eq!(
+            std::fs::read_to_string(&p).expect("migrated"),
+            "[{\"x\":1}]"
+        );
         // Editing the new copy must not be overwritten by the legacy file.
         std::fs::write(&p, b"[]").expect("rewrite");
-        assert_eq!(paired_path().canonicalize().unwrap(), p.canonicalize().unwrap());
+        assert_eq!(
+            paired_path().canonicalize().unwrap(),
+            p.canonicalize().unwrap()
+        );
         assert_eq!(std::fs::read_to_string(&p).expect("kept"), "[]");
         unset_env("LPLUS_STATE_DIR");
         unset_env("ODMF_OUT");

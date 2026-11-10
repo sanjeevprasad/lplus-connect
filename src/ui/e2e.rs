@@ -2,9 +2,9 @@
 //! harness, click handlers drive the router, and mock transfer ticks
 //! converge on the executor.
 
-use gpui::{MouseButton, Size, TestApp, px};
 use crate::ui::app::AppState;
 use crate::ui::router::Route;
+use gpui::{MouseButton, Size, TestApp, px};
 
 #[test]
 fn root_renders_home_and_secondary_nav_navigates() {

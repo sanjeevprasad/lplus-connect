@@ -204,7 +204,9 @@ async fn session(
                                 v.get("local_user_name")
                                     .and_then(|x| x.as_str())
                                     .unwrap_or("heycast_odmf"),
-                                v.get("local_user_id").and_then(|x| x.as_str()).unwrap_or(""),
+                                v.get("local_user_id")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or(""),
                             );
                             let mut out = Vec::with_capacity(reply.len() + 2);
                             out.extend_from_slice(&(reply.len() as u16).to_be_bytes());
@@ -257,7 +259,9 @@ async fn session(
             tracing::info!("[odmf] frame {peer} (enc) | {}", redact(&plain));
             crate::odmf_pc::handle_inbound(&plain);
             if respond && plain.contains("PairRequest") {
-                let Some(k) = media_key.as_ref() else { continue };
+                let Some(k) = media_key.as_ref() else {
+                    continue;
+                };
                 let (rb, rn, rid) = peer_other(&peer_ip, &local_bus);
                 let reply = format!(
                     "{{\"cmd\":\"PairSuccess\",\"remote_user_name\":\"{rn}\",\"remote_user_id\":\"{rid}\",\"remote_transportbus_id\":\"{rb}\"}}"
@@ -357,9 +361,7 @@ fn gcm_open<N>(key: &[u8], iv: &[u8], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>>
 where
     N: aes_gcm::aead::array::ArraySize,
     aes_gcm::AesGcm<aes::Aes256, N>:
-        aes_gcm::KeyInit
-        + aes_gcm::aead::Aead
-        + aes_gcm::aead::AeadCore<NonceSize = N>,
+        aes_gcm::KeyInit + aes_gcm::aead::Aead + aes_gcm::aead::AeadCore<NonceSize = N>,
     aes_gcm::Nonce<N>: TryFrom<Vec<u8>>,
 {
     use aes_gcm::aead::Aead;
@@ -375,9 +377,7 @@ fn gcm_seal<N>(key: &[u8], iv: &[u8], aad: &[u8], msg: &[u8]) -> Option<Vec<u8>>
 where
     N: aes_gcm::aead::array::ArraySize,
     aes_gcm::AesGcm<aes::Aes256, N>:
-        aes_gcm::KeyInit
-        + aes_gcm::aead::Aead
-        + aes_gcm::aead::AeadCore<NonceSize = N>,
+        aes_gcm::KeyInit + aes_gcm::aead::Aead + aes_gcm::aead::AeadCore<NonceSize = N>,
     aes_gcm::Nonce<N>: TryFrom<Vec<u8>>,
 {
     use aes_gcm::aead::Aead;
@@ -472,19 +472,29 @@ fn try_parse_enc_frame(buf: &[u8], key: Option<&[u8; 32]>) -> Option<(String, us
 /// (`OdmfSignalingServer.notifyClientPairSuccess`, odmfr/odmfc.java), which
 /// the client then adopts as its `remoteTransportBusId` before flushing its
 /// queued session messages (`odmft`).
-static PEERS: std::sync::Mutex<Vec<(String, String, String, String)>> = std::sync::Mutex::new(Vec::new());
+static PEERS: std::sync::Mutex<Vec<(String, String, String, String)>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn peer_note(ip: &str, bus: &str, user_name: &str, user_id: &str) {
     let Ok(mut v) = PEERS.lock() else { return };
     if !v.iter().any(|(i, b, _, _)| i == ip && b == bus) {
-        v.push((ip.to_string(), bus.to_string(), user_name.to_string(), user_id.to_string()));
+        v.push((
+            ip.to_string(),
+            bus.to_string(),
+            user_name.to_string(),
+            user_id.to_string(),
+        ));
     }
 }
 
 /// The other socket's identity for `ip` (cross-pair); falls back to `own`
 /// when only one socket has announced itself.
 fn peer_other(ip: &str, own_bus: &str) -> (String, String, String) {
-    let def = (own_bus.to_string(), "heycast_odmf".to_string(), String::new());
+    let def = (
+        own_bus.to_string(),
+        "heycast_odmf".to_string(),
+        String::new(),
+    );
     let Ok(v) = PEERS.lock() else { return def };
     v.iter()
         .find(|(i, b, _, _)| i == ip && b != own_bus)
@@ -614,7 +624,10 @@ impl OdmfAuth {
             match spki_to_sec1(&pk_der) {
                 Some(s) => s,
                 None => {
-                    tracing::warn!("[odmf] auth: bad peer public_key framing (len {})", pk_der.len());
+                    tracing::warn!(
+                        "[odmf] auth: bad peer public_key framing (len {})",
+                        pk_der.len()
+                    );
                     return None;
                 }
             }
@@ -646,10 +659,15 @@ impl OdmfAuth {
                 }
             }
         };
-        let plain = try_open(true).or_else(|| try_open(false)).unwrap_or_else(|| {
-            tracing::warn!("[odmf] auth: peer cipher GCM open fail (iv {}B)", iv_in.len());
-            Vec::new()
-        });
+        let plain = try_open(true)
+            .or_else(|| try_open(false))
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "[odmf] auth: peer cipher GCM open fail (iv {}B)",
+                    iv_in.len()
+                );
+                Vec::new()
+            });
         if plain.is_empty() {
             return None;
         }
@@ -955,8 +973,9 @@ mod tests {
         // SigIdentityAuthHelper.getAuthInfo: the peer's plaintext is its raw
         // near-field id bytes — NOT JSON (the old echo assumption).
         let inner = "phone-id-raw-bytes";
-        let sealed = gcm_seal::<aes_gcm::aead::consts::U16>(&key, &iv, ts.as_bytes(), inner.as_bytes())
-            .expect("seal");
+        let sealed =
+            gcm_seal::<aes_gcm::aead::consts::U16>(&key, &iv, ts.as_bytes(), inner.as_bytes())
+                .expect("seal");
         let auth_info = serde_json::json!({
             "timestamp": ts,
             "iv": general_purpose::STANDARD.encode(&iv),
@@ -999,7 +1018,8 @@ mod tests {
             .decode(echoed["key"].as_str().expect("key field"))
             .expect("key is b64");
         assert_eq!(
-            media_key, picked_key.to_vec(),
+            media_key,
+            picked_key.to_vec(),
             "the phone adopts b64decode(json.key); the session must seal replies with the very same bytes"
         );
         assert_eq!(media_key.len(), 32, "PC picks a 256-bit media key");
@@ -1043,7 +1063,11 @@ mod tests {
         peer_note("192.0.2.13", "busB", "dup", "dup"); // dedupe
         assert_eq!(
             peer_other("192.0.2.13", "busA"),
-            ("busB".to_string(), "heycast_odmf2".to_string(), "uidB".to_string())
+            (
+                "busB".to_string(),
+                "heycast_odmf2".to_string(),
+                "uidB".to_string()
+            )
         );
         assert_eq!(
             peer_other("192.0.2.13", "busB").0,
@@ -1068,9 +1092,7 @@ mod tests {
 
     #[test]
     fn prelude_frames_env_and_default() {
-        let f = prelude_frames_from(Some(
-            r#"["{\"cmd\":\"a\"}","{\"cmd\":\"b\"}"]"#.to_string(),
-        ));
+        let f = prelude_frames_from(Some(r#"["{\"cmd\":\"a\"}","{\"cmd\":\"b\"}"]"#.to_string()));
         assert_eq!(f.len(), 2);
         assert!(f[0].contains("\"a\"") && f[1].contains("\"b\""));
         assert!(prelude_frames_from(Some("not json".to_string())).is_empty());
@@ -1153,11 +1175,17 @@ mod tests {
         let sps = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x03, 0x00, 0xb0];
         let aus = d.push(&sps);
         assert_eq!(aus.len(), 1);
-        assert_eq!(aus[0], [b"\x00\x00\x00\x01".to_vec(), sps.to_vec()].concat());
+        assert_eq!(
+            aus[0],
+            [b"\x00\x00\x00\x01".to_vec(), sps.to_vec()].concat()
+        );
         let pps = [0x44, 0x01, 0xc1, 0xe3, 0x0f, 0x09, 0x41, 0xef, 0x61, 0x28];
         let aus = d.push(&pps);
         assert_eq!(aus.len(), 1);
-        assert_eq!(aus[0], [b"\x00\x00\x00\x01".to_vec(), pps.to_vec()].concat());
+        assert_eq!(
+            aus[0],
+            [b"\x00\x00\x00\x01".to_vec(), pps.to_vec()].concat()
+        );
     }
 
     #[test]

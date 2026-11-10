@@ -100,9 +100,6 @@ mod tests {
 
     #[test]
     fn connected_state_key_grammar() {
-        assert_eq!(
-            connected_state_key("L+ PC"),
-            "L+ PC_device_connected_state"
-        );
+        assert_eq!(connected_state_key("L+ PC"), "L+ PC_device_connected_state");
     }
 }

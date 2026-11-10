@@ -26,9 +26,7 @@ const MAX_NAL: usize = 4 * 1024 * 1024;
 /// RTSP methods on the WFD lanes (RFC 7826 set minus the ANNOUNCE-family
 /// extras the engine never emits). Wire spelling is strum-derived — method
 /// names exist in exactly one place, on the variants.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter, AsRefStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter, AsRefStr)]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 pub enum RtspMethod {
     Options,
@@ -826,9 +824,7 @@ mod tests {
             &[("Transport", "RTP/AVP/UDP;unicast;client_port=15550-15551")],
         );
         let wire = m.to_bytes();
-        assert!(
-            wire.starts_with(b"SETUP rtsp://192.0.2.2:7236/wfd1.0/streamid=0 RTSP/1.0\r\n")
-        );
+        assert!(wire.starts_with(b"SETUP rtsp://192.0.2.2:7236/wfd1.0/streamid=0 RTSP/1.0\r\n"));
         let s = String::from_utf8(wire.clone()).unwrap();
         assert!(s.contains("CSeq: 3\r\n"));
         assert!(s.contains("Transport: RTP/AVP/UDP;unicast;client_port=15550-15551\r\n"));

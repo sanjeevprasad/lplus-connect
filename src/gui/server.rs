@@ -308,10 +308,18 @@ mod tests {
         let port = super::spawn().expect("seam http server");
         // The vendor-browser boot path (shim.js, /vendor tree, renderer-only
         // permission stub) was removed with the JS half; they must 404.
-        for path in ["/", "/index.html", "/vendor/", "/shim.js", "/check_local_network_permission"] {
+        for path in [
+            "/",
+            "/index.html",
+            "/vendor/",
+            "/shim.js",
+            "/check_local_network_permission",
+        ] {
             let buf = request(
                 port,
-                format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").into_bytes().as_slice(),
+                format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .into_bytes()
+                    .as_slice(),
             );
             assert!(buf.starts_with("HTTP/1.1 404"), "{path}: {buf}");
         }

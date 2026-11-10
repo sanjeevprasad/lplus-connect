@@ -91,7 +91,9 @@ fn load_host_name() -> String {
         let pinned = std::fs::read_to_string(settings_path())
             .ok()
             .and_then(|raw| parse_host_name(&raw));
-        pinned.or_else(crate::sdpd::system_hostname).unwrap_or_else(|| "L+ PC".into())
+        pinned
+            .or_else(crate::sdpd::system_hostname)
+            .unwrap_or_else(|| "L+ PC".into())
     }
     #[cfg(test)]
     {
@@ -220,7 +222,10 @@ fn route_invoke(channel: &str, payload: &Value) -> Option<Value> {
         // UNBIND (settings page / card delete): vendor payload
         // `{ device_id, removeStateDir }`; consumers toast on !ok.
         "generic_agent_settings_remove_device" => {
-            let id = payload.get("device_id").and_then(Value::as_str).unwrap_or("");
+            let id = payload
+                .get("device_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let found = crate::gui::devices::remove_device(id);
             Some(json!({ "ok": found, "deviceId": id }))
         }

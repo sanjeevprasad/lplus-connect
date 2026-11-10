@@ -420,7 +420,10 @@ mod tests {
         let id = "bHBsdXMtcGMtMQ==";
         let auth = json!({ "id": id, "public_key": "PUBKEYb64", "auth_version": 1 }).to_string();
         let (ability, rsp) = odmf_bodies("192.0.2.1", &auth);
-        for (v, cmd) in [(&ability, "pc_devicetype_supportodmf"), (&rsp, "rsp_odmf_key")] {
+        for (v, cmd) in [
+            (&ability, "pc_devicetype_supportodmf"),
+            (&rsp, "rsp_odmf_key"),
+        ] {
             let env: serde_json::Value = serde_json::from_str(v).expect("value json");
             assert_eq!(env["msg_type"], 50, "{cmd} envelope msg_type");
             assert_eq!(env["msg_cmd"], cmd);

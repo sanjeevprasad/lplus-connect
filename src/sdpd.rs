@@ -109,7 +109,10 @@ pub fn default_vip() -> String {
 /// the Windows/Node-style env vars, in that order.
 pub fn system_hostname() -> Option<String> {
     let from_file = |p: &str| -> Option<String> {
-        std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     };
     from_file("/proc/sys/kernel/hostname")
         .or_else(|| from_file("/etc/hostname"))
@@ -3008,7 +3011,10 @@ mod tests {
             .into_iter()
             .map(|(l, _)| l)
             .collect();
-        assert!(!v.iter().any(|l| l.starts_with(crate::rtsp::RtspMethod::Announce.as_ref())));
+        assert!(
+            !v.iter()
+                .any(|l| l.starts_with(crate::rtsp::RtspMethod::Announce.as_ref()))
+        );
     }
 }
 
