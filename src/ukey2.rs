@@ -13,12 +13,12 @@ use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::d2d::D2dConnectionContextV1;
-use protocol::protos::{
-    CipherCommitment, EcP256PublicKey, GenericPublicKey, Ukey2ClientFinished, Ukey2ClientInit,
-    Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit, ukey2_message,
+use proto::{
+    CipherCommitment, EcP256PublicKey, GenericPublicKey, PublicKeyType, Ukey2ClientFinished,
+    Ukey2ClientInit, Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit, ukey2_message,
 };
 
-const VERSION: u32 = 1;
+const VERSION: i32 = 1;
 const NONCE_LEN: usize = 32;
 const NEXT_PROTOCOL: &str = "AES_256_CBC-HMAC_SHA256";
 /// Used WITHOUT trailing NUL (C++ passes a const char* string).
@@ -79,11 +79,13 @@ fn generic_public_key(point: &PublicKey) -> Vec<u8> {
         }
     };
     let gp = GenericPublicKey {
-        key_type: Some(1), // EC_P256
+        r#type: PublicKeyType::EcP256 as i32,
         ec_p256_public_key: Some(EcP256PublicKey {
-            x: Some(signed(&bytes[1..33])),
-            y: Some(signed(&bytes[33..65])),
+            x: signed(&bytes[1..33]),
+            y: signed(&bytes[33..65]),
         }),
+        rsa2048_public_key: None,
+        dh2048_public_key: None,
     };
     gp.encode_to_vec()
 }
@@ -93,8 +95,7 @@ pub fn parse_public_key(generic: &[u8]) -> Result<PublicKey> {
     let ec = gp
         .ec_p256_public_key
         .context("missing ec_p256_public_key")?;
-    let x = ec.x.context("missing x")?;
-    let y = ec.y.context("missing y")?;
+    let (x, y) = (ec.x, ec.y);
     let pad32 = |b: &[u8]| -> Vec<u8> {
         let mut b = b;
         while b.len() > 32 && b.first() == Some(&0) {
@@ -211,6 +212,9 @@ impl Ukey2Handshake {
                         commitment: Some(Sha512::digest(&self.client_finish_raw).to_vec()),
                     }],
                     next_protocol: Some(NEXT_PROTOCOL.into()),
+                    // Official repeated field (v2 multi-protocol offer); this
+                    // client only ever offers the single legacy protocol.
+                    next_protocols: vec![],
                 };
                 self.our_init = wrap(ukey2_message::Type::ClientInit, &init.encode_to_vec());
                 Some(self.our_init.clone())
@@ -223,6 +227,8 @@ impl Ukey2Handshake {
                     random: Some(random),
                     handshake_cipher: Some(Ukey2HandshakeCipher::P256Sha512 as i32),
                     public_key: Some(generic_public_key(&self.public)),
+                    // Official field; the vendor server never sends it.
+                    selected_next_protocol: None,
                 };
                 self.our_init = wrap(ukey2_message::Type::ServerInit, &init.encode_to_vec());
                 Some(self.our_init.clone())

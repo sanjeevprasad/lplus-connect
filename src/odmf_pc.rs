@@ -21,9 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Once, OnceLock};
 
-use protocol::odmf::{
-    ChannelMsg, ConsultReply, Envelope, IceCandidate, Sdp, SendEnvelope, Signaled,
-};
+use proto::odmf::{ChannelMsg, ConsultReply, Envelope, IceCandidate, Sdp, SendEnvelope, Signaled};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::channel::ChannelId;
 use str0m::format::{Codec, FormatParams};
@@ -481,8 +479,8 @@ async fn drain(rtc: &mut Rtc, c: &mut DrainCtx<'_>) {
                     let command = serde_json::from_str::<ChannelMsg>(&txt)
                         .ok()
                         .and_then(|m| m.command);
-                    if command.and_then(|c| c.parse::<protocol::rtsp::RtspMethod>().ok())
-                        == Some(protocol::rtsp::RtspMethod::SetParameter)
+                    if command.and_then(|c| c.parse::<proto::rtsp::RtspMethod>().ok())
+                        == Some(proto::rtsp::RtspMethod::SetParameter)
                     {
                         // Phone echo (q2/i.java p(b)): consult was accepted.
                         **consult_ack = true;
@@ -539,7 +537,7 @@ fn send_consult(rtc: &mut Rtc, chan: &Option<ChannelId>, extra: Option<ChannelId
         env_or("ODMF_SINK_FPS", "30").parse().unwrap_or(30),
     );
     let reply = serde_json::to_string(&ConsultReply {
-        command: protocol::rtsp::RtspMethod::SetParameter.to_string(),
+        command: proto::rtsp::RtspMethod::SetParameter.to_string(),
         width: w,
         height: h,
         fps,

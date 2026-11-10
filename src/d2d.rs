@@ -2,10 +2,10 @@
 //! google/ukey2 (d2d_crypto_ops.cc / d2d_connection_context_v1.cc) and
 //! google/securemessage C++ references.
 //!
-//! Wire: SecureMessage { header_and_body = RawHAB { Header, AES-256-CBC body },
-//! signature = HMAC-SHA256 }. Same secret key signs and encrypts, so the C++
-//! skips the plaintext tag (TaggedPlaintextRequired == false) and no
-//! associated data is present.
+//! Wire: SecureMessage { header_and_body = HeaderAndBody { Header,
+//! AES-256-CBC body }, signature = HMAC-SHA256 }. Same secret key signs and
+//! encrypts, so the C++ skips the plaintext tag
+//! (TaggedPlaintextRequired == false) and no associated data is present.
 
 use aes::Aes256;
 use anyhow::{Context, Result, bail, ensure};
@@ -16,7 +16,7 @@ use prost::Message;
 use rand::Rng;
 use sha2::Sha256;
 
-use protocol::protos::{
+use proto::{
     DeviceToDeviceMessage, EncScheme, GcmMetadata, Header, HeaderAndBody, SecureMessage, SigScheme,
 };
 
@@ -34,7 +34,7 @@ pub const SM_SALT: &[u8; 32] = &[
 
 const PURPOSE_ENC: &[u8] = b"ENC:2"; // "ENC:" + AES_256_CBC scheme number
 const PURPOSE_SIG: &[u8] = b"SIG:1"; // "SIG:" + HMAC_SHA256 scheme number
-const GCM_TYPE_D2D_MESSAGE: u32 = 1; // GcmMetadata type used by D2D context v1
+const GCM_TYPE_D2D_MESSAGE: i32 = 1; // GcmMetadata type used by D2D context v1
 
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
@@ -83,28 +83,24 @@ pub fn signcrypt(secret: &[u8], public_metadata: &[u8], payload: &[u8]) -> Resul
         .encrypt_padded_vec::<NoPadding>(&body);
 
     let header = Header {
-        signature_scheme: Some(SigScheme::HmacSha256 as i32),
+        signature_scheme: SigScheme::HmacSha256 as i32,
+        encryption_scheme: EncScheme::Aes256Cbc as i32,
         verification_key_id: None,
-        encryption_scheme: Some(EncScheme::Aes256Cbc as i32),
         decryption_key_id: None,
+        iv: Some(iv),
         public_metadata: Some(public_metadata.to_vec()),
         associated_data_length: None,
-        iv: Some(iv),
-    }
-    .encode_to_vec();
-    let hab = HeaderAndBody {
-        header: Some(header),
-        body: Some(ct),
-    }
-    .encode_to_vec();
+        nonce: None,
+    };
+    let hab = HeaderAndBody { header, body: ct }.encode_to_vec();
 
     let mut mac = Hmac::<Sha256>::new_from_slice(&sig_key).context("hmac key")?;
     mac.update(&hab);
     let signature = mac.finalize().into_bytes().to_vec();
 
     Ok(SecureMessage {
-        header_and_body: Some(hab),
-        signature: Some(signature),
+        header_and_body: hab,
+        signature,
     }
     .encode_to_vec())
 }
@@ -112,8 +108,8 @@ pub fn signcrypt(secret: &[u8], public_metadata: &[u8], payload: &[u8]) -> Resul
 /// Inverse of [`signcrypt`]; returns (public_metadata, payload).
 pub fn verify_decrypt(secret: &[u8], wire: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let sm = SecureMessage::decode(wire).context("SecureMessage decode")?;
-    let hab = sm.header_and_body.context("missing header_and_body")?;
-    let signature = sm.signature.context("missing signature")?;
+    let hab = sm.header_and_body;
+    let signature = sm.signature;
 
     let sig_key = sm_derive(secret, PURPOSE_SIG)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(&sig_key).context("hmac key")?;
@@ -122,18 +118,17 @@ pub fn verify_decrypt(secret: &[u8], wire: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
         .map_err(|_| anyhow::anyhow!("hmac verify failed"))?;
 
     let parsed = HeaderAndBody::decode(hab.as_slice()).context("HeaderAndBody decode")?;
-    let header = Header::decode(parsed.header.context("missing header")?.as_slice())
-        .context("Header decode")?;
+    let header = parsed.header;
     ensure!(
-        header.signature_scheme == Some(SigScheme::HmacSha256 as i32)
-            && header.encryption_scheme == Some(EncScheme::Aes256Cbc as i32),
+        header.signature_scheme == SigScheme::HmacSha256 as i32
+            && header.encryption_scheme == EncScheme::Aes256Cbc as i32,
         "unexpected schemes"
     );
     let iv = header.iv.context("missing iv")?;
     let enc_key = sm_derive(secret, PURPOSE_ENC)?;
     let mut plain = Aes256CbcDec::new_from_slices(&enc_key, &iv)
         .context("aes key len")?
-        .decrypt_padded_vec::<NoPadding>(&parsed.body.context("missing body")?)
+        .decrypt_padded_vec::<NoPadding>(&parsed.body)
         .map_err(|_| anyhow::anyhow!("aes decrypt failed"))?;
     pkcs7_strip(&mut plain)?;
     Ok((header.public_metadata.unwrap_or_default(), plain))
@@ -176,7 +171,7 @@ impl D2dConnectionContextV1 {
         }
         .encode_to_vec();
         let meta = GcmMetadata {
-            type_field: Some(GCM_TYPE_D2D_MESSAGE),
+            r#type: GCM_TYPE_D2D_MESSAGE,
             version: Some(1),
         }
         .encode_to_vec();
@@ -186,10 +181,7 @@ impl D2dConnectionContextV1 {
     pub fn decode_from_peer(&mut self, wire: &[u8]) -> Result<Vec<u8>> {
         let (meta, d2d_bytes) = verify_decrypt(&self.decode_key, wire)?;
         let parsed = GcmMetadata::decode(meta.as_slice()).context("GcmMetadata decode")?;
-        ensure!(
-            parsed.type_field == Some(GCM_TYPE_D2D_MESSAGE),
-            "wrong gcm type"
-        );
+        ensure!(parsed.r#type == GCM_TYPE_D2D_MESSAGE, "wrong gcm type");
         let d2d = DeviceToDeviceMessage::decode(d2d_bytes.as_slice())
             .context("DeviceToDeviceMessage decode")?;
         self.decode_seq += 1;

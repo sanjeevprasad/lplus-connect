@@ -75,7 +75,7 @@ pub fn parse_set_state(out: &str) -> SetState {
     let Some(start) = out.find('{') else {
         return SetState::Failed("no json in app_function output".into());
     };
-    let Ok(env) = serde_json::from_str::<protocol::appfn::AppStateOut>(&out[start..]) else {
+    let Ok(env) = serde_json::from_str::<proto::appfn::AppStateOut>(&out[start..]) else {
         return SetState::Failed("unparseable app_function output".into());
     };
     let Some(item) = env.items.first() else {

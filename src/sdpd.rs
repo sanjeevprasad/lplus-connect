@@ -150,7 +150,7 @@ pub fn reply_variants(verb: &str) -> Vec<(String, Vec<(&'static str, &'static st
         ("ANNOUNCE * HTTP/1.1".into(), vec![]),
     ];
     if ProbeVerb::from_str(verb) != Ok(ProbeVerb::Query) {
-        out.retain(|(line, _)| !line.starts_with(protocol::rtsp::RtspMethod::Announce.as_ref()));
+        out.retain(|(line, _)| !line.starts_with(proto::rtsp::RtspMethod::Announce.as_ref()));
     }
     out
 }
@@ -551,12 +551,17 @@ fn kms_bootstrap_frame(
 }
 
 /// Drive the phone's PC-panel row with retries: the AppFunction gate only
-/// accepts a transition while the accessory engine's list is fresh, so on
-/// a stale/not-found verdict we poke the phone to rescan and try again.
+/// accepts a transition while the accessory engine's list is fresh, and
+/// that window lasts seconds (one discovery cycle). The phone re-discovers
+/// our PC every `announce_secs`, so retry the set on a short cadence to
+/// land inside the next window; the linker-panel poke (a full app start,
+/// ~1 s of adb) runs once, before the tight loop.
 async fn drive_panel_state(ip: &str, dev_name: &str, connect: bool) {
     use crate::steer::SetState;
     let verb = if connect { "connect" } else { "disconnect" };
-    for attempt in 0..3u8 {
+    const ATTEMPTS: u8 = 12;
+    crate::steer::poke_linker_panel().await;
+    for attempt in 0..ATTEMPTS {
         let Ok(out) = crate::steer::set_connected_state(dev_name, connect).await else {
             tracing::warn!("[cmd] {verb} {ip} FAILED (adb)");
             return;
@@ -569,18 +574,20 @@ async fn drive_panel_state(ip: &str, dev_name: &str, connect: bool) {
                 );
                 return;
             }
-            SetState::Retryable(reason) if attempt < 2 => {
+            SetState::Retryable(reason) if attempt < ATTEMPTS - 1 && attempt % 4 == 3 => {
+                // Same verdict every window: nudge the engine to rescan.
                 tracing::info!("[cmd] {verb} {ip}: panel stale ({reason}); rescanning phone");
-                crate::steer::poke_linker_panel().await;
                 crate::steer::refresh_panel_snapshot().await;
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-            SetState::Retryable(reason) | SetState::Failed(reason) => {
+            SetState::Retryable(_) => {}
+            SetState::Failed(reason) => {
                 tracing::warn!("[cmd] {verb} {ip} rejected: {reason}");
                 return;
             }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
     }
+    tracing::warn!("[cmd] {verb} {ip} rejected: panel row never fresh in {ATTEMPTS} attempts");
 }
 
 fn spawn_command_runner(dev_name: String, kms_pwd: String, local_ip: String, kms_port: u16) {
@@ -1202,14 +1209,22 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
             _ = pub_ticker.tick(), if link_pub_bytes.is_some() => {
                 if let Some(phone) = last_phone {
                     // Rotate candidate service-id formats: the phone logs
-                    // `Invalid service id format: <value>` until one passes.
-                    let ns_candidates: [&str; 6] = [
-                        "0123456789abcdef",
-                        "TGlua1N3aXRjaE1ncg",
-                        "SenselessLinkSwitchMgr.sdp",
-                        "sdp/LinkSwitchMgr",
-                        "linkswitchmgr",
-                        "LinkSwitchMgr",
+                    // `Invalid service id format: <value>` per rejection,
+                    // so the pass-through candidate is whichever one stops
+                    // appearing there (and shows up in dispatch logs).
+                    let ns_candidates: [&str; 12] = [
+                        "com.oplus.linkswitchmgr",
+                        "com.oplus.linkswitchmgr.sdp",
+                        "com.heytap.linkswitchmgr.sdp",
+                        "com.oplus.pantaconnect.LinkSwitchMgr",
+                        "LinkSwitchMgr.sdp",
+                        "PeripheralDiscoveryService.sdp",
+                        "AlwaysOnFusionService",
+                        "0000fd70-0000-1000-8000-00805f9b34fb",
+                        "e83b6f1c2d4a5b9087654321abcdef01",
+                        "linkswitchmgr@sdp",
+                        "TGlua1N3aXRjaE1ncg==",
+                        "sdp:LinkSwitchMgr",
                     ];
                     let ns_use = if linkns == "LinkSwitchMgr" {
                         { ns_i += 1; ns_candidates[(ns_i as usize) % ns_candidates.len()] }
@@ -3240,7 +3255,7 @@ mod tests {
             .collect();
         assert!(
             !v.iter()
-                .any(|l| l.starts_with(protocol::rtsp::RtspMethod::Announce.as_ref()))
+                .any(|l| l.starts_with(proto::rtsp::RtspMethod::Announce.as_ref()))
         );
     }
 }

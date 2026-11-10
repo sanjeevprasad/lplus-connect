@@ -24,8 +24,8 @@ use base64::Engine as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use protocol::odmf::{AuthFields, AuthInfoFile, AuthResponse, PairMsg, json_reply};
-use protocol::rtsp::{Rtsp, RtspExt, RtspMethod, WfdParam, response_with_body};
+use proto::odmf::{AuthFields, AuthInfoFile, AuthResponse, PairMsg, json_reply};
+use proto::rtsp::{Rtsp, RtspExt, RtspMethod, WfdParam, response_with_body};
 use strum::IntoEnumIterator;
 
 const START_CODE: &[u8] = b"\x00\x00\x00\x01";
@@ -908,7 +908,7 @@ impl H265Depacketizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::rtsp::{parse_rtp, request, request_with_body};
+    use proto::rtsp::{parse_rtp, request, request_with_body};
 
     /// Regression: reproduce Java `BtIdentityAuthHelper` (odmfi/odmfg::odmfb)
     /// exactly — raw 65-B uncompressed peer point, raw ECDH X as AES-256 key,

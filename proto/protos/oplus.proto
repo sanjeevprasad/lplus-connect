@@ -1,0 +1,24 @@
+// L+ Connect — the one message that DIVERGES from Google's protos.
+//
+// Everything else in this crate is generated verbatim from Google's
+// canonical files (see build.rs). This is the phone's UKEY2 fork: the
+// LIVE engine ships the 16-byte AES IV for the post-ukey2 frame cryptor in
+// a tag-2 `iv_spec` on its ClientFinished. We only ever DECODE this field
+// (our own ClientFinished sends it unset, so on the wire we are byte-equal
+// to Google's message — pinned in `tests/proto_cross.rs`). Do not "align"
+// without a fresh capture: the phone's messages really carry tag 2.
+//
+// Corroboration from Oplus's own builds (2026-11-10): the PC engine
+// `devicespace.exe` links their private Rust crate `connect-protocols`
+// (git rev c7a96db; panic strings `ukey2 iv size error`) and its prost
+// field pool contains `Ukey2ClientFinished iv_spec` — the fork is declared
+// in their own ukey.proto, with this exact field name. `pantaChannelService
+// .exe` embeds the C++ descriptor as `ivSpec` at the same tag 2.
+
+syntax = "proto2";
+package opluswire;
+
+message Ukey2ClientFinished {
+  optional bytes public_key = 1;
+  optional bytes iv_spec = 2;
+}

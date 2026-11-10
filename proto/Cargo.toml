@@ -1,0 +1,24 @@
+[package]
+name    = "proto"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+# Phone↔PC wire contract only: prost-generated protobuf (Google's
+# canonical protos in protos/ + oplus.proto for the single phone-forked
+# message) plus the JSON/text lanes (odmf, pair, appfn, rtsp). No sockets,
+# no tokio, no state — anything daemon↔gui belongs to the `lplus` bin.
+
+[dependencies]
+prost      = { workspace = true }
+rtsp-types = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+strum      = { workspace = true }
+thiserror  = { workspace = true }
+
+# Codegen from protos/. Requires protoc.
+[build-dependencies]
+prost-build = { workspace = true }
+
+[dev-dependencies]
+prost = { workspace = true }

@@ -4,9 +4,13 @@
 //! Wire: each message travels in a cpbus data frame `[40 30][len u16be]
 //! [type u16be][seq u16be][7b || protobuf]`. `ScpMessage` selects the
 //! protocol step; `q` is the hello envelope; `SyncData` carries the device
-//! advertisement. Field numbers recovered from the phone engine's protobuf
-//! generated classes (`com.oplus.pantaconnect.connection.scp.{f0,q,
-//! ScpSyncData}`).
+//! advertisement. Field numbers verified against the live phone build
+//! (`OnePlus/CPH2745IN:17/CP2A.260605.016`, `com.heytap.accessory`
+//! AccessoryFramework.apk sha256 `e6dc3c55c710850a…778f3b51`): generated
+//! protobuf-lite classes `com.oplus.pantaconnect.connection.scp.{f0,q,
+//! ScpSyncData,d0}` declare MSGTYPE=1/DATA=2; SEQUENCENO=1/CHANNEL=2/
+//! NAMESPACE=3/SERVICENAME=4; DEVICENAME=1..LINKTYPE=7; DEVICEID=1/KSC=2/
+//! KSCALIAS=3, and `ScpSyncData.LinkType` = P2P,WLAN,CLOUD,USB,SPP (0–4).
 
 use prost::Message;
 
@@ -101,31 +105,17 @@ pub const TOKEN: [u8; 3] = [0x08, 0xad, 0x12];
 pub fn q_from_payload(payload: &[u8]) -> Option<Hello> {
     let b = payload.strip_prefix(&[0x7b])?;
     let b = b.strip_prefix(&TOKEN).unwrap_or(b);
-    if b.first() == Some(&0x12) {
-        let mut br = &b[1..];
-        // varint length
-        let mut shift = 0;
-        let mut len: usize = 0;
-        loop {
-            let byte = *br.first()?;
-            br = &br[1..];
-            len |= ((byte & 0x7f) as usize) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 28 {
-                return None;
-            }
-        }
-        if br.len() >= len {
-            Hello::decode(&br[..len]).ok()
-        } else {
-            None
-        }
-    } else {
-        None
+    // The peer's HELLO is `ScpMessage { 2: q }` with msg_type omitted; let
+    // prost do the field-2 framing. SYNC payloads start with field 1, so
+    // the guard rejects them just as the hand-rolled scan did.
+    if b.first() != Some(&0x12) {
+        return None;
     }
+    let sm = ScpMessage::decode(b).ok()?;
+    if sm.msg_type.is_some() {
+        return None;
+    }
+    Hello::decode(sm.data.as_slice()).ok()
 }
 
 /// HELLO frame with an explicit sequence number (echo the peer's).

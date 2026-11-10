@@ -139,6 +139,14 @@ lplus backend (in-process, same binary)
   `apply_daemon_env()` seeds the env-driven knobs — SCP_*, EPI, KMS(36863),
   LINK_*, REPL, `SCP_INTERACT=accept`, `LPLUS_EVENTS_PORT=14752` — in `main`
   while single-threaded (CLI `--name/--csp/--vip` override `SdpdConfig`).
+  Non-defaulted knobs: `LPLUS_USB=1` re-enables the adb/USB device lane
+  (hidden by default: Wi-Fi-only device lists; paired bonds stay persisted
+  either way); `ODMF_LIVE=1` pipes decoded mirror frames to the in-window
+  live preview (`ODMF_PLAYER`/`ODMF_FFMPEG` override the players), and
+  `ODMF_LISTEN`/`ODMF_RTP_PORT` move the mirror RTSP/RTP endpoints;
+  `LINKPUB` replaces the auto-built `LinkInfoPayload` blob (hex) that the
+  LinkSwitchMgr `SERVICE-PUBLISH` carries, `LINKNS` pins the published
+  service id instead of rotating candidates.
   Before the backend starts, `preflight_or_die` bind-checks every port the
   daemon takes (csp family, datatrans lanes, UDP 10150/10151, REPL, bridge)
   and **fails loudly** naming each port and the holder (`ss -ltnp` /

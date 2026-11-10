@@ -101,7 +101,7 @@ fn pairing_url_base() -> String {
 
 #[cfg(test)]
 fn pairing_qr_param(host: &str) -> String {
-    use protocol::pair::{HeySynergy, Synergy};
+    use proto::pair::{HeySynergy, Synergy};
 
     let bean = Synergy {
         mac: String::new(),

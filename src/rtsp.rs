@@ -1,14 +1,14 @@
 //! Cast video lane driver (PROTOCOL.md §7.3): the PC connects to the
 //! phone's RTSP server, drives OPTIONS/DESCRIBE/SETUP/PLAY, then receives
 //! RTP/UDP H.264 on the advertised port pair. Wire types (RTSP messages,
-//! RTP headers, SDP, depacketizer) live in `protocol::rtsp`.
+//! RTP headers, SDP, depacketizer) live in `proto::rtsp`.
 
 use anyhow::{Context, Result};
 use std::io::{BufReader, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
-use protocol::rtsp::{
+use proto::rtsp::{
     H264Depacketizer, PT_H264, RtspExt, RtspMethod, parse_rtp, parse_sdp, read_msg, request,
 };
 
@@ -231,7 +231,7 @@ pub fn pump_rtp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::rtsp::response_with_body;
+    use proto::rtsp::response_with_body;
 
     fn nalu(t: u8, body: &[u8]) -> Vec<u8> {
         let mut v = vec![t];
