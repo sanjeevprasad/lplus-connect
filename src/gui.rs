@@ -13,6 +13,7 @@
 //! See `../GUI.md` for the vendored-renderer port and the full IPC channel
 //! registry.
 
+pub mod api;
 pub mod cast;
 pub mod devices;
 pub(crate) mod ipc;

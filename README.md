@@ -28,6 +28,7 @@ and other state live in the same directory.
 cargo test                               # daemon + UI tests
 cargo clippy --all-targets -- -D warnings
 ./check.sh                               # gitleaks + cargo deny
+git config core.hooksPath hooks          # once per clone: pre-commit runs check.sh
 ```
 
 Internals — architecture, IPC channel registry, device model, UI module map,

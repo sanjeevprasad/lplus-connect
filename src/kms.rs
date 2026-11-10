@@ -312,6 +312,8 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                 }
                 let mut acc: Vec<u8> = Vec::new();
                 let mut tmp = [0u8; 4096];
+                // Rate-limited link-evidence refresh (see epi lane).
+                let mut last_ev = tokio::time::Instant::now();
                 'read: loop {
                     let rd = match &mut repl_rx {
                         Some(rx) => tokio::select! {
@@ -336,7 +338,18 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                     };
                     match rd {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => acc.extend_from_slice(&tmp[..n]),
+                        Ok(n) => {
+                            acc.extend_from_slice(&tmp[..n]);
+                            if last_ev.elapsed() >= std::time::Duration::from_secs(60) {
+                                last_ev = tokio::time::Instant::now();
+                                crate::sdpd::emit_device(
+                                    "kms",
+                                    peer.ip().to_string(),
+                                    None,
+                                    true,
+                                );
+                            }
+                        }
                     }
                     // Frame-split the accumulator (24 B header + length body).
                     loop {

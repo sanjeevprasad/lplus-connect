@@ -540,24 +540,49 @@ fn kms_bootstrap_frame(
     ))
 }
 
+/// Drive the phone's PC-panel row with retries: the AppFunction gate only
+/// accepts a transition while the accessory engine's list is fresh, so on
+/// a stale/not-found verdict we poke the phone to rescan and try again.
+async fn drive_panel_state(ip: &str, dev_name: &str, connect: bool) {
+    use crate::steer::SetState;
+    let verb = if connect { "connect" } else { "disconnect" };
+    for attempt in 0..3u8 {
+        let Ok(out) = crate::steer::set_connected_state(dev_name, connect).await else {
+            tracing::warn!("[cmd] {verb} {ip} FAILED (adb)");
+            return;
+        };
+        match crate::steer::parse_set_state(&out) {
+            SetState::Success => {
+                tracing::info!(
+                    "[cmd] {verb} {ip} via app_function (attempt {})",
+                    attempt + 1
+                );
+                return;
+            }
+            SetState::Retryable(reason) if attempt < 2 => {
+                tracing::info!("[cmd] {verb} {ip}: panel stale ({reason}); rescanning phone");
+                crate::steer::poke_linker_panel().await;
+                crate::steer::refresh_panel_snapshot().await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            SetState::Retryable(reason) | SetState::Failed(reason) => {
+                tracing::warn!("[cmd] {verb} {ip} rejected: {reason}");
+                return;
+            }
+        }
+    }
+}
+
 fn spawn_command_runner(dev_name: String, kms_pwd: String, local_ip: String, kms_port: u16) {
     tokio::spawn(async move {
         let mut rx = subscribe_commands();
         while let Ok(cmd) = rx.recv().await {
             match cmd {
                 Command::Connect { ip } => {
-                    match crate::steer::set_connected_state(&dev_name, true).await {
-                        Ok(out) => {
-                            tracing::info!("[cmd] connect {ip} via app_function: {}", out.trim())
-                        }
-                        Err(e) => tracing::warn!("[cmd] connect {ip} FAILED: {e:#}"),
-                    }
+                    drive_panel_state(&ip, &dev_name, true).await;
                 }
                 Command::Disconnect { ip } => {
-                    match crate::steer::set_connected_state(&dev_name, false).await {
-                        Ok(out) => tracing::info!("[cmd] disconnect {ip}: {}", out.trim()),
-                        Err(e) => tracing::warn!("[cmd] disconnect {ip} FAILED: {e:#}"),
-                    }
+                    drive_panel_state(&ip, &dev_name, false).await;
                 }
                 Command::KmsBootstrap { ip } => {
                     let from =
@@ -914,7 +939,14 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
     let link_pub_bytes: Option<Vec<u8>> = std::env::var("LINKPUB")
         .ok()
         .filter(|s| !s.is_empty())
-        .map(|s| hex::decode(&s).unwrap_or_else(|_| s.as_bytes().to_vec()));
+        .map(|s| hex::decode(&s).unwrap_or_else(|_| s.as_bytes().to_vec()))
+        .or_else(|| {
+            Some(link_info_payload(
+                &link_mac_spec(),
+                &cfg.vip,
+                &gateway_of(&cfg.vip),
+            ))
+        });
     if let Ok(spec) = std::env::var("LINK_PORTS") {
         // Reply template: mirror the phone's own 66B link-detection frame
         // (captured live): `[00 40][0c][PDID ascii 12][01 38 02 01 00]
@@ -1290,6 +1322,10 @@ fn spawn_session_logger(
                 // re-handshake needed. Key: "{port} {peer}".
                 let repl_on = std::env::var("LPLUS_REPL_PORT").is_ok();
                 let repl_key = format!("{epi_port} {peer}");
+                // Rate-limited link-evidence refresh: devices.rs drops
+                // `is_connected` when a row goes quiet, so live traffic
+                // must re-assert presence (≤1/min, cheap broadcast).
+                let mut last_ev = tokio::time::Instant::now();
                 emit_device("epi", event_host(&peer), None, true);
                 let mut repl_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> = None;
                 if repl_on {
@@ -1402,6 +1438,10 @@ fn spawn_session_logger(
                         }
                         Ok(n) => {
                             acc.extend_from_slice(&tmp[..n]);
+                            if last_ev.elapsed() >= std::time::Duration::from_secs(60) {
+                                last_ev = tokio::time::Instant::now();
+                                emit_device("epi", event_host(&peer), None, true);
+                            }
                             tracing::info!(
                                 "[epi] :{epi_port} <- {peer} {n}B | {}",
                                 hex::encode(&tmp[..n.min(64)])
@@ -2976,9 +3016,119 @@ async fn handle(
     }
 }
 
+/// bincode (varint encoding) unsigned integer.
+fn bincode_varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8 & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// bincode (varint encoding) string: varint length + UTF-8 bytes.
+fn bincode_str(s: &str, out: &mut Vec<u8>) {
+    bincode_varint(s.len() as u64, out);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Identity MAC for link frames: `LINK_MAC`, else `eth0`, else synthetic.
+fn link_mac_spec() -> String {
+    std::env::var("LINK_MAC")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/sys/class/net/eth0/address")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "aa:bb:cc:dd:ee:ff".into())
+}
+
+/// Gateway string derived from the VIP's first three octets.
+fn gateway_of(vip: &str) -> String {
+    let octets: Vec<&str> = vip.split('.').collect();
+    if octets.len() == 4 {
+        format!("{}.{}.{}.1", octets[0], octets[1], octets[2])
+    } else {
+        vip.to_string()
+    }
+}
+
+/// `LinkInfoPayload` for the LinkSwitchMgr `SERVICE-PUBLISH`
+/// (phone-side parser: libcpkit `0x26528c` → `0x26392c`):
+/// TLV `tag u16le 0x332F` + `version u8 0x32`, bincode varint length,
+/// then bincode(varint) `LinkInfoPayloadData{compact_links,
+/// v_gateway_ip_addr, need_all_response, known_peer_devices}`.
+fn link_info_payload(mac: &str, ip: &str, gw: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    bincode_varint(1, &mut body); // compact_links: one entry
+    bincode_varint(1, &mut body); // link_states_bitmap: WLAN_STA connected
+    bincode_str(mac, &mut body); // link_mac_addr
+    bincode_str(ip, &mut body); // link_ip_addr
+    bincode_str(gw, &mut body); // v_gateway_ip_addr
+    body.push(0); // need_all_response: false
+    bincode_varint(0, &mut body); // known_peer_devices: []
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&[0x2f, 0x33, 0x32]); // tag 0x332F (LE) + version 0x32
+    bincode_varint(body.len() as u64, &mut out);
+    out.extend_from_slice(&body);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published blob must round-trip the phone parser's contract:
+    /// TLV header `2f 33 32`, bincode varint payload length, then the
+    /// six `LinkInfoPayloadData` fields in order.
+    #[test]
+    fn link_info_payload_round_trips_fields() {
+        let mac = "02:00:00:00:00:01";
+        let ip = "192.0.2.11";
+        let gw = "192.0.2.1";
+        let blob = link_info_payload(mac, ip, gw);
+        assert_eq!(&blob[..3], &[0x2f, 0x33, 0x32]);
+
+        let mut cur = &blob[3..];
+        let read_varint = |cur: &mut &[u8]| -> u64 {
+            let mut v = 0u64;
+            let mut shift = 0;
+            loop {
+                let b = cur[0];
+                *cur = &cur[1..];
+                v |= ((b & 0x7f) as u64) << shift;
+                if b & 0x80 == 0 {
+                    return v;
+                }
+                shift += 7;
+            }
+        };
+        let read_str = |cur: &mut &[u8]| -> String {
+            let n = read_varint(cur) as usize;
+            let s = String::from_utf8(cur[..n].to_vec()).unwrap();
+            *cur = &cur[n..];
+            s
+        };
+
+        let payload_len = read_varint(&mut cur) as usize;
+        assert_eq!(payload_len, cur.len());
+        assert_eq!(read_varint(&mut cur), 1); // compact_links count
+        assert_eq!(read_varint(&mut cur), 1); // link_states_bitmap
+        assert_eq!(read_str(&mut cur), mac);
+        assert_eq!(read_str(&mut cur), ip);
+        assert_eq!(read_str(&mut cur), gw);
+        assert_eq!(cur[0], 0); // need_all_response
+        cur = &cur[1..];
+        assert_eq!(read_varint(&mut cur), 0); // known_peer_devices
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn gateway_of_derives_from_vip() {
+        assert_eq!(gateway_of("192.0.2.11"), "192.0.2.1");
+        assert_eq!(gateway_of("not-an-ip"), "not-an-ip");
+    }
 
     #[test]
     fn render_has_all_validated_headers() {

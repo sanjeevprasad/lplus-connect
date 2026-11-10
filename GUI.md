@@ -278,10 +278,12 @@ wall 9/9 PASS against vendor references.
 
 ## 10. Known gaps / honest stubs
 
-- Device cards vs the vendor: the "Mobile network" warning tag and the
-  ability-gated Screen Collaborate entry have no backend data yet
-  (`deviceCellularStatus`, `isHaveScreenShareAbility`), so the tag is
-  omitted and the entry always shows (its route is the audited stub).
+- Device cards vs the vendor: the "Mobile network" warning tag has no
+  backend data yet (`deviceCellularStatus`), so it is omitted; the
+  Screen Collaborate quick entry is rendered greyed and non-clickable
+  until the multi-screen backend channels exist (no
+  `isHaveScreenShareAbility` in the rows either — flip the `enabled`
+  arg in `card_feature_entry` to re-arm it).
 
 - Icons are open-licensed, not vendor copies: every glyph (nav rail, floor
   controls, QR overlays) is a **Lucide** (ISC) SVG embedded from the

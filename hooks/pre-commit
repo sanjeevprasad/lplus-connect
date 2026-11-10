@@ -1,0 +1,15 @@
+#!/bin/sh
+# pre-commit — run the repo gate (gitleaks history/staged/unstaged +
+# cargo deny via check.sh) before a commit is recorded.
+# Usage: installed via `git config core.hooksPath hooks`.
+# Bypass: SKIP_CHECKS=1 git commit ... (or git commit --no-verify).
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+if [ "${SKIP_CHECKS:-0}" = 1 ]; then
+    printf 'pre-commit: SKIP_CHECKS=1, gate skipped\n'
+    exit 0
+fi
+
+./check.sh

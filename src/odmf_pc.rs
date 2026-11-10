@@ -18,6 +18,7 @@
 //! offer/answer/candidate through two channels.
 
 use std::net::{IpAddr, SocketAddr};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Once, OnceLock};
 
 use str0m::change::{SdpAnswer, SdpPendingOffer};
@@ -26,8 +27,8 @@ use str0m::format::{Codec, FormatParams};
 use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::{DatagramRecv, Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, Rtc};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::broadcast;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Events the sink forwards into the WebRTC task.
 #[derive(Debug, Clone)]
@@ -204,7 +205,7 @@ async fn run(mut rx: UnboundedReceiver<PcEvent>, pc_ip: IpAddr, rtp_port: u16, o
     let mut rebuilds: u32 = 0;
     let mut connected_at: Option<tokio::time::Instant> = None;
     let mut depkt = crate::wfd_sink::H265Depacketizer::default();
-    let mut out: Option<std::fs::File> = None;
+    let mut out: Option<FrameSink> = None;
     let mut rtp_count: u64 = 0;
     let mut buf = vec![0u8; 2048];
     // Safety net: the phone's MEDIA_CONNECTED handler that requests the
@@ -399,7 +400,7 @@ struct DrainCtx<'a> {
     udp: &'a Arc<tokio::net::UdpSocket>,
     next_timeout: &'a mut tokio::time::Instant,
     depkt: &'a mut crate::wfd_sink::H265Depacketizer,
-    out: &'a mut Option<std::fs::File>,
+    out: &'a mut Option<FrameSink>,
     rtp_count: &'a mut u64,
     out_path: &'a str,
     chan: &'a mut Option<ChannelId>,
@@ -448,12 +449,10 @@ async fn drain(rtc: &mut Rtc, c: &mut DrainCtx<'_>) {
                     }
                     for au in depkt.push(&p.payload) {
                         if out.is_none() {
-                            **out = Some(open_out(out_path));
+                            **out = Some(open_sink(out_path));
                         }
-                        if let Some(f) = out.as_mut()
-                            && let Err(e) = std::io::Write::write_all(f, &au)
-                        {
-                            tracing::warn!("[webrtc] h265 write: {e}");
+                        if let Some(sink) = out.as_mut() {
+                            sink.write(&au);
                         }
                     }
                 }
@@ -567,7 +566,9 @@ fn send_consult(rtc: &mut Rtc, chan: &Option<ChannelId>, extra: Option<ChannelId
             match ch.write(false, reply.as_bytes()) {
                 Ok(n) => {
                     sent += 1;
-                    tracing::info!("[webrtc] tx consult SET_PARAMETER {n}B on {cid:?} (w{w} h{h} fps{fps})");
+                    tracing::info!(
+                        "[webrtc] tx consult SET_PARAMETER {n}B on {cid:?} (w{w} h{h} fps{fps})"
+                    );
                 }
                 Err(e) => tracing::warn!("[webrtc] channel {cid:?} write: {e}"),
             }
@@ -587,11 +588,258 @@ fn send_consult(rtc: &mut Rtc, chan: &Option<ChannelId>, extra: Option<ChannelId
     sent
 }
 
+/// Where received access units go: the file dump by default, or a player
+/// for live preview (`ODMF_LIVE=1`, see [`open_sink`]). `Native` decodes
+/// via ffmpeg to JPEG frames handed to the GPUI live-preview window;
+/// `Player` pipes the raw stream to ffplay's own window.
+enum FrameSink {
+    File(std::fs::File),
+    Player {
+        stdin: std::process::ChildStdin,
+        child: Child,
+    },
+    Native {
+        stdin: std::process::ChildStdin,
+        child: Child,
+    },
+}
+
+impl FrameSink {
+    fn write(&mut self, au: &[u8]) {
+        match self {
+            Self::File(f) => {
+                if let Err(e) = std::io::Write::write_all(f, au) {
+                    tracing::warn!("[webrtc] h265 write: {e}");
+                }
+            }
+            Self::Player { stdin, child } | Self::Native { stdin, child } => {
+                if let Err(e) = std::io::Write::write_all(stdin, au) {
+                    tracing::warn!("[webrtc] live preview write: {e}; closing player");
+                    let _ = child.kill();
+                }
+            }
+        }
+    }
+}
+
+/// What `ODMF_LIVE` asks for.
+#[derive(PartialEq, Eq, Debug)]
+enum LivePref {
+    Off,
+    /// Prefer the in-app GPUI window (needs the GUI bridge in this process).
+    Native,
+    /// External player window only.
+    Player,
+}
+
+fn live_pref() -> LivePref {
+    live_pref_from(std::env::var("ODMF_LIVE").ok().as_deref())
+}
+
+fn live_pref_from(value: Option<&str>) -> LivePref {
+    match value {
+        None | Some("") | Some("0") => LivePref::Off,
+        Some("player") | Some("ffplay") => LivePref::Player,
+        Some(_) => LivePref::Native,
+    }
+}
+
+fn open_sink(out_path: &str) -> FrameSink {
+    let pref = live_pref();
+    if pref == LivePref::Native {
+        #[cfg(feature = "gui")]
+        if crate::ui::live::request_native()
+            && let Some(n) = spawn_native()
+        {
+            return n;
+        }
+    }
+    if pref != LivePref::Off {
+        if let Some(player) = spawn_player() {
+            return player;
+        }
+        tracing::warn!("[webrtc] live preview unavailable; falling back to file dump");
+    }
+    FrameSink::File(open_out(out_path))
+}
+
+/// ffmpeg invocation: raw Annex-B H.265 on stdin → JPEG frames on stdout,
+/// buffering/analysis disabled for lowest practical latency.
+#[cfg(feature = "gui")]
+fn native_args() -> Vec<&'static str> {
+    vec![
+        "-loglevel",
+        "error",
+        "-probesize",
+        "32768",
+        "-analyzeduration",
+        "0",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-f",
+        "hevc",
+        "-i",
+        "pipe:0",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "-q:v",
+        "5",
+        "pipe:1",
+    ]
+}
+
+/// Extract complete, decodable JPEG frames from the decoder stdout byte
+/// stream as RGBA images. Entropy-coded JPEG data may itself contain
+/// `FFD9` byte pairs, so candidate ends are accepted only when the slice
+/// actually decodes; any trailing partial frame stays in `buf`.
+#[cfg(feature = "gui")]
+fn extract_preview_frames(buf: &mut Vec<u8>) -> Vec<image::RgbaImage> {
+    const SOI: [u8; 2] = [0xff, 0xd8];
+    const EOI: [u8; 2] = [0xff, 0xd9];
+    /// Bytes to retain when no frame start is visible yet (a marker may
+    /// straddle the next read); junk beyond this is dropped.
+    const TAIL: usize = 2;
+    /// A frame start that cannot yield a decodable frame within this many
+    /// bytes is treated as corrupt and skipped.
+    const MAX_FRAME_BYTES: usize = 16 << 20;
+    let mut frames = Vec::new();
+    loop {
+        let Some(start) = buf.windows(2).position(|w| w == SOI) else {
+            if buf.len() > TAIL {
+                buf.drain(..buf.len() - TAIL);
+            }
+            return frames;
+        };
+        let limit = (start + MAX_FRAME_BYTES).min(buf.len());
+        let mut consumed = None;
+        let mut at = start + 2;
+        while at + 2 <= limit {
+            let Some(rel) = buf[at..limit].windows(2).position(|w| w == EOI) else {
+                break;
+            };
+            let end = at + rel + 2;
+            if let Ok(img) = image::load_from_memory(&buf[start..end]) {
+                frames.push(img.to_rgba8());
+                consumed = Some(end);
+                break;
+            }
+            at = end;
+        }
+        match consumed {
+            Some(end) => buf.drain(..end),
+            // Corrupt frame start (unreasonably large) → skip it and retry
+            // at the next SOI; otherwise keep from the SOI onward, waiting
+            // for more bytes of the partial frame.
+            None if start + MAX_FRAME_BYTES <= buf.len() => buf.drain(..start + 2),
+            None => {
+                if start > 0 {
+                    buf.drain(..start);
+                }
+                return frames;
+            }
+        };
+    }
+}
+
+#[cfg(feature = "gui")]
+fn spawn_native() -> Option<FrameSink> {
+    let prog = env_or("ODMF_FFMPEG", "ffmpeg");
+    let mut child = match Command::new(&prog)
+        .args(native_args())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("[webrtc] spawn {prog} (native preview): {e}");
+            return None;
+        }
+    };
+    let stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    tracing::info!("[webrtc] native live preview via {prog} (jpeg frames → gpui window)");
+    std::thread::Builder::new()
+        .name("live-preview".into())
+        .spawn(move || {
+            use std::io::Read;
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        for rgba in extract_preview_frames(&mut buf) {
+                            crate::ui::live::push_frame(crate::ui::live::render_image(rgba));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[webrtc] decoder stdout: {e}");
+                        break;
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(FrameSink::Native { stdin, child })
+}
+
+/// ffplay invocation for a raw Annex-B H.265 stream on stdin, tuned for
+/// lowest practical latency (no buffering, no stream analysis).
+fn live_args() -> Vec<&'static str> {
+    vec![
+        "-loglevel",
+        "error",
+        "-probesize",
+        "32768",
+        "-analyzeduration",
+        "0",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-f",
+        "hevc",
+        "pipe:0",
+    ]
+}
+
+fn spawn_player() -> Option<FrameSink> {
+    let prog = env_or("ODMF_PLAYER", "ffplay");
+    let mut child = match Command::new(&prog)
+        .args(live_args())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("[webrtc] spawn {prog}: {e}");
+            return None;
+        }
+    };
+    let stdin = child.stdin.take()?;
+    tracing::info!("[webrtc] live preview via {prog}");
+    Some(FrameSink::Player { stdin, child })
+}
+
 fn open_out(path: &str) -> std::fs::File {
     if let Some(p) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(p);
     }
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         Ok(f) => {
             tracing::info!("[webrtc] writing H.265 access units to {path}");
             f
@@ -651,10 +899,8 @@ fn offer_or_resend(
                     // the client only dispatches SDP/candidate JSON nested in
                     // {"cmd":"send","msg":"<inner json string>"} —
                     // `onSocketMessage` case CMD_SEND → odmfc(msg).
-                    let inner =
-                        serde_json::json!({ "type": "offer", "sdp": sdp }).to_string();
-                    let payload =
-                        serde_json::json!({ "cmd": "send", "msg": inner }).to_string();
+                    let inner = serde_json::json!({ "type": "offer", "sdp": sdp }).to_string();
+                    let payload = serde_json::json!({ "cmd": "send", "msg": inner }).to_string();
                     for tag in tags {
                         let _ = sig_channel().send((tag.clone(), payload.clone()));
                     }
@@ -671,6 +917,127 @@ fn offer_or_resend(
 
 #[cfg(test)]
 mod tests {
+    /// Opt-in live smoke: run with `ODMF_LIVE=1` and a real
+    /// `../capture/video_odmf.h265` present; asserts the player sink
+    /// spawns and accepts access-unit bytes. Skips otherwise.
+    #[test]
+    fn live_sink_accepts_real_access_units() {
+        if std::env::var("ODMF_LIVE").is_err() {
+            return;
+        }
+        let Ok(bytes) = std::fs::read("../capture/video_odmf.h265") else {
+            return;
+        };
+        let mut sink = open_sink("/tmp/lplus-live-verify.h265");
+        assert!(
+            matches!(sink, FrameSink::Player { .. } | FrameSink::Native { .. }),
+            "ODMF_LIVE must yield a live sink"
+        );
+        sink.write(&bytes[..bytes.len().min(2 << 20)]);
+        if let FrameSink::Player { mut child, .. } = sink {
+            let _ = child.kill();
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn native_decoder_pipeline_yields_frames() {
+        // Exercises the real chain: Annex-B bytes → ffmpeg → jpeg splitter
+        // → image decode → bridge slot. Needs the recorded dump; skipped
+        // without it or without a spawnable ffmpeg.
+        let Ok(bytes) = std::fs::read("../capture/video_odmf.h265") else {
+            return;
+        };
+        let Some(mut sink) = spawn_native() else {
+            return;
+        };
+        // Feed from a mid-session window (100 MiB into the fixed capture):
+        // the recording's head is reference-broken (no IDR for the first
+        // 16 MiB, RPS errors), and ffmpeg only emits those frames on
+        // input EOF — useless for a live pipeline check. Mid-session
+        // windows decode continuously with stdin held open.
+        const START: usize = 100 << 20;
+        if bytes.len() <= START + (1 << 20) {
+            eprintln!("capture shorter than probe window; skipping");
+            return;
+        }
+        let before = crate::ui::live::produced_frames();
+        for chunk in bytes[START..START + (8 << 20)].chunks(1 << 20) {
+            sink.write(chunk);
+        }
+        // Close stdin (dropping the sink drops its stdin): ffmpeg flushes
+        // everything it buffered at input EOF, so the frame claim no
+        // longer depends on when the decoder decides to emit while
+        // streaming (that made this test flaky). The reader thread keeps
+        // draining stdout after the drop. The polling deadline is only a
+        // hang guard, not the expected runtime.
+        drop(sink);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while crate::ui::live::produced_frames() == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            crate::ui::live::produced_frames() > before,
+            "decoder produced no frames from real stream bytes"
+        );
+    }
+
+    #[test]
+    fn live_pref_maps_odmf_live() {
+        assert_eq!(live_pref_from(None), LivePref::Off);
+        assert_eq!(live_pref_from(Some("")), LivePref::Off);
+        assert_eq!(live_pref_from(Some("0")), LivePref::Off);
+        assert_eq!(live_pref_from(Some("player")), LivePref::Player);
+        assert_eq!(live_pref_from(Some("ffplay")), LivePref::Player);
+        assert_eq!(live_pref_from(Some("1")), LivePref::Native);
+        assert_eq!(live_pref_from(Some("gpui")), LivePref::Native);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn preview_frame_extractor_handles_partials_and_junk() {
+        use image::ImageBuffer;
+        let jpeg = |seed: u8| {
+            let img = ImageBuffer::from_fn(16, 16, |x, y| {
+                let r = ((x * 7 + seed as u32) % 256) as u8;
+                let g = ((y * 13) % 256) as u8;
+                image::Rgb([r, g, seed])
+            });
+            let mut out = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 50)
+                .encode(img.as_raw(), 16, 16, image::ExtendedColorType::Rgb8)
+                .expect("encode");
+            out
+        };
+        let f1 = jpeg(1);
+        let f2 = jpeg(2);
+        let mut buf: Vec<u8> = vec![0x00, 0x11]; // junk before first frame
+        buf.extend_from_slice(&f1);
+        buf.extend_from_slice(&f2);
+        let mut partial = jpeg(3);
+        partial.truncate(partial.len() / 2); // no EOI reachable
+        buf.extend_from_slice(&partial);
+        let frames = extract_preview_frames(&mut buf);
+        assert_eq!(frames.len(), 2, "two complete frames decoded");
+        assert_eq!(frames[0].width(), 16);
+        // the partial frame stays buffered for the next read
+        assert_eq!(buf, partial);
+        // junk with no frame start trims to a marker-sized tail
+        let mut junk = vec![7u8; 100];
+        assert!(extract_preview_frames(&mut junk).is_empty());
+        assert_eq!(junk.len(), 2);
+    }
+
+    #[test]
+    fn live_preview_pipes_raw_hevc_to_stdin() {
+        let args = live_args();
+        // The player contract: raw Annex-B H.265 demuxer on a stdin pipe,
+        // with buffering disabled (latency floor).
+        assert!(args.windows(2).any(|w| w == ["-f", "hevc"]));
+        assert_eq!(args.last().copied(), Some("pipe:0"));
+        assert!(args.windows(2).any(|w| w == ["-fflags", "nobuffer"]));
+    }
+
     use super::*;
 
     /// The offer must be exactly what libwebrtc's H.265 answerer needs:
@@ -691,7 +1058,10 @@ mod tests {
         assert!(lower.contains("a=rtpmap:96 h265/90000"), "{sdp}");
         assert!(lower.contains("webrtc-datachannel"), "{sdp}");
         assert!(!lower.contains("vp8") && !lower.contains("h264"), "{sdp}");
-        assert!(lower.contains("a=ice-lite") || lower.contains("ice-lite"), "{sdp}");
+        assert!(
+            lower.contains("a=ice-lite") || lower.contains("ice-lite"),
+            "{sdp}"
+        );
     }
 
     /// Only the SDP/candidate `type`s reach the WebRTC task (top level or

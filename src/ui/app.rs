@@ -22,7 +22,8 @@ fn devices_of(v: &Value) -> Option<Vec<Device>> {
     serde_json::from_value::<Vec<Device>>(Value::Array(arr.clone())).ok()
 }
 
-/// Screen-mirroring (`screen.js`/odmf) mock-backed state.
+/// Screen-mirroring (`screen.js`/odmf) panel state; backend via the
+/// odmf channels, mock fallback only in `LPLUS_BACKEND=off` mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Quality {
     LowLatency,
@@ -82,12 +83,7 @@ impl Default for AppState {
 impl AppState {
     pub fn new() -> Self {
         let mut ipc = Ipc::from_env();
-        let host_name = ipc
-            .invoke(Channel::SettingsGetHostName, Value::Null)
-            .get("hostName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("This PC")
-            .to_string();
+        let host_name = ipc.host_name().unwrap_or_else(|| "This PC".to_string());
         Self {
             router: Router::new(Route::Home),
             ipc,
@@ -128,13 +124,8 @@ impl AppState {
     /// host name from it. Tests keep `AppState::new()`'s mock-only default.
     pub fn use_launch_transport(&mut self) {
         self.ipc = Ipc::from_launch();
-        if let Some(name) = self
-            .ipc
-            .invoke(Channel::SettingsGetHostName, Value::Null)
-            .get("hostName")
-            .and_then(Value::as_str)
-        {
-            self.host_name = name.to_string();
+        if let Some(name) = self.ipc.host_name() {
+            self.host_name = name;
         }
     }
 
@@ -407,8 +398,7 @@ impl AppState {
         if v.get("ok").and_then(|v| v.as_bool()) == Some(true) {
             self.mirroring.active_listen =
                 v.get("listen").and_then(|v| v.as_str()).map(str::to_string);
-            self.toast
-                .push("Mirroring started (mock sink)", ToastKind::Success);
+            self.toast.push("Mirroring started", ToastKind::Success);
         } else {
             self.toast
                 .push("Mirroring failed to start", ToastKind::Error);
@@ -433,10 +423,7 @@ impl AppState {
     }
 
     pub fn set_host_name(&mut self, name: &str) {
-        let v = self
-            .ipc
-            .invoke(Channel::SettingsSetHostName, json!({ "hostName": name }));
-        if v.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        if self.ipc.set_host_name(name) {
             self.host_name = name.trim().to_string();
             self.toast.push("Host name saved", ToastKind::Success);
         } else {
@@ -897,7 +884,7 @@ mod tests {
         // Stage 1: find the card's "⋮" trigger (top-right of the first card).
         let mut more_pt = None;
         'more: for y in (60..=470).step_by(4) {
-            for x in (380..=452).step_by(4) {
+            for x in (380..=560).step_by(4) {
                 window.simulate_click(gpui::point(px(x as f32), px(y as f32)), MouseButton::Left);
                 window.draw();
                 if window.read(|a, _cx| a.ui.more_menu_for == Some(0)) {
@@ -1303,7 +1290,7 @@ mod tests {
         // Open the first card's "⋮" menu via its trigger.
         let mut opened = false;
         'open: for y in (60..=470).step_by(4) {
-            for x in (380..=452).step_by(4) {
+            for x in (380..=560).step_by(4) {
                 window.simulate_click(gpui::point(px(x as f32), px(y as f32)), MouseButton::Left);
                 window.draw();
                 if window.read(|a, _cx| a.ui.more_menu_for == Some(0)) {

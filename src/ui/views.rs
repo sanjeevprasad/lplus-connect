@@ -527,7 +527,7 @@ impl AppState {
                 div()
                     .id(("device-card", idx))
                     .relative()
-                    .w(px(260.))
+                    .w(px(340.))
                     .rounded(px(CARD_R))
                     .bg(h(CARD_BG))
                     .border_1()
@@ -559,7 +559,7 @@ impl AppState {
                                         .child(
                                             svg()
                                                 .data(Icon::Unlink.svg_bytes())
-                                                .size(px(15.))
+                                                .size(px(16.))
                                                 .text_color(h(TEXT_SECONDARY)),
                                         )
                                         .on_click(cx.listener(move |app, _e, _w, cx| {
@@ -581,7 +581,7 @@ impl AppState {
                                     .child(
                                         svg()
                                             .data(Icon::EllipsisVertical.svg_bytes())
-                                            .size(px(15.))
+                                            .size(px(16.))
                                             .text_color(h(TEXT_SECONDARY)),
                                     )
                                     .on_click(cx.listener(move |app, _e, _w, cx| {
@@ -648,6 +648,7 @@ impl AppState {
                             ("entry-files", idx),
                             files_item,
                             Icon::Folder,
+                            true,
                             move |app| {
                                 app.navigate(Route::CrossFile {
                                     device_id: Some(crossfile_id.clone()),
@@ -661,6 +662,7 @@ impl AppState {
                                 ("entry-cast", idx),
                                 cast_item,
                                 Icon::MonitorSmartphone,
+                                true,
                                 move |app| {
                                     app.navigate(Route::Screen {
                                         device_id: Some(screen_id.clone()),
@@ -668,11 +670,15 @@ impl AppState {
                                 },
                             ));
                         }
+                        // No isHaveScreenShareAbility in the rows and the
+                        // multi-screen backend is pending, so greyed until
+                        // the channels land (GUI.md §10).
                         entries = entries.child(self.card_feature_entry(
                             cx,
                             ("entry-share", idx),
                             share_item,
                             Icon::ScreenShare,
+                            false,
                             move |app| {
                                 app.navigate(Route::ScreenShare {
                                     device_id: Some(share_id.clone()),
@@ -684,6 +690,7 @@ impl AppState {
                             ("entry-sync", idx),
                             sync_item,
                             Icon::ArrowLeftRight,
+                            true,
                             |app| app.navigate(Route::Settings),
                         ));
                         card.child(entries)
@@ -813,13 +820,15 @@ impl AppState {
     }
 
     /// Connected-card quick-feature entry (`SingleDeviceCard` function-area:
-    /// icon above label, tinted hover fill).
+    /// icon above label, tinted hover fill). `enabled = false` greys the
+    /// entry and drops its click handler (backend not wired yet).
     fn card_feature_entry<F>(
         &mut self,
         cx: &mut Context<Self>,
         id: (&'static str, usize),
         label: &'static str,
         icon: Icon,
+        enabled: bool,
         go: F,
     ) -> AnyElement
     where
@@ -828,31 +837,60 @@ impl AppState {
         div()
             .id(id)
             .flex_1()
-            .h(px(58.))
+            // Taffy clamps flex items to their min-content width, which
+            // would let "Screen Collaborate" outgrow "Files"; pin the
+            // minimum to zero so the entries split the row evenly and
+            // long labels wrap.
+            .min_w(px(0.))
+            .h(px(96.))
             .rounded(px(8.))
             .flex()
             .flex_col()
             .items_center()
-            .justify_center()
-            .gap(px(4.))
-            .cursor_pointer()
-            .hover(|d| d.bg(h(HOVER_BG)))
-            .child(
-                svg()
-                    .data(icon.svg_bytes())
-                    .size(px(20.))
-                    .text_color(h(TEXT_SECONDARY)),
-            )
+            // Icon (in the vendor's 44px circular shell) top-pinned, label
+            // bottom-pinned: both rows stay aligned while long labels wrap.
+            .justify_start()
+            .pt(px(8.))
+            .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(h(HOVER_BG))))
             .child(
                 div()
+                    .size(px(44.))
+                    .rounded(px(22.))
+                    .bg(a(0x59_59_59, 0.09))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .data(icon.svg_bytes())
+                            .size(px(20.))
+                            .text_color(if enabled {
+                                h(TEXT_SECONDARY)
+                            } else {
+                                h(TEXT_DISABLED)
+                            }),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .pb(px(8.))
+                    .px(px(4.))
                     .text_size(px(10.))
-                    .text_color(h(TEXT_SECONDARY))
+                    .text_center()
+                    .text_color(if enabled {
+                        h(TEXT_SECONDARY)
+                    } else {
+                        h(TEXT_DISABLED)
+                    })
                     .child(label),
             )
-            .on_click(cx.listener(move |app, _e, _w, cx| {
-                go(app);
-                cx.notify();
-            }))
+            .when(enabled, move |d| {
+                d.on_click(cx.listener(move |app, _e, _w, cx| {
+                    go(app);
+                    cx.notify();
+                }))
+            })
             .into_any_element()
     }
 
@@ -1532,7 +1570,7 @@ impl AppState {
                         .text_color(h(TEXT_SECONDARY))
                         .child(
                             active
-                                .map(|l| format!("Mirroring → {l} (mock sink)"))
+                                .map(|l| format!("Mirroring → {l}"))
                                 .unwrap_or_else(|| "Not mirroring".into()),
                         ),
                 ),

@@ -203,7 +203,16 @@ pub fn odmf_start() -> Value {
     let (body1, body2) = odmf_bodies(&server_ip, &auth);
     let (_, q1) = push_value("cast_ability_sync", &body1);
     let (_, q2) = push_value("cast_ability_sync", &body2);
-    json!({ "ok": true, "id": id, "pushes": 2, "queued": [q1, q2] })
+    json!({
+        "ok": true,
+        "id": id,
+        "pushes": 2,
+        "queued": [q1, q2],
+        // The sink the phone will dial (what the GUI shows under the
+        // mirroring toggle; `env_or` mirrors the sink's own defaults).
+        "listen": env_or("ODMF_LISTEN", "0.0.0.0:7236"),
+        "rtp_port": env_or("ODMF_RTP_PORT", "15550"),
+    })
 }
 
 /// The two CastMessage JSON bodies of the ODMF trigger (pure, for tests).

@@ -40,6 +40,12 @@ const PUSH_INTERVAL_SECS: u64 = 1;
 const ROW_TTL_SECS: u64 = 5 * 60;
 /// Rows without an event for this long drop the discovered flag.
 const DISCOVERED_WINDOW_SECS: u64 = 120;
+/// A row may only claim "connected" on fresh link evidence: epi/kms
+/// traffic (keepalive-re-emitted at ≤60 s cadence while a session lives)
+/// or adb polls refresh `last_seen`; silence beyond this clears the flag.
+/// Phones that vanish without a TCP FIN never deliver the close event, so
+/// without this the GUI keeps claiming Connected forever.
+const CONN_STALE_SECS: u64 = 180;
 const BRIDGE_RETRY: Duration = Duration::from_secs(2);
 
 /// Host-local addresses: the backend may report its own side of sessions
@@ -78,8 +84,9 @@ pub struct DeviceRow {
     pub usb_serial: Option<String>,
     pub is_discovered: bool,
     pub is_connected: bool,
-    /// Persistent pairing bond (scp_sync session or authorized adb
-    /// transport). Paired rows survive TTL pruning and show offline.
+    /// Persistent pairing bond (scp_sync session or a bond carried in
+    /// `paired.json`; adb authorization alone is transport presence, not
+    /// a bond). Paired rows survive TTL pruning and show offline.
     pub is_paired: bool,
     /// Spelling as consumed by mydevice.handleDiscoveryDevice.
     #[serde(rename = "protcol_device_id")]
@@ -123,6 +130,19 @@ struct Inner {
 /// Vendor `CONNECT_TYPE` bits (renderer `Ve.gy`): LAN discovery vs adb/USB.
 pub const CONNECT_TYPE_LAN: u8 = 16;
 pub const CONNECT_TYPE_USB: u8 = 128;
+
+/// The product is Wi-Fi only: adb/USB transport rows are a diagnostic
+/// lane. Unless `LPLUS_USB=1` the poller never starts and every read
+/// surface hides these rows (their bonds stay in `paired.json` so
+/// re-enabling restores them untouched).
+pub fn usb_lane_on() -> bool {
+    std::env::var("LPLUS_USB").is_ok_and(|v| v == "1")
+}
+
+/// Surface-level visibility for one row (pure for tests).
+fn usb_hidden(row: &DeviceRow, usb_on: bool) -> bool {
+    !usb_on && row.connect_type == CONNECT_TYPE_USB
+}
 
 /// Process-wide registry: the loopback server thread and the GPUI direct
 /// dispatch share one model without plumbing State through both.
@@ -201,9 +221,15 @@ pub fn paired_rows() -> Vec<Value> {
     let mut i = inner().lock().expect("devices lock poisoned");
     refresh_ephemeral(&mut i);
     sync_paired(&mut i);
-    let mut rows: Vec<&DeviceRow> = i.rows.values().filter(|r| r.is_paired).collect();
+    let mut rows: Vec<&DeviceRow> = i
+        .rows
+        .values()
+        .filter(|r| r.is_paired && !usb_hidden(r, usb_lane_on()))
+        .collect();
     rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-    rows.iter().map(|r| serde_json::to_value(r).unwrap_or(Value::Null)).collect()
+    rows.iter()
+        .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+        .collect()
 }
 
 /// User-initiated device removal (`generic_agent_settings_remove_device`,
@@ -301,8 +327,7 @@ fn init_inner() {
         i.unpaired_saved = serde_json::to_string_pretty(&ids).unwrap_or_default();
         let mut rows: Vec<&DeviceRow> = i.rows.values().filter(|r| r.is_paired).collect();
         rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-        i.paired_saved =
-            serde_json::to_string_pretty(&rows).unwrap_or_default();
+        i.paired_saved = serde_json::to_string_pretty(&rows).unwrap_or_default();
     }
     let mut rx = crate::sdpd::subscribe_devices();
     // Own thread + tiny current-thread runtime: presence ingest must not
@@ -381,8 +406,12 @@ pub fn rows_json() -> Value {
 /// Serializable visible rows (sorted, ephemeral flags refreshed, stale
 /// rows pruned).
 fn visible_rows(i: &mut Inner) -> Vec<Value> {
+    visible_rows_gated(i, usb_lane_on())
+}
+
+fn visible_rows_gated(i: &mut Inner, usb_on: bool) -> Vec<Value> {
     refresh_ephemeral(i);
-    let mut rows: Vec<&DeviceRow> = i.rows.values().collect();
+    let mut rows: Vec<&DeviceRow> = i.rows.values().filter(|r| !usb_hidden(r, usb_on)).collect();
     rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
     rows.iter()
         .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
@@ -448,7 +477,10 @@ pub fn parse_adb_devices(out: &str) -> Vec<AdbDevice> {
             .split_whitespace()
             .find_map(|t| t.strip_prefix("model:"))
             .map(|m| m.replace('_', " "));
-        devs.push(AdbDevice { serial: serial.to_string(), model });
+        devs.push(AdbDevice {
+            serial: serial.to_string(),
+            model,
+        });
     }
     devs
 }
@@ -480,7 +512,9 @@ fn ingest_adb(i: &mut Inner, devs: &[AdbDevice]) {
                 usb_serial: Some(d.serial.clone()),
                 is_discovered: true,
                 is_connected: true,
-                is_paired: true,
+                // Transport presence alone is not a pairing bond; real
+                // pairing evidence (scp_sync / persisted bond) flips this.
+                is_paired: false,
                 protcol_device_id: format!("usb-{}", d.serial),
                 last_seen: now,
                 last_session: now,
@@ -515,6 +549,9 @@ fn ingest_adb(i: &mut Inner, devs: &[AdbDevice]) {
 /// runtime like presence ingest; missing/failing adb is silent (rows from
 /// the last good poll prune away once adb answers empty).
 fn spawn_usb_lane() {
+    if !usb_lane_on() {
+        return;
+    }
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -607,12 +644,35 @@ fn refresh_ephemeral(i: &mut Inner) {
     i.rows.retain(|key, row| {
         let keep = row.is_paired || now.saturating_sub(row.last_seen) <= ROW_TTL_SECS;
         if !keep {
-            tracing::debug!("[pair] ttl-prune {key} (paired={}, lastSeen={})", row.is_paired, row.last_seen);
+            tracing::debug!(
+                "[pair] ttl-prune {key} (paired={}, lastSeen={})",
+                row.is_paired,
+                row.last_seen
+            );
         }
         keep
     });
+    let stale_conn: Vec<String> = i
+        .rows
+        .iter()
+        .filter(|(_, r)| r.is_connected && now.saturating_sub(r.last_seen) > CONN_STALE_SECS)
+        .map(|(k, _)| k.clone())
+        .collect();
     for row in i.rows.values_mut() {
         row.is_discovered = now.saturating_sub(row.last_seen) <= DISCOVERED_WINDOW_SECS;
+    }
+    for key in &stale_conn {
+        if let Some(row) = i.rows.get_mut(key) {
+            row.is_connected = false;
+            tracing::info!(
+                "[pair] {} marked disconnected: no link evidence for {}s",
+                row.device_id,
+                CONN_STALE_SECS
+            );
+        }
+    }
+    if !stale_conn.is_empty() {
+        i.dirty = true;
     }
 }
 
@@ -719,6 +779,7 @@ mod tests {
         ingest_adb(&mut i, &[dev]);
         let row = i.rows.get("usb:FAKESERIAL000001").expect("usb row minted");
         assert!(row.is_connected);
+        assert!(!row.is_paired, "authorized adb alone is not a pairing bond");
         assert_eq!(row.connect_type, CONNECT_TYPE_USB);
         assert_eq!(row.usb_serial.as_deref(), Some("FAKESERIAL000001"));
         assert_eq!(row.device_name, "OnePlus 15");
@@ -728,14 +789,18 @@ mod tests {
             i.rows.get("192.0.2.2").map(|r| r.connect_type),
             Some(CONNECT_TYPE_LAN)
         );
-        // Transport gone → paired row survives reporting offline; presence row untouched.
+        // Transport gone → presence-only usb rows prune; a paired row
+        // (persisted bond) survives reporting offline; LAN rows untouched.
+        i.rows.insert("usb:KEPT".to_string(), usb_row("KEPT", true));
         ingest_adb(&mut i, &[]);
         assert!(i.rows.contains_key("192.0.2.2"));
-        let kept = i.rows.get("usb:FAKESERIAL000001").expect("paired row kept offline");
+        assert!(!i.rows.contains_key("usb:FAKESERIAL000001"));
+        let kept = i.rows.get("usb:KEPT").expect("paired row kept offline");
         assert!(!kept.is_connected);
         assert!(kept.is_paired);
         // Unpaired usb rows (never authorized) prune when the transport vanishes.
-        i.rows.insert("usb:GONE".to_string(), usb_row("GONE", false));
+        i.rows
+            .insert("usb:GONE".to_string(), usb_row("GONE", false));
         ingest_adb(&mut i, &[]);
         assert!(!i.rows.contains_key("usb:GONE"));
     }
@@ -763,13 +828,22 @@ mod tests {
     #[test]
     fn remove_device_drops_rows_and_blocks_adb_resurfacing() {
         let mut i = Inner::default();
-        let dev = AdbDevice { serial: "FAKESERIAL000001".into(), model: None };
+        let dev = AdbDevice {
+            serial: "FAKESERIAL000001".into(),
+            model: None,
+        };
         ingest_adb(&mut i, &[dev]);
         assert!(i.rows.contains_key("usb:FAKESERIAL000001"));
         assert!(forget(&mut i, "usb-FAKESERIAL000001"));
         assert!(!i.rows.contains_key("usb:FAKESERIAL000001"));
         // Transport still up: the block keeps it from re-minting.
-        ingest_adb(&mut i, &[AdbDevice { serial: "FAKESERIAL000001".into(), model: None }]);
+        ingest_adb(
+            &mut i,
+            &[AdbDevice {
+                serial: "FAKESERIAL000001".into(),
+                model: None,
+            }],
+        );
         assert!(!i.rows.contains_key("usb:FAKESERIAL000001"));
         assert!(!forget(&mut i, "never-seen"));
         // A fresh scp_sync bond lifts the block.
@@ -826,17 +900,24 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("paired-devices.json");
         let mut i = Inner::default();
+        // adb authorization alone must not persist as a bond; the bond is
+        // the row carried in (or written to) `paired.json`.
         ingest_adb(
             &mut i,
-            &[AdbDevice { serial: "FAKESERIAL000001".into(), model: Some("CPH2745".into()) }],
+            &[AdbDevice {
+                serial: "FAKESERIAL000001".into(),
+                model: Some("CPH2745".into()),
+            }],
         );
+        i.rows
+            .insert("usb:BONDED".to_string(), usb_row("BONDED", true));
         ev(&mut i, "epi", "192.0.2.2", None, false);
         let rows: Vec<&DeviceRow> = i.rows.values().filter(|r| r.is_paired).collect();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 1, "adb presence alone is not a bond");
         save_paired(&path, &rows).expect("save");
         let loaded = load_paired(&path);
         assert_eq!(loaded, rows.into_iter().cloned().collect::<Vec<_>>());
-        assert_eq!(row_key(&loaded[0]).as_deref(), Some("usb:FAKESERIAL000001"));
+        assert_eq!(row_key(&loaded[0]).as_deref(), Some("usb:BONDED"));
         std::fs::write(&path, "not json").expect("corrupt");
         assert!(load_paired(&path).is_empty());
         std::fs::remove_dir_all(&dir).ok();
@@ -874,13 +955,7 @@ mod tests {
         // The phone produces typed session events; the neighbour's SSDP /
         // probe chatter never reaches the event bus, and an unclassified
         // event for it must not mint a row either.
-        ev(
-            &mut i,
-            "scp_sync",
-            "192.0.2.2",
-            Some("OnePlus 12"),
-            true,
-        );
+        ev(&mut i, "scp_sync", "192.0.2.2", Some("OnePlus 12"), true);
         ev(&mut i, "probe", "192.0.2.6", None, false);
         ev(&mut i, "announce", "192.0.2.6", None, false);
         let rows = visible_rows(&mut i);
@@ -935,6 +1010,43 @@ mod tests {
     }
 
     #[test]
+    fn connected_flag_requires_fresh_link_evidence() {
+        let mut i = Inner::default();
+        ev(&mut i, "epi", "192.0.2.7", None, true);
+        assert_eq!(visible_rows(&mut i)[0]["isConnected"], true);
+        // Silent beyond the window (phone vanished without a FIN): the
+        // row stays inside the TTL but must stop claiming Connected.
+        for row in i.rows.values_mut() {
+            row.last_seen = now_secs() - (CONN_STALE_SECS + 5);
+        }
+        let rows = visible_rows(&mut i);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["isConnected"], false);
+        // Fresh link evidence re-asserts it.
+        ev(&mut i, "epi", "192.0.2.7", None, true);
+        assert_eq!(visible_rows(&mut i)[0]["isConnected"], true);
+    }
+
+    #[test]
+    fn wifi_only_mode_hides_usb_rows_from_surfaces() {
+        // The product surface is Wi-Fi only unless the diagnostic adb
+        // lane is enabled; bonds stay in the registry (paired.json).
+        assert!(usb_hidden(&usb_row("B", true), false));
+        assert!(!usb_hidden(&usb_row("B", true), true));
+        let mut i = Inner::default();
+        i.rows.insert("usb:BONDED".to_string(), usb_row("BONDED", true));
+        ev(&mut i, "epi", "192.0.2.8", None, true);
+        let rows = visible_rows_gated(&mut i, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["deviceId"], "192-0-2-8");
+        assert!(i.rows.contains_key("usb:BONDED"), "bond must persist hidden");
+        // Lane on: the row shows again, untouched.
+        let rows = visible_rows_gated(&mut i, true);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().filter(|r| r["connectType"] == 128).count(), 1);
+    }
+
+    #[test]
     fn bus_row_push_carries_object_not_stringified_json() {
         let mut rx = crate::gui::bus_subscribe();
         apply_event(&DeviceEvent {
@@ -965,4 +1077,3 @@ mod tests {
         assert_eq!(data["deviceId"], "192-0-2-4");
     }
 }
-

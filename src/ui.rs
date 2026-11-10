@@ -11,6 +11,7 @@
 mod app;
 #[allow(dead_code)]
 mod ipc;
+pub(crate) mod live;
 #[allow(dead_code)]
 mod router;
 #[allow(dead_code)]
@@ -115,20 +116,20 @@ pub fn run(transport: Transport, flags: UiFlags) {
                 entity
             })
             .expect("open main window");
+        live::start_bridge(cx);
         let state: gpui::Entity<AppState> = root_state.expect("window root view");
         // Live refresh: the merged app re-pulls the device lists on a timer
         // so adb/pairing changes surface without user action. Direct
         // dispatch is a cheap registry read; attach mode is loopback HTTP.
-        let _refresh_task = cx.spawn(async move |cx| {
+        let refresh_task = cx.spawn(async move |cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(2))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(2)).await;
                 cx.update(|app| {
                     state.update(app, |app_state, _cx| app_state.refresh_devices());
                 });
             }
         });
+        live::retain_task(refresh_task);
         cx.activate(true);
     });
 }
@@ -201,7 +202,10 @@ mod tests {
 
     #[test]
     fn route_flag_maps_vendor_names() {
-        assert_eq!(start_route(Some("uploaddownload"), false), Some(Route::UploadDownload));
+        assert_eq!(
+            start_route(Some("uploaddownload"), false),
+            Some(Route::UploadDownload)
+        );
         assert_eq!(start_route(Some("aiSearch"), false), Some(Route::AiSearch));
     }
 

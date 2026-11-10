@@ -25,8 +25,10 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write as _};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
+use strum::{Display, EnumString};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -77,6 +79,10 @@ fn audit_snapshot() -> Vec<Value> {
 /// is skipped under `cfg(test)` so tests never touch the user file.
 static HOST_NAME: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(load_host_name()));
 
+/// Serializes tests that read/write the shared `HOST_NAME` static.
+#[cfg(test)]
+pub(crate) static HOST_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
+
 /// Panel settings file: `settings.json` in the per-user state dir
 /// (`state.rs`); migrated once from the legacy capture-dir
 /// `panel-settings.json`.
@@ -112,11 +118,11 @@ fn parse_host_name(raw: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-fn host_name() -> String {
+pub(crate) fn host_name() -> String {
     HOST_NAME.lock().expect("host name lock poisoned").clone()
 }
 
-fn set_host_name(name: &str) {
+pub(crate) fn set_host_name(name: &str) {
     *HOST_NAME.lock().expect("host name lock poisoned") = name.to_string();
     #[cfg(not(test))]
     if let Err(e) = persist_host_name(&settings_path(), name) {
@@ -197,16 +203,59 @@ fn unhandled(channel: &str) -> Value {
     json!({ "ok": false, "__unhandled": channel, "error": format!("unhandled:{channel}") })
 }
 
+/// Wire names for renderer `cmd` values and `ipc_invoke` channels. The
+/// dispatch/registry tables below key on this enum: a name typo is a
+/// compile error at the variant site, and the strum `snake_case`
+/// serialization pins each variant to its exact wire spelling.
+#[derive(Debug, PartialEq, Eq, Hash, EnumString, Display)]
+#[strum(serialize_all = "snake_case")]
+enum WireCmd {
+    // Transport/protocol commands (plain `cmd` posts).
+    IpcInvoke,
+    IpcBus,
+    IpcSend,
+    ConsoleLog,
+    OpenExternal,
+    IpcRegistry,
+    ReplExec,
+    CastPush,
+    OdmfStart,
+    KmsBootstrap,
+    LplusStatus,
+    SettingsSetHostName,
+    ConnectDevice,
+    DisconnectDevice,
+    // Vendor inventory/probe channels (`ipc_invoke` and plain spellings).
+    GenericAgentGetPairedDevices,
+    GenericAgentSettingsRemoveDevice,
+    GenericAgentGetLocalDeviceId,
+    GenericAgentGetCloudBind,
+    GenericAgentEnsureRunning,
+    GetCurrentConnectedDeviceInfoList,
+    PublicGetSystemTheme,
+    SettingsGetPcConnectRunning,
+    LplusSidecarStatus,
+    SettingsGetHostName,
+    GetHttpServerPort,
+    IsHttpServerRunning,
+    DeviceFoundList,
+    /// Any wire string not in the table; kept in the enum (strum default)
+    /// so both match tables stay total and the audit paths keep the
+    /// original spelling.
+    #[strum(default)]
+    Other(String),
+}
+
 /// Registry for `ipcRenderer.invoke` channels. Returns `None` when no
 /// handler exists; callers then record + return [`unhandled`].
-fn route_invoke(channel: &str, payload: &Value) -> Option<Value> {
+fn route_invoke(channel: &WireCmd, payload: &Value) -> Option<Value> {
     match channel {
         // ---- daemon / device inventory ---------------------------------
         // PAIRED_DEVICES: persistent pairing bonds from the row table
         // (scp_sync / authorized adb); consumers expect { ok, entries[] }
         // and read pairedDevices??paired_devices??instances (see
         // render/genericAgent/binding/gaPairBoundStatus.js).
-        "generic_agent_get_paired_devices" => {
+        WireCmd::GenericAgentGetPairedDevices => {
             let rows = crate::gui::devices::paired_rows();
             let entries: Vec<Value> = rows
                 .iter()
@@ -221,7 +270,7 @@ fn route_invoke(channel: &str, payload: &Value) -> Option<Value> {
         }
         // UNBIND (settings page / card delete): vendor payload
         // `{ device_id, removeStateDir }`; consumers toast on !ok.
-        "generic_agent_settings_remove_device" => {
+        WireCmd::GenericAgentSettingsRemoveDevice => {
             let id = payload
                 .get("device_id")
                 .and_then(Value::as_str)
@@ -230,45 +279,49 @@ fn route_invoke(channel: &str, payload: &Value) -> Option<Value> {
             Some(json!({ "ok": found, "deviceId": id }))
         }
         // GET_LOCAL_DEVICE_ID: consumers String(localId || '') — plain id string.
-        "generic_agent_get_local_device_id" => Some(pc_device_id()),
+        WireCmd::GenericAgentGetLocalDeviceId => Some(pc_device_id()),
         // GET_CLOUD_BIND: consumers expect { ok, bound, record? }.
-        "generic_agent_get_cloud_bind" => {
+        WireCmd::GenericAgentGetCloudBind => {
             Some(json!({ "ok": true, "bound": false, "record": null }))
         }
-        "generic_agent_ensure_running" => Some(json!({ "ok": true, "status": "idle" })),
+        WireCmd::GenericAgentEnsureRunning => Some(json!({ "ok": true, "status": "idle" })),
         // GET_CURRENT_CONNECTED_DEVICE_INFO_LIST: consumers iterate an array.
-        "get_current_connected_device_info_list" => Some(device_list()),
-        "public_get_system_theme" => Some(json!("light")),
-        "settings_get_pc_connect_running" => Some(json!(false)),
+        WireCmd::GetCurrentConnectedDeviceInfoList => Some(device_list()),
+        WireCmd::PublicGetSystemTheme => Some(json!("light")),
+        WireCmd::SettingsGetPcConnectRunning => Some(json!(false)),
 
         // ---- window probes (viewport / focus) are host-side concerns;
         //      clients get them from the OS, not this registry. ----------
 
         // ---- lplus-specific probes (safe defaults) ------------------------
-        "lplus_sidecar_status" => Some(crate::gui::devices::sidecar_status()),
-        "settings_get_host_name" => Some(json!(host_name())),
-        "get_http_server_port" => Some(json!(null)),
-        "is_http_server_running" => Some(json!(false)),
+        WireCmd::LplusSidecarStatus => Some(crate::gui::devices::sidecar_status()),
+        WireCmd::SettingsGetHostName => Some(json!(host_name())),
+        WireCmd::GetHttpServerPort => Some(json!(null)),
+        WireCmd::IsHttpServerRunning => Some(json!(false)),
 
         // ---- device actions (renderer Connect/Disconnect) ------------------
         // Forwarded to the backend command channel (crate::sdpd::Command);
         // payload carries {ip}.
-        "connect_device" | "disconnect_device" => {
+        WireCmd::ConnectDevice | WireCmd::DisconnectDevice => {
+            let kind = if matches!(channel, WireCmd::ConnectDevice) {
+                "connect_device"
+            } else {
+                "disconnect_device"
+            };
             let ip = payload
                 .get("ip")
                 .and_then(Value::as_str)
                 .or_else(|| payload.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(dispatch_device(channel, ip))
+            Some(dispatch_device(kind, ip))
         }
         // Device-wall channel (DiscoveredDevices contract): same rows as
         // the bus, wrapped so `ok`-checking consumers work.
-        "device_found_list" => Some(json!({ "ok": true, "devices": all_rows() })),
-        _ => {
-            let _ = payload;
-            None
-        }
+        WireCmd::DeviceFoundList => Some(json!({ "ok": true, "devices": all_rows() })),
+        // Transport commands and unrecognized spellings are not invoke
+        // channels; callers audit them.
+        _ => None,
     }
 }
 
@@ -368,19 +421,23 @@ fn dispatch_kms(ip: String) -> Value {
 /// object (`{channel, payload}` for `ipc_invoke`, the bus payload for
 /// `ipc_bus`, …). Unknown commands answer with the typed unhandled marker.
 pub fn dispatch(cmd: &str, args: Value) -> Value {
+    let cmd = WireCmd::from_str(cmd).unwrap_or_else(|_| WireCmd::Other(cmd.to_string()));
     match cmd {
-        "ipc_invoke" => {
+        WireCmd::IpcInvoke => {
             let channel = args.get("channel").and_then(Value::as_str).unwrap_or("");
+            let channel =
+                WireCmd::from_str(channel).unwrap_or_else(|_| WireCmd::Other(channel.to_string()));
             let payload = args.get("payload").cloned().unwrap_or(Value::Null);
-            match route_invoke(channel, &payload) {
+            match route_invoke(&channel, &payload) {
                 Some(v) => v,
                 None => {
-                    audit_record("unhandled-invoke", channel);
-                    unhandled(channel)
+                    let name = channel.to_string();
+                    audit_record("unhandled-invoke", &name);
+                    unhandled(&name)
                 }
             }
         }
-        "ipc_bus" => {
+        WireCmd::IpcBus => {
             // Accept the payload directly or wrapped as `{payload: …}` (the
             // shape `/__ipc` clients forward).
             let body = args.get("payload").cloned().unwrap_or_else(|| args.clone());
@@ -420,14 +477,14 @@ pub fn dispatch(cmd: &str, args: Value) -> Value {
             json!({ "ok": true })
         }
         // Fire-and-forget `ipcRenderer.send` on any non-bus channel: recorded.
-        "ipc_send" => {
+        WireCmd::IpcSend => {
             let channel = args.get("channel").and_then(Value::as_str).unwrap_or("");
             audit_record("send", channel);
             json!({ "ok": true })
         }
         // Console bridge: remote clients mirror batched logs onto the host
         // log so boot diagnostics are capturable without devtools.
-        "console_log" => {
+        WireCmd::ConsoleLog => {
             if let Some(lines) = args.get("batch").and_then(Value::as_array) {
                 for line in lines {
                     let level = line.get("level").and_then(Value::as_str).unwrap_or("log");
@@ -439,7 +496,7 @@ pub fn dispatch(cmd: &str, args: Value) -> Value {
         }
         // `shell.openExternal` bridge: URLs are validated and logged, never
         // launched from the server side.
-        "open_external" => {
+        WireCmd::OpenExternal => {
             let url = args.get("url").and_then(Value::as_str).unwrap_or("");
             if !(url.starts_with("http://")
                 || url.starts_with("https://")
@@ -452,22 +509,22 @@ pub fn dispatch(cmd: &str, args: Value) -> Value {
             json!({ "ok": true })
         }
         // Debug helper: channels hit but not served yet (feeds GUI.md §3).
-        "ipc_registry" => Value::Array(audit_snapshot()),
+        WireCmd::IpcRegistry => Value::Array(audit_snapshot()),
 
         // ---- panel product channels (contract) -----------------------------
-        "repl_exec" => {
+        WireCmd::ReplExec => {
             let line = args.get("line").and_then(Value::as_str).unwrap_or("");
             repl_exec_line(line)
         }
-        "cast_push" => {
+        WireCmd::CastPush => {
             let key = args.get("key").and_then(Value::as_str).unwrap_or("");
             let value = args.get("value").and_then(Value::as_str).unwrap_or("");
             crate::gui::cast::cast_push(key, value)
         }
-        "odmf_start" => crate::gui::cast::odmf_start(),
-        "kms_bootstrap" => dispatch_kms(device_ip(&args)),
-        "lplus_status" => crate::gui::cast::status_json(),
-        "settings_set_host_name" => {
+        WireCmd::OdmfStart => crate::gui::cast::odmf_start(),
+        WireCmd::KmsBootstrap => dispatch_kms(device_ip(&args)),
+        WireCmd::LplusStatus => crate::gui::cast::status_json(),
+        WireCmd::SettingsSetHostName => {
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
@@ -481,11 +538,17 @@ pub fn dispatch(cmd: &str, args: Value) -> Value {
             json!({ "ok": true, "name": name })
         }
         // Renderer (or direct) Connect/Disconnect entry points.
-        "connect_device" => dispatch_device("connect_device", device_ip(&args)),
-        "disconnect_device" => dispatch_device("disconnect_device", device_ip(&args)),
-        other => {
-            audit_record("unknown-cmd", other);
-            unhandled(other)
+        WireCmd::ConnectDevice => dispatch_device("connect_device", device_ip(&args)),
+        WireCmd::DisconnectDevice => dispatch_device("disconnect_device", device_ip(&args)),
+        // Vendor inventory/probe channels posted in their plain form, and
+        // anything unrecognized: answer from the registry or audit.
+        cmd => {
+            if let Some(v) = route_invoke(&cmd, &args) {
+                return v;
+            }
+            let name = cmd.to_string();
+            audit_record("unknown-cmd", &name);
+            unhandled(&name)
         }
     }
 }
@@ -502,9 +565,6 @@ fn device_ip(args: &Value) -> String {
 mod tests {
     use super::*;
     use base64::Engine as _;
-
-    /// Serializes the tests that read/write the shared `HOST_NAME` static.
-    static HOST_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
 
     #[test]
     fn dispatch_known_channel_answers_host_name() {

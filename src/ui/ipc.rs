@@ -188,7 +188,11 @@ impl MockMain {
                 "config": { "language": "en", "launchAtLogin": false, "autoUpdate": true }
             }),
             Channel::SettingsGetHostName => json!({ "ok": true, "hostName": self.host_name }),
-            Channel::SettingsSetHostName => match args.get("hostName").and_then(Value::as_str) {
+            Channel::SettingsSetHostName => match args
+                .get("hostName")
+                .or_else(|| args.get("name"))
+                .and_then(Value::as_str)
+            {
                 Some(name) if !name.trim().is_empty() => {
                     self.host_name = name.trim().to_string();
                     json!({ "ok": true })
@@ -579,6 +583,39 @@ impl Ipc {
         self.last_served
     }
 
+    fn using_direct(&self) -> bool {
+        matches!(self.backend.as_ref(), Some(Transport::Direct)) && !self.backend_down
+    }
+
+    /// Typed host-name read. Direct dispatch calls the daemon API with no
+    /// JSON round-trip; over http/mock the reply is parsed, accepting both
+    /// the daemon's bare-string answer and the mock's `{ok, hostName}`.
+    pub fn host_name(&mut self) -> Option<String> {
+        if self.using_direct() {
+            return Some(crate::gui::api::host_name().host_name);
+        }
+        let v = self.invoke(Channel::SettingsGetHostName, Value::Null);
+        v.as_str().map(str::to_string).or_else(|| {
+            v.get("hostName")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    }
+
+    /// Typed host-name write; `false` on rejection (blank name, unhandled).
+    /// Sends both vendor key spellings so mock (`hostName`) and daemon
+    /// (`name`) answer without a second round-trip.
+    pub fn set_host_name(&mut self, name: &str) -> bool {
+        if self.using_direct() {
+            return crate::gui::api::set_host_name(name).is_ok();
+        }
+        let v = self.invoke(
+            Channel::SettingsSetHostName,
+            json!({ "hostName": name, "name": name }),
+        );
+        v.get("ok").and_then(Value::as_bool) == Some(true)
+    }
+
     /// `Some` while the real backend is configured and healthy.
     pub fn backend_addr(&self) -> Option<SocketAddr> {
         if self.backend_down {
@@ -615,6 +652,39 @@ mod tests {
         let v = m.invoke(Channel::LplusStatus, Value::Null);
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["backend_up"], json!(true));
+    }
+
+    #[test]
+    fn typed_host_name_accepts_daemon_and_mock_shapes() {
+        use crate::ui::ipc::http_tests::stub_backend;
+        let addr = stub_backend(vec![("settings_get_host_name", json!("desk-1"))]);
+        let mut ipc = Ipc::http(addr);
+        assert_eq!(ipc.host_name().as_deref(), Some("desk-1"));
+
+        let mut mock = Ipc::mock_only();
+        assert_eq!(mock.host_name().as_deref(), Some("L+ PC"));
+    }
+
+    #[test]
+    fn typed_set_host_name_requires_ok_and_falls_back() {
+        use crate::ui::ipc::http_tests::stub_backend;
+        let addr = stub_backend(vec![("settings_set_host_name", json!({ "ok": true }))]);
+        let mut ipc = Ipc::http(addr);
+        assert!(ipc.set_host_name("desk-2"));
+        assert_eq!(ipc.last_served(), "backend");
+
+        let addr = stub_backend(vec![("settings_set_host_name", json!({ "ok": false }))]);
+        let mut ipc = Ipc::http(addr);
+        assert!(
+            !ipc.set_host_name("desk-2"),
+            "ok=false must be a typed false"
+        );
+
+        // No stubbed reply: the mock answers the same typed call.
+        let addr = stub_backend(vec![]);
+        let mut ipc = Ipc::http(addr);
+        assert!(ipc.set_host_name("desk-2"));
+        assert_eq!(ipc.last_served(), "mock");
     }
 
     #[test]
