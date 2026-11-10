@@ -201,8 +201,88 @@ impl AppState {
         }
     }
 
-    /// Card "Delete": open the vendor's second-confirmation dialog.
+    /// "⋮" more-menu (`DeviceCardMoreMenu`): at most one card menu open.
+    pub fn toggle_more_menu(&mut self, idx: usize) {
+        self.ui.more_menu_for = if self.ui.more_menu_for == Some(idx) {
+            None
+        } else {
+            Some(idx)
+        };
+    }
+
+    pub fn close_more_menu(&mut self) {
+        self.ui.more_menu_for = None;
+    }
+
+    /// Card "Connect" CTA. With another device already connected the vendor
+    /// shows the "Connect to a new device?" conflict dialog
+    /// (`MyDeviceDialogsSection` stopConnect) before starting the flow.
+    pub fn request_connect(&mut self, device: &Device) {
+        let other_connected = self
+            .connection
+            .connected()
+            .iter()
+            .any(|d| d.device_id != device.device_id);
+        if other_connected {
+            self.ui.connect_conflict = Some(device.device_id.clone());
+        } else {
+            self.connect_device(device);
+        }
+    }
+
+    pub fn cancel_connect_conflict(&mut self) {
+        self.ui.connect_conflict = None;
+    }
+
+    pub fn confirm_connect_conflict(&mut self) {
+        let Some(id) = self.ui.connect_conflict.take() else {
+            return;
+        };
+        let Some(device) = self
+            .connection
+            .wall()
+            .into_iter()
+            .find(|d| d.device_id == id)
+        else {
+            return;
+        };
+        self.connect_device(&device);
+    }
+
+    /// Card/menu "Disconnect": vendor `useDisconnectClick` asks first for
+    /// devices under the persistent pairing bond (the same-account devices
+    /// auto-connect governs here); merely-found devices disconnect directly.
+    pub fn request_disconnect(&mut self, device: &Device) {
+        self.ui.more_menu_for = None;
+        if device.is_paired {
+            self.ui.disconnect_pending = Some(device.device_id.clone());
+        } else {
+            self.disconnect_device(device);
+        }
+    }
+
+    pub fn cancel_disconnect(&mut self) {
+        self.ui.disconnect_pending = None;
+    }
+
+    pub fn confirm_disconnect(&mut self) {
+        let Some(id) = self.ui.disconnect_pending.take() else {
+            return;
+        };
+        let Some(device) = self
+            .connection
+            .wall()
+            .into_iter()
+            .find(|d| d.device_id == id)
+        else {
+            return;
+        };
+        self.disconnect_device(&device);
+    }
+
+    /// Card "Delete device": open the vendor's second-confirmation dialog.
     pub fn request_remove_device(&mut self, device: &Device) {
+        self.ui.more_menu_for = None;
         self.ui.delete_pending = Some(device.device_id.clone());
     }
 
@@ -578,6 +658,61 @@ pub fn qr_dialog_labels() -> (
     )
 }
 
+/// Device-card tags and "⋮" more-menu items (`SingleDeviceCard.vue`,
+/// `DeviceCardMoreMenu.vue`: `MS_CONNECTED_TAG`,
+/// `MS_SECOND_NEAREST_CONNECTION`, `UTILS_DISCONNECT`, `MS_DElETE_DEVICE`).
+pub fn card_menu_labels() -> (&'static str, &'static str, &'static str, &'static str) {
+    (
+        "Connected",
+        "Recently connected",
+        "Disconnect",
+        "Delete device",
+    )
+}
+
+/// Connected-card quick-feature entries (`deviceCardFeature.js`:
+/// `MS_NAME_FILE`, `MS_NAME_PROJECTION`, `SCREEN_SHARE`, `CA_CONTENT_SYNC`).
+pub fn quick_feature_labels() -> (&'static str, &'static str, &'static str, &'static str) {
+    ("Files", "Screencast", "Screen Collaborate", "Content sync")
+}
+
+/// Vendor delete confirm (`MyDeviceDialogsSection`: `MS_DELETE_THIS_DEVICE`
+/// + `MS_CONNECTING_TO_THIS_DEVICE`, danger `UTILS_DELETE`).
+pub fn delete_confirm_labels() -> (&'static str, &'static str, &'static str, &'static str) {
+    (
+        "Delete this device?",
+        "If there is an active connection to this device, it will be terminated.",
+        "Cancel",
+        "Delete",
+    )
+}
+
+/// Vendor `DisconnectConfirm` (`MS_DISCONNECT_CONFIRM_TITLE`,
+/// sharing-aware `MS_DISCONNECT_CONFIRM_TEXT` /
+/// `EX_DISCONNECT_WHEN_SHARING_AND_SAME_ACCOUNT_TIP`, danger
+/// `UTILS_DISCONNECT`).
+pub fn disconnect_confirm_labels(
+    sharing: bool,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    let message = if sharing {
+        "This will end the screen collaboration session, and this device will no longer automatically connect today."
+    } else {
+        "It won't automatically connect again until tomorrow."
+    };
+    ("Disconnect this device?", message, "Cancel", "Disconnect")
+}
+
+/// Vendor stop-connect conflict dialog (`MS_DISCONNECT_TITLE` +
+/// `MS_DISCONNECT_NEW_DEVICE`, `UTILS_CONNECT` confirm).
+pub fn connect_conflict_labels() -> (&'static str, &'static str, &'static str, &'static str) {
+    (
+        "Connect to a new device?",
+        "Active connections will be terminated.",
+        "Cancel",
+        "Connect",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,23 +894,47 @@ mod tests {
             },
         );
         window.draw();
-        // Click the Delete row at the bottom-right of the first card.
-        let mut opened = false;
-        let mut card_pt = (0, 0);
-        'card: for y in (280..=440).step_by(4) {
-            for x in (360..=458).step_by(5) {
+        // Stage 1: find the card's "⋮" trigger (top-right of the first card).
+        let mut more_pt = None;
+        'more: for y in (60..=470).step_by(4) {
+            for x in (380..=452).step_by(4) {
                 window.simulate_click(gpui::point(px(x as f32), px(y as f32)), MouseButton::Left);
                 window.draw();
-                if window.read(|a, _cx| a.ui.delete_pending.is_some()) {
-                    opened = true;
-                    card_pt = (x, y);
-                    break 'card;
+                if window.read(|a, _cx| a.ui.more_menu_for == Some(0)) {
+                    more_pt = Some((x, y));
+                    break 'more;
                 }
             }
         }
-        assert!(opened, "card Delete row must open the confirm dialog");
-        // Click Remove in the dialog (bottom-right of the centered card).
-        // A stray Cancel hit just re-opens the dialog for the next probe.
+        let (more_x, more_y) = more_pt.expect("card ⋮ button must open the more-menu");
+        // Stage 2: click the danger "Delete device" item. The scan stays
+        // left of the ⋮ button so it can never toggle the menu closed.
+        let mut del_pt = None;
+        'del: for y in (more_y + 8..=more_y + 90).step_by(4) {
+            for x in (more_x - 140..=more_x - 20).step_by(5) {
+                window.simulate_click(gpui::point(px(x as f32), px(y as f32)), MouseButton::Left);
+                window.draw();
+                if window.read(|a, _cx| a.ui.delete_pending.is_some()) {
+                    del_pt = Some((x, y));
+                    break 'del;
+                }
+                if window.read(|a, _cx| a.ui.more_menu_for.is_none()) {
+                    // Stray click closed the menu: re-open and retry.
+                    window.simulate_click(
+                        gpui::point(px(more_x as f32), px(more_y as f32)),
+                        MouseButton::Left,
+                    );
+                    window.draw();
+                }
+            }
+        }
+        let (del_x, del_y) = del_pt.expect("more-menu Delete device must arm the confirm");
+        assert!(
+            window.read(|a, _cx| a.ui.delete_pending.is_some()),
+            "Delete device arms the vendor confirm dialog"
+        );
+        // Click Delete in the dialog (bottom-right of the centered card).
+        // A stray Cancel hit re-arms the flow via the saved menu points.
         let mut removed = false;
         'dialog: for y in (370..=520).step_by(4) {
             for x in (760..=950).step_by(6) {
@@ -788,16 +947,18 @@ mod tests {
                     break 'dialog;
                 }
                 if window.read(|a, _cx| a.ui.delete_pending.is_none()) {
-                    // Cancel hit: re-open and retry.
-                    window.simulate_click(
-                        gpui::point(px(card_pt.0 as f32), px(card_pt.1 as f32)),
-                        MouseButton::Left,
-                    );
-                    window.draw();
+                    // Cancel hit: re-open the menu path and retry.
+                    for pt in [(more_x, more_y), (del_x, del_y)] {
+                        window.simulate_click(
+                            gpui::point(px(pt.0 as f32), px(pt.1 as f32)),
+                            MouseButton::Left,
+                        );
+                        window.draw();
+                    }
                 }
             }
         }
-        assert!(removed, "dialog Remove button must drop the device");
+        assert!(removed, "dialog Delete button must drop the device");
     }
 
     #[test]
@@ -983,6 +1144,190 @@ mod tests {
     }
 
     #[test]
+    fn paired_disconnect_asks_confirm_unpaired_disconnects_directly() {
+        let mut a = AppState::new();
+        let bonded = Device {
+            device_id: "bonded".into(),
+            device_name: "Bonded".into(),
+            ip: "192.0.2.1".into(),
+            is_connected: true,
+            is_discovered: true,
+            connect_type: 2,
+            device_type: 8,
+            battery: None,
+            is_paired: true,
+        };
+        let transient = Device {
+            device_id: "transient".into(),
+            is_paired: false,
+            ..bonded.clone()
+        };
+        a.connection.mark_connected(bonded.clone());
+        a.connection.mark_connected(transient.clone());
+        // Persistent-bond device: vendor DisconnectConfirm gates the action.
+        a.request_disconnect(&bonded);
+        assert_eq!(a.ui.disconnect_pending.as_deref(), Some("bonded"));
+        assert!(
+            a.connection.is_connected("bonded"),
+            "still connected pre-confirm"
+        );
+        a.confirm_disconnect();
+        assert!(!a.connection.is_connected("bonded"));
+        assert!(a.ui.disconnect_pending.is_none());
+        // Merely-found device: disconnects without a dialog.
+        a.request_disconnect(&transient);
+        assert!(a.ui.disconnect_pending.is_none());
+        assert!(!a.connection.is_connected("transient"));
+    }
+
+    #[test]
+    fn connect_conflict_gates_second_connect_until_confirmed() {
+        use crate::ui::ipc::http_tests::stub_backend;
+        let addr = stub_backend(vec![
+            (
+                "via:get_current_connected_device_info_list",
+                json!([{ "deviceId": "active", "deviceName": "Active", "ip": "192.0.2.1",
+                         "isConnected": true, "isPaired": true, "connectType": 2,
+                         "deviceType": 8 }]),
+            ),
+            (
+                "generic_agent_get_paired_devices",
+                json!({ "ok": true, "entries": [],
+                        "devices": [{ "deviceId": "idle", "deviceName": "Idle",
+                                      "ip": "192.0.2.2", "isConnected": false,
+                                      "isPaired": true, "connectType": 16,
+                                      "deviceType": 8 }] }),
+            ),
+            (
+                "via:connect_device",
+                json!({ "ok": true, "ip": "192.0.2.2" }),
+            ),
+        ]);
+        let mut a = AppState::new();
+        a.ipc = Ipc::http(addr);
+        a.refresh_devices();
+        let idle = a
+            .connection
+            .wall()
+            .into_iter()
+            .find(|d| d.device_id == "idle")
+            .expect("paired offline row");
+        // Another device is connected: the CTA raises the conflict dialog
+        // instead of starting the connect.
+        a.request_connect(&idle);
+        assert_eq!(a.ui.connect_conflict.as_deref(), Some("idle"));
+        assert!(
+            !a.ipc
+                .audit()
+                .iter()
+                .any(|e| e == "backend-invoke:connect_device"),
+            "no connect request before the user confirms"
+        );
+        a.confirm_connect_conflict();
+        assert!(a.ui.connect_conflict.is_none());
+        // Confirmed: the queued ack defers completion to the device list.
+        assert_eq!(
+            a.connection.state,
+            ConnectState::WaitingPermission("idle".into())
+        );
+    }
+
+    #[test]
+    fn connect_without_conflict_goes_directly() {
+        use crate::ui::ipc::http_tests::stub_backend;
+        let addr = stub_backend(vec![
+            ("via:get_current_connected_device_info_list", json!([])),
+            (
+                "generic_agent_get_paired_devices",
+                json!({ "ok": true, "entries": [],
+                        "devices": [{ "deviceId": "idle", "deviceName": "Idle",
+                                      "ip": "192.0.2.2", "isConnected": false,
+                                      "isPaired": true, "connectType": 16,
+                                      "deviceType": 8 }] }),
+            ),
+            (
+                "via:connect_device",
+                json!({ "ok": true, "ip": "192.0.2.2" }),
+            ),
+        ]);
+        let mut a = AppState::new();
+        a.ipc = Ipc::http(addr);
+        a.refresh_devices();
+        let idle = a
+            .connection
+            .wall()
+            .into_iter()
+            .find(|d| d.device_id == "idle")
+            .expect("paired offline row");
+        a.request_connect(&idle);
+        assert!(a.ui.connect_conflict.is_none(), "no device in the way");
+        assert_eq!(
+            a.connection.state,
+            ConnectState::WaitingPermission("idle".into())
+        );
+    }
+
+    #[test]
+    fn more_menu_opens_one_card_at_a_time() {
+        let mut a = device_app();
+        a.toggle_more_menu(0);
+        assert_eq!(a.ui.more_menu_for, Some(0));
+        a.toggle_more_menu(2);
+        assert_eq!(a.ui.more_menu_for, Some(2));
+        a.toggle_more_menu(2);
+        assert_eq!(a.ui.more_menu_for, None);
+    }
+
+    #[test]
+    fn more_menu_closes_on_outside_click() {
+        use gpui::{MouseButton, Size, TestApp, px};
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            gpui::WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                    origin: gpui::point(px(0.), px(0.)),
+                    size: Size {
+                        width: px(1280.),
+                        height: px(800.),
+                    },
+                })),
+                ..Default::default()
+            },
+            |_window, _cx| {
+                let mut a = AppState::new();
+                a.refresh_devices();
+                a
+            },
+        );
+        window.draw();
+        // Open the first card's "⋮" menu via its trigger.
+        let mut opened = false;
+        'open: for y in (60..=470).step_by(4) {
+            for x in (380..=452).step_by(4) {
+                window.simulate_click(gpui::point(px(x as f32), px(y as f32)), MouseButton::Left);
+                window.draw();
+                if window.read(|a, _cx| a.ui.more_menu_for == Some(0)) {
+                    opened = true;
+                    break 'open;
+                }
+            }
+        }
+        assert!(opened, "⋮ trigger opens the more-menu");
+        // A click on empty content (root click-away) dismisses it without
+        // triggering anything else.
+        window.simulate_click(gpui::point(px(1150.), px(700.)), MouseButton::Left);
+        window.draw();
+        window.read(|a, _cx| {
+            assert!(
+                a.ui.more_menu_for.is_none(),
+                "outside click closes the menu"
+            );
+            assert!(a.ui.delete_pending.is_none() && a.ui.disconnect_pending.is_none());
+            assert!(!a.ui.connect_dialog_open);
+        });
+    }
+
+    #[test]
     fn mirroring_toggle_round_trips_through_mock_odmf() {
         let mut a = AppState::new();
         a.toggle_mirroring();
@@ -1068,6 +1413,49 @@ mod tests {
         );
         assert!(usb[2].starts_with("* Only phones or tablets"));
         assert_eq!(bg_btn, "Connect in background");
+        assert_eq!(
+            card_menu_labels(),
+            (
+                "Connected",
+                "Recently connected",
+                "Disconnect",
+                "Delete device"
+            )
+        );
+        assert_eq!(
+            quick_feature_labels(),
+            ("Files", "Screencast", "Screen Collaborate", "Content sync")
+        );
+        assert_eq!(
+            delete_confirm_labels(),
+            (
+                "Delete this device?",
+                "If there is an active connection to this device, it will be terminated.",
+                "Cancel",
+                "Delete",
+            )
+        );
+        let (d_title, d_msg, d_cancel, d_confirm) = disconnect_confirm_labels(false);
+        assert_eq!(d_title, "Disconnect this device?");
+        assert_eq!(
+            d_msg,
+            "It won't automatically connect again until tomorrow."
+        );
+        assert_eq!((d_cancel, d_confirm), ("Cancel", "Disconnect"));
+        assert!(
+            disconnect_confirm_labels(true)
+                .1
+                .starts_with("This will end the screen collaboration session")
+        );
+        assert_eq!(
+            connect_conflict_labels(),
+            (
+                "Connect to a new device?",
+                "Active connections will be terminated.",
+                "Cancel",
+                "Connect",
+            )
+        );
     }
 
     #[test]

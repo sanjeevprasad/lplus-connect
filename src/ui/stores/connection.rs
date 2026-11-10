@@ -194,6 +194,12 @@ pub struct UiStore {
     pub qr_tab: usize,
     /// Device id awaiting the vendor's delete-confirmation dialog.
     pub delete_pending: Option<String>,
+    /// Card index whose vendor "⋮" more-menu is open.
+    pub more_menu_for: Option<usize>,
+    /// Device id awaiting the vendor DisconnectConfirm dialog.
+    pub disconnect_pending: Option<String>,
+    /// Device id awaiting the "Connect to a new device?" conflict dialog.
+    pub connect_conflict: Option<String>,
 }
 
 impl UiStore {

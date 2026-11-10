@@ -6,7 +6,10 @@ use gpui::{
     AnyElement, Context, FontWeight, Render, SharedString, Window, div, prelude::*, px, svg,
 };
 
-use crate::ui::app::{AppState, Quality, qr_dialog_labels, wall_labels};
+use crate::ui::app::{
+    AppState, Quality, card_menu_labels, connect_conflict_labels, delete_confirm_labels,
+    disconnect_confirm_labels, qr_dialog_labels, quick_feature_labels, wall_labels,
+};
 use crate::ui::ipc::Channel;
 use crate::ui::router::Route;
 use crate::ui::stores::connection::{ConnectState, DEVICE_TYPE_PAD};
@@ -14,6 +17,18 @@ use crate::ui::stores::toast::ToastKind;
 use crate::ui::stores::transfer::{Direction, TransferStatus};
 use crate::ui::theme::*;
 use lucide_static_svg::Icon;
+
+/// The three vendor device-section confirm dialogs, sharing the compact
+/// `DsDialog` layout (title, message, Cancel + danger/primary action).
+#[derive(Clone, Copy)]
+enum ConfirmKind {
+    /// `MyDeviceDialogsSection` delete confirm (danger Delete).
+    Delete,
+    /// `DisconnectConfirm` (danger Disconnect; sharing-aware copy).
+    Disconnect,
+    /// Stop-connect confirm: Connect terminates the active connection.
+    ConnectConflict,
+}
 
 impl AppState {
     // ---------------------------------------------------------- home shell
@@ -50,10 +65,20 @@ impl AppState {
             Route::Note => self.render_stub(cx, "Notes", &[Channel::NoteList]),
         };
         div()
+            .id("root")
             .size_full()
             .flex()
             .flex_row()
             .bg(h(BG))
+            // Click-away: any click that bubbles to the root (i.e. every
+            // click outside the "⋮" menu, whose own handlers stop
+            // propagation) dismisses an open card menu.
+            .on_click(cx.listener(|app, _e, _w, cx| {
+                if app.ui.more_menu_for.is_some() {
+                    app.close_more_menu();
+                    cx.notify();
+                }
+            }))
             .child(sidebar)
             .child(
                 div()
@@ -74,7 +99,13 @@ impl AppState {
                         d.child(self.render_qr_dialog(cx))
                     })
                     .when(self.ui.delete_pending.is_some(), |d| {
-                        d.child(self.render_delete_dialog(cx))
+                        d.child(self.render_confirm_dialog(cx, ConfirmKind::Delete))
+                    })
+                    .when(self.ui.disconnect_pending.is_some(), |d| {
+                        d.child(self.render_confirm_dialog(cx, ConfirmKind::Disconnect))
+                    })
+                    .when(self.ui.connect_conflict.is_some(), |d| {
+                        d.child(self.render_confirm_dialog(cx, ConfirmKind::ConnectConflict))
                     }),
             )
             .into_any_element()
@@ -141,10 +172,7 @@ impl AppState {
             );
             let nav_rows: [(&'static str, Route); 2] = [
                 ("Devices", Route::Home),
-                (
-                    "Remote control",
-                    Route::RemoteControl { device_id: None },
-                ),
+                ("Remote control", Route::RemoteControl { device_id: None }),
             ];
             for (idx, (label, target)) in nav_rows.into_iter().enumerate() {
                 let is_sel = selected == Some(idx);
@@ -483,17 +511,22 @@ impl AppState {
         let mut grid = div().flex().flex_row().flex_wrap().gap(px(14.));
         for (idx, dev) in wall.iter().enumerate() {
             let connected = self.connection.is_connected(&dev.device_id);
-            let device = dev.clone();
-            let del_device = dev.clone();
+            let is_pad = dev.device_type == DEVICE_TYPE_PAD;
+            let connect_target = dev.clone();
+            let disconnect_target = dev.clone();
+            let menu_disconnect_target = dev.clone();
+            let menu_delete_target = dev.clone();
+            let crossfile_id = dev.device_id.clone();
+            let screen_id = dev.device_id.clone();
+            let share_id = dev.device_id.clone();
             let battery = dev.battery.map(|b| format!("{}%", b)).unwrap_or_default();
-            let kind = if dev.device_type == DEVICE_TYPE_PAD {
-                "Tablet"
-            } else {
-                "Phone"
-            };
+            let kind = if is_pad { "Tablet" } else { "Phone" };
+            let (connected_tag, recent_tag, disconnect_item, delete_item) = card_menu_labels();
+            let (files_item, cast_item, share_item, sync_item) = quick_feature_labels();
             grid = grid.child(
                 div()
                     .id(("device-card", idx))
+                    .relative()
                     .w(px(260.))
                     .rounded(px(CARD_R))
                     .bg(h(CARD_BG))
@@ -502,36 +535,63 @@ impl AppState {
                     .p(px(14.))
                     .flex()
                     .flex_col()
-                    .gap(px(10.))
+                    .gap(px(8.))
+                    // Vendor top row: disconnect glyph (connected cards
+                    // only) plus the "⋮" more-menu trigger.
                     .child(
                         div()
-                            .h(px(120.))
-                            .rounded(px(10.))
-                            .bg(h(if dev.device_type == DEVICE_TYPE_PAD {
-                                CARD_SCREEN_PAD
-                            } else {
-                                CARD_SCREEN_PHONE
-                            }))
                             .flex()
+                            .flex_row()
                             .items_center()
-                            .justify_center()
+                            .justify_end()
+                            .gap(px(4.))
+                            .when(connected, |row| {
+                                row.child(
+                                    div()
+                                        .id(("card-disconnect", idx))
+                                        .size(px(24.))
+                                        .rounded(px(12.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(h(HOVER_BG)))
+                                        .child(
+                                            svg()
+                                                .data(Icon::Unlink.svg_bytes())
+                                                .size(px(15.))
+                                                .text_color(h(TEXT_SECONDARY)),
+                                        )
+                                        .on_click(cx.listener(move |app, _e, _w, cx| {
+                                            app.request_disconnect(&disconnect_target);
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
-                                    .w(px(54.))
-                                    .h(px(100.))
-                                    .rounded(px(10.))
-                                    .bg(h(CARD_INNER))
-                                    .border_1()
-                                    .border_color(h(CARD_INNER_BORDER))
+                                    .id(("card-more", idx))
+                                    .size(px(24.))
+                                    .rounded(px(12.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(h(HOVER_BG)))
                                     .child(
-                                        div()
-                                            .text_size(px(20.))
-                                            .text_color(h(CARD_INNER_TEXT))
-                                            .child("+"),
-                                    ),
+                                        svg()
+                                            .data(Icon::EllipsisVertical.svg_bytes())
+                                            .size(px(15.))
+                                            .text_color(h(TEXT_SECONDARY)),
+                                    )
+                                    .on_click(cx.listener(move |app, _e, _w, cx| {
+                                        // Own the click: without this the
+                                        // root click-away handler would
+                                        // close the menu we just opened.
+                                        cx.stop_propagation();
+                                        app.toggle_more_menu(idx);
+                                        cx.notify();
+                                    })),
                             ),
                     )
                     .child(
@@ -544,7 +604,7 @@ impl AppState {
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(h(TEXT))
-                                    .child(device.device_name.clone()),
+                                    .child(dev.device_name.clone()),
                             )
                             .child(
                                 div()
@@ -553,70 +613,165 @@ impl AppState {
                                     .child(battery),
                             ),
                     )
+                    // Vendor status tags (`el-tag` with dot): "Connected" /
+                    // "Recently connected".
                     .child(
                         div()
-                            .text_size(px(FONT_SMALL))
-                            .text_color(h(TEXT_SECONDARY))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .when(connected, |t| {
+                                t.child(tag_pill(connected_tag, LINK, SELECTED_BG))
+                            })
+                            .when(!connected && dev.is_paired, |t| {
+                                t.child(tag_pill(recent_tag, TEXT_SECONDARY, HOVER_BG))
+                            })
                             .child({
                                 let mut meta = kind.to_string();
                                 if !dev.ip.is_empty() {
                                     meta.push_str(&format!(" · {}", dev.ip));
                                 }
-                                if dev.is_paired {
-                                    meta.push_str(" · Paired");
-                                }
-                                meta
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id(("device-connect", idx))
-                            .h(px(32.))
-                            .rounded(px(PILL_R))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .bg(if connected { h(CARD_BG) } else { h(PRIMARY) })
-                            .child(
-                                div()
-                                    .text_size(px(FONT_LABEL))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(if connected {
-                                        h(TEXT_SECONDARY)
-                                    } else {
-                                        h(ON_PRIMARY)
-                                    })
-                                    .child(if connected { "Disconnect" } else { "Connect" }),
-                            )
-                            .on_click(cx.listener(move |app, _e, _w, cx| {
-                                if app.connection.is_connected(&device.device_id) {
-                                    app.disconnect_device(&device);
-                                } else {
-                                    app.connect_device(&device);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id(("device-delete", idx))
-                            .h(px(20.))
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .cursor_pointer()
-                            .child(
                                 div()
                                     .text_size(px(FONT_SMALL))
                                     .text_color(h(TEXT_SECONDARY))
-                                    .child("Delete"),
-                            )
-                            .on_click(cx.listener(move |app, _e, _w, cx| {
-                                app.request_remove_device(&del_device);
-                                cx.notify();
-                            })),
-                    ),
+                                    .child(meta)
+                            }),
+                    )
+                    // Vendor function-area: connected cards get the quick
+                    // entries (`deviceCardFeature.js`); paired cards only
+                    // show the Connect CTA (`MS_INITIATE_CONNECT`).
+                    .when(connected, |card| {
+                        let mut entries = div().flex().flex_row().gap(px(6.));
+                        entries = entries.child(self.card_feature_entry(
+                            cx,
+                            ("entry-files", idx),
+                            files_item,
+                            Icon::Folder,
+                            move |app| {
+                                app.navigate(Route::CrossFile {
+                                    device_id: Some(crossfile_id.clone()),
+                                    folder: None,
+                                });
+                            },
+                        ));
+                        if !is_pad {
+                            entries = entries.child(self.card_feature_entry(
+                                cx,
+                                ("entry-cast", idx),
+                                cast_item,
+                                Icon::MonitorSmartphone,
+                                move |app| {
+                                    app.navigate(Route::Screen {
+                                        device_id: Some(screen_id.clone()),
+                                    });
+                                },
+                            ));
+                        }
+                        entries = entries.child(self.card_feature_entry(
+                            cx,
+                            ("entry-share", idx),
+                            share_item,
+                            Icon::ScreenShare,
+                            move |app| {
+                                app.navigate(Route::ScreenShare {
+                                    device_id: Some(share_id.clone()),
+                                });
+                            },
+                        ));
+                        entries = entries.child(self.card_feature_entry(
+                            cx,
+                            ("entry-sync", idx),
+                            sync_item,
+                            Icon::ArrowLeftRight,
+                            |app| app.navigate(Route::Settings),
+                        ));
+                        card.child(entries)
+                    })
+                    .when(!connected, |card| {
+                        card.child(
+                            div()
+                                .id(("device-connect", idx))
+                                .h(px(32.))
+                                .rounded(px(PILL_R))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .bg(h(PRIMARY))
+                                .child(
+                                    div()
+                                        .text_size(px(FONT_LABEL))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(h(ON_PRIMARY))
+                                        .child("Connect"),
+                                )
+                                .on_click(cx.listener(move |app, _e, _w, cx| {
+                                    app.request_connect(&connect_target);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    // Vendor "⋮" menu (`DeviceCardMoreMenu`): Disconnect
+                    // (connected only) then danger Delete device.
+                    .when(self.ui.more_menu_for == Some(idx), |card| {
+                        card.child(
+                            div()
+                                .absolute()
+                                .right(px(8.))
+                                .top(px(36.))
+                                .w(px(150.))
+                                .rounded(px(8.))
+                                .bg(h(BG))
+                                .border_1()
+                                .border_color(h(DIVIDER))
+                                .py(px(4.))
+                                .flex()
+                                .flex_col()
+                                .when(connected, |menu| {
+                                    menu.child(
+                                        div()
+                                            .id(("menu-disconnect", idx))
+                                            .px(px(12.))
+                                            .py(px(6.))
+                                            .cursor_pointer()
+                                            .hover(|d| d.bg(h(HOVER_BG)))
+                                            .child(
+                                                div()
+                                                    .text_size(px(FONT_LABEL))
+                                                    .text_color(h(TEXT))
+                                                    .child(disconnect_item),
+                                            )
+                                            .on_click(cx.listener(move |app, _e, _w, cx| {
+                                                cx.stop_propagation();
+                                                app.close_more_menu();
+                                                app.request_disconnect(&menu_disconnect_target);
+                                                cx.notify();
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(("menu-delete", idx))
+                                        .px(px(12.))
+                                        .py(px(6.))
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(h(HOVER_BG)))
+                                        .child(
+                                            div()
+                                                .text_size(px(FONT_LABEL))
+                                                .text_color(h(ERROR))
+                                                .child(delete_item),
+                                        )
+                                        .on_click(cx.listener(move |app, _e, _w, cx| {
+                                            cx.stop_propagation();
+                                            app.close_more_menu();
+                                            app.request_remove_device(&menu_delete_target);
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    }),
             );
         }
         wrap.child(
@@ -655,6 +810,50 @@ impl AppState {
         )
         .child(grid)
         .into_any_element()
+    }
+
+    /// Connected-card quick-feature entry (`SingleDeviceCard` function-area:
+    /// icon above label, tinted hover fill).
+    fn card_feature_entry<F>(
+        &mut self,
+        cx: &mut Context<Self>,
+        id: (&'static str, usize),
+        label: &'static str,
+        icon: Icon,
+        go: F,
+    ) -> AnyElement
+    where
+        F: Fn(&mut Self) + 'static,
+    {
+        div()
+            .id(id)
+            .flex_1()
+            .h(px(58.))
+            .rounded(px(8.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(h(HOVER_BG)))
+            .child(
+                svg()
+                    .data(icon.svg_bytes())
+                    .size(px(20.))
+                    .text_color(h(TEXT_SECONDARY)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(h(TEXT_SECONDARY))
+                    .child(label),
+            )
+            .on_click(cx.listener(move |app, _e, _w, cx| {
+                go(app);
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn connect_status_line(&self) -> Option<String> {
@@ -880,16 +1079,26 @@ impl AppState {
             .into_any_element()
     }
 
-    // --------------------------------------------- delete-confirm dialog
-    fn render_delete_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let id = self.ui.delete_pending.clone().unwrap_or_default();
-        let name = self
-            .connection
-            .wall()
-            .into_iter()
-            .find(|d| d.device_id == id)
-            .map(|d| d.device_name.clone())
-            .unwrap_or_else(|| id.clone());
+    // --------------------------------------------- vendor confirm dialogs
+    /// Shared `DsDialog` compact confirm (title, message, Cancel + a danger
+    /// or primary action) for the three vendor device-section dialogs:
+    /// Delete this device, Disconnect this device, Connect to a new device.
+    fn render_confirm_dialog(&mut self, cx: &mut Context<Self>, kind: ConfirmKind) -> AnyElement {
+        let (id_prefix, title, message, cancel, confirm, danger) = match kind {
+            ConfirmKind::Delete => {
+                let (title, message, cancel, confirm) = delete_confirm_labels();
+                ("delete", title, message, cancel, confirm, true)
+            }
+            ConfirmKind::Disconnect => {
+                let (title, message, cancel, confirm) =
+                    disconnect_confirm_labels(self.mirroring.active_listen.is_some());
+                ("disconnect", title, message, cancel, confirm, true)
+            }
+            ConfirmKind::ConnectConflict => {
+                let (title, message, cancel, confirm) = connect_conflict_labels();
+                ("conflict", title, message, cancel, confirm, false)
+            }
+        };
         div()
             .absolute()
             .left(px(0.))
@@ -913,16 +1122,13 @@ impl AppState {
                             .text_size(px(FONT_TITLE))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(h(TEXT))
-                            .child(format!("Remove {name}?")),
+                            .child(title),
                     )
                     .child(
                         div()
                             .text_size(px(FONT_BODY))
                             .text_color(h(TEXT_SECONDARY))
-                            .child(
-                                "Unpair this device and remove it from the list. \
-                                 It must pair again to return.",
-                            ),
+                            .child(message),
                     )
                     .child(
                         div()
@@ -932,7 +1138,7 @@ impl AppState {
                             .gap(px(10.))
                             .child(
                                 div()
-                                    .id("delete-cancel")
+                                    .id(SharedString::from(format!("{id_prefix}-cancel")))
                                     .h(px(32.))
                                     .px(px(14.))
                                     .rounded(px(PILL_R))
@@ -947,20 +1153,24 @@ impl AppState {
                                         div()
                                             .text_size(px(FONT_LABEL))
                                             .text_color(h(TEXT_SECONDARY))
-                                            .child("Cancel"),
+                                            .child(cancel),
                                     )
-                                    .on_click(cx.listener(|app, _e, _w, cx| {
-                                        app.cancel_remove_device();
+                                    .on_click(cx.listener(move |app, _e, _w, cx| {
+                                        match id_prefix {
+                                            "delete" => app.cancel_remove_device(),
+                                            "disconnect" => app.cancel_disconnect(),
+                                            _ => app.cancel_connect_conflict(),
+                                        }
                                         cx.notify();
                                     })),
                             )
                             .child(
                                 div()
-                                    .id("delete-confirm")
+                                    .id(SharedString::from(format!("{id_prefix}-confirm")))
                                     .h(px(32.))
                                     .px(px(14.))
                                     .rounded(px(PILL_R))
-                                    .bg(h(PRIMARY))
+                                    .bg(if danger { h(ERROR) } else { h(PRIMARY) })
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -970,10 +1180,14 @@ impl AppState {
                                             .text_size(px(FONT_LABEL))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(h(ON_PRIMARY))
-                                            .child("Remove"),
+                                            .child(confirm),
                                     )
-                                    .on_click(cx.listener(|app, _e, _w, cx| {
-                                        app.confirm_remove_device();
+                                    .on_click(cx.listener(move |app, _e, _w, cx| {
+                                        match id_prefix {
+                                            "delete" => app.confirm_remove_device(),
+                                            "disconnect" => app.confirm_disconnect(),
+                                            _ => app.confirm_connect_conflict(),
+                                        }
                                         cx.notify();
                                     })),
                             ),
@@ -2000,6 +2214,27 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Vendor card status tag (`el-tag` with a leading dot).
+fn tag_pill(label: &str, color: u32, bg: u32) -> AnyElement {
+    div()
+        .h(px(18.))
+        .px(px(6.))
+        .rounded(px(4.))
+        .bg(h(bg))
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .child(div().size(px(5.)).rounded(px(3.)).bg(h(color)))
+        .child(
+            div()
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(h(color))
+                .child(label.to_string()),
+        )
+        .into_any_element()
 }
 
 /// Render the pairing payload as a real QR grid (fast_qr encoder). The

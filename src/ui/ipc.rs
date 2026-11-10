@@ -1,16 +1,18 @@
-//! Mock "main process" for the GPUI port.
+//! IPC seam for the GPUI port.
 //!
 //! The vendor renderer talked to Electron main through `IpcService`/
 //! `ipcManager` channels; the backend answers the same channel
-//! names in `src/gui/ipc.rs`. To keep this UI decoupled from the backend
-//! (per project direction), the UI talks to this in-process
-//! mock with the identical contract: served channels answer `{ok:true,…}`,
-//! anything else answers `{ok:false, __unhandled:"<channel>"}` and is
-//! recorded in an audit ring exposed as `ipc_registry` — same ring idea as
-//! the real backend. Swapping this for a real transport is a drop-in.
+//! names in `src/gui/ipc.rs`. `Ipc` dispatches into that backend; with no
+//! backend every channel keeps the vendor contract — `{ok:false,
+//! __unhandled:"<channel>"}` — and is recorded in an audit ring exposed as
+//! `ipc_registry` (same ring idea as the real backend). Test builds also
+//! compile a stateful mock main (`MockMain`) that answers the served
+//! channels with the identical `{ok:true,…}` contract, so the UI suite runs
+//! without a phone or daemon.
 
 use std::collections::VecDeque;
 
+#[cfg(test)]
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Value, json};
 use strum::{Display, EnumIter, EnumString};
@@ -83,6 +85,7 @@ const AUDIT_CAP: usize = 256;
 /// QR deep link the phone's exported, autoVerify `QrCodeScanActivity`
 /// accepts (PROTOCOL.md §3): `heycast://synergy/start?param=<b64
 /// HeySynergy JSON>`. Override with `LPLUS_PAIRING_URL_BASE` for staging.
+#[cfg(test)]
 fn pairing_url_base() -> String {
     std::env::var("LPLUS_PAIRING_URL_BASE")
         .unwrap_or_else(|_| "heycast://synergy/start".to_string())
@@ -92,6 +95,7 @@ fn pairing_url_base() -> String {
 /// the bean so the phone's GSON binds them); keys the mock cannot know stay
 /// empty and the phone's pre-dial gate chain fills the rest. `Type` "4" is
 /// `ConnectType::WLAN` (§5.3).
+#[cfg(test)]
 fn pairing_qr_param(host: &str) -> String {
     let bean = json!({ "HeySynergy": {
         "Mac": "",
@@ -113,6 +117,12 @@ fn pairing_qr_param(host: &str) -> String {
     general_purpose::STANDARD.encode(bean.to_string())
 }
 
+/// Stateful fake vendor "main" — **test builds only**. Serves the two canned
+/// demo devices over the shared channel contract so the GPUI suite (and
+/// test-build launches with `LPLUS_BACKEND=off`) exercise the UI without a
+/// phone or daemon. Shipped builds never compile this: dispatch goes to the
+/// backend, or keeps the vendor unhandled contract.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct MockMain {
     audit: VecDeque<String>,
@@ -121,6 +131,7 @@ pub struct MockMain {
     unpaired_ids: Vec<String>,
 }
 
+#[cfg(test)]
 impl MockMain {
     pub fn new() -> Self {
         Self {
@@ -404,14 +415,16 @@ impl Transport {
     fn addr(&self) -> SocketAddr {
         match self {
             Self::Http(b) => b.addr,
-            Self::Direct => DEFAULT_BACKEND_ADDR.parse().unwrap_or_else(|_| "127.0.0.1:0".parse().expect("static")),
+            Self::Direct => DEFAULT_BACKEND_ADDR
+                .parse()
+                .unwrap_or_else(|_| "127.0.0.1:0".parse().expect("static")),
         }
     }
 }
 
-/// Resolution of `LPLUS_BACKEND`; `None` = mock only. With `default_backend`
-/// an unset value means the local daemon (launch semantics); without it,
-/// mock (test semantics).
+/// Resolution of `LPLUS_BACKEND`; `None` = no backend. With `default_backend`
+/// an unset value means the local daemon (launch semantics); without it, no
+/// backend (test semantics: mock filler).
 fn ipc_spec(spec: &str, default_backend: bool) -> Option<SocketAddr> {
     if spec.is_empty() {
         return if default_backend {
@@ -430,12 +443,15 @@ fn ipc_spec(spec: &str, default_backend: bool) -> Option<SocketAddr> {
     spec.parse().ok()
 }
 
-/// Dispatcher behind `AppState::ipc`: prefers the real linux-client backend
-/// and keeps the mock as per-channel filler (anything the backend answers
-/// `__unhandled`, or everything once the backend is judged down). Same
-/// `{ok,…}` contract either way, so the views never learn which side served.
+/// Dispatcher behind `AppState::ipc`: prefers the real linux-client backend;
+/// test builds additionally keep the mock as per-channel filler (anything
+/// the backend answers `__unhandled`, or everything once the backend is
+/// judged down). Shipped builds have no filler: with no backend every
+/// channel keeps the vendor unhandled contract. Same `{ok,…}` shape either
+/// way, so the views never learn which side served.
 #[derive(Debug)]
 pub struct Ipc {
+    #[cfg(test)]
     mock: MockMain,
     backend: Option<Transport>,
     backend_down: bool,
@@ -443,49 +459,54 @@ pub struct Ipc {
     last_served: &'static str,
 }
 
-impl Default for Ipc {
-    fn default() -> Self {
-        Self::mock_only()
-    }
-}
-
 impl Ipc {
-    pub fn mock_only() -> Self {
+    fn with_backend(backend: Option<Transport>, last_served: &'static str) -> Self {
         Self {
+            #[cfg(test)]
             mock: MockMain::new(),
-            backend: None,
+            backend,
             backend_down: false,
             audit: VecDeque::new(),
-            last_served: "mock",
+            last_served,
         }
+    }
+
+    /// No transport and no mock filler: every dispatch is audited and
+    /// answered `__unhandled`. `LPLUS_BACKEND=off` in shipped builds.
+    fn detached() -> Self {
+        Self::with_backend(None, "none")
+    }
+
+    /// Test-only fallback when no backend is configured (test semantics).
+    #[cfg(test)]
+    pub fn mock_only() -> Self {
+        Self::with_backend(None, "mock")
+    }
+
+    #[cfg(test)]
+    fn fallback() -> Self {
+        Self::mock_only()
+    }
+
+    #[cfg(not(test))]
+    fn fallback() -> Self {
+        Self::detached()
     }
 
     pub fn http(addr: SocketAddr) -> Self {
-        Self {
-            mock: MockMain::new(),
-            backend: Some(Transport::Http(HttpBackend { addr })),
-            backend_down: false,
-            audit: VecDeque::new(),
-            last_served: "mock",
-        }
+        Self::with_backend(Some(Transport::Http(HttpBackend { addr })), "backend")
     }
 
     /// Merged-binary transport: dispatch straight into the in-process
     /// daemon (shared registry, no sockets).
     pub fn direct() -> Self {
-        Self {
-            mock: MockMain::new(),
-            backend: Some(Transport::Direct),
-            backend_down: false,
-            audit: VecDeque::new(),
-            last_served: "mock",
-        }
+        Self::with_backend(Some(Transport::Direct), "backend")
     }
 
-    /// `LPLUS_BACKEND`: `off`/`0`/`mock` → mock only; `1`/`auto` →
-    /// `127.0.0.1:1421`; `host:port` → that address. Unset means mock only
-    /// here (test default); real launches use [`Ipc::from_launch`], which
-    /// defaults to the local daemon instead.
+    /// `LPLUS_BACKEND`: `off`/`0`/`mock` → no backend; `1`/`auto` →
+    /// `127.0.0.1:1421`; `host:port` → that address. Unset means no backend
+    /// here (test semantics: mock filler); real launches use
+    /// [`Ipc::from_launch`], which defaults to the local daemon instead.
     pub fn from_env() -> Self {
         Self::from_spec(false)
     }
@@ -501,7 +522,7 @@ impl Ipc {
         let spec = std::env::var("LPLUS_BACKEND").unwrap_or_default();
         match ipc_spec(spec.trim(), default_backend) {
             Some(addr) => Self::http(addr),
-            None => Self::mock_only(),
+            None => Self::fallback(),
         }
     }
 
@@ -538,8 +559,19 @@ impl Ipc {
                 }
             }
         }
-        self.last_served = "mock";
-        self.mock.invoke_raw(channel, args)
+        #[cfg(test)]
+        {
+            self.last_served = "mock";
+            self.mock.invoke_raw(channel, args)
+        }
+        #[cfg(not(test))]
+        {
+            // Shipped builds have no filler: keep the vendor unhandled
+            // contract and audit it for the audit page / probe.
+            self.last_served = "none";
+            self.record(&format!("unhandled-invoke:{channel}"));
+            json!({ "ok": false, "__unhandled": channel })
+        }
     }
 
     /// Which side answered the last `invoke` — "backend" or "mock".
@@ -563,11 +595,13 @@ impl Ipc {
         self.audit.push_back(entry.to_string());
     }
 
-    /// Ipc-level backend events followed by the mock's own audit ring.
+    /// Ipc-level backend events followed by the mock's own audit ring
+    /// (test builds only).
     pub fn audit(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.audit.iter().cloned().collect();
-        out.extend(self.mock.audit());
-        out
+        let base = self.audit.iter().cloned();
+        #[cfg(test)]
+        let base = base.chain(self.mock.audit());
+        base.collect()
     }
 }
 

@@ -31,8 +31,6 @@
 #![warn(clippy::all)]
 
 mod ble;
-#[cfg(feature = "gui")]
-mod ui;
 #[allow(dead_code)] // dev/CI surface kept for wire-capture work (was lib-public)
 mod d2d;
 mod gui;
@@ -45,6 +43,8 @@ mod protos;
 mod rtsp;
 #[allow(dead_code)] // dev/CI surface kept for wire-capture work (was lib-public)
 mod scp;
+#[cfg(feature = "gui")]
+mod ui;
 
 mod sdpd;
 mod state;
@@ -82,7 +82,8 @@ struct Cli {
     #[arg(long, default_value_t = sdpd::default_vip())]
     vip: String,
     // ---- window flags (default / `gui` entry points) ---------------------
-    /// Demo state: mock devices + manual-connect lane.
+    /// Demo state: manual-connect lane (the device mock only compiles into
+    /// test builds).
     #[arg(long, global = true)]
     demo: bool,
     /// Open the manual-connect dialog at launch.
@@ -232,7 +233,11 @@ fn apply_daemon_env() {
     if !seeds.is_empty() {
         tracing::info!(
             "[state] seeded from settings.json: {}",
-            seeds.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")
+            seeds
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         for (k, v) in seeds {
             // SAFETY: single-threaded startup, as below.
@@ -598,7 +603,13 @@ mod cli_tests {
     #[test]
     fn top_level_overrides_parse() {
         let cli = Cli::try_parse_from([
-            "lplus", "--name", "FOO", "--csp", "10153", "--vip", "192.0.2.12",
+            "lplus",
+            "--name",
+            "FOO",
+            "--csp",
+            "10153",
+            "--vip",
+            "192.0.2.12",
         ])
         .unwrap();
         assert_eq!(cli.name, "FOO");
@@ -650,7 +661,11 @@ mod cli_tests {
         assert!(missing.iter().any(|(k, _)| *k == "KMS"));
         assert!(missing.iter().any(|(k, _)| *k == "LPLUS_EVENTS_PORT"));
         // Pairing material must never live in the generic table.
-        assert!(!missing.iter().any(|(k, _)| *k == "SCP_KSC" || *k == "LINK_KPD"));
+        assert!(
+            !missing
+                .iter()
+                .any(|(k, _)| *k == "SCP_KSC" || *k == "LINK_KPD")
+        );
     }
 
     #[test]
@@ -660,7 +675,13 @@ mod cli_tests {
             "linkKpd": "",
         });
         let seeds = settings_seeds(&settings, &|k| (k == "LINK_KPD").then(|| "preset".into()));
-        assert_eq!(seeds, vec![("SCP_KSC".to_string(), "00112233445566778899aabbccddeeff".to_string())]);
+        assert_eq!(
+            seeds,
+            vec![(
+                "SCP_KSC".to_string(),
+                "00112233445566778899aabbccddeeff".to_string()
+            )]
+        );
         let none = settings_seeds(&settings, &|_| Some("set".into()));
         assert!(none.is_empty());
     }

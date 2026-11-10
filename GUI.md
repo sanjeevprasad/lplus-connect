@@ -63,7 +63,7 @@ were used to drive this port (call sites, response shapes, boot order).
 | Console mirror | `console_log` IPC / `GET /__log` beacon mirror remote client logs onto the host log |
 | Reference bundle | `vendor/renderer` is served nowhere; the `.html`/`.js`/`.css` keep the historical `app://`→`/` rewrite so RE diffs against the asar stay line-aligned |
 | Locale | The port authors English strings; the bundle's bundled zh packs remain as reference data |
-| UI transports | direct (merged default): the window calls `gui::ipc::dispatch` in-process; attach (`gui` subcommand): `POST /__ipc` to a running daemon, `LPLUS_BACKEND=off/1/host:port`; mock: in-process stubs fill unimplemented channels and record them in the audit ring. Tests run mock-only and never touch the network |
+| UI transports | direct (merged default): the window calls `gui::ipc::dispatch` in-process; attach (`gui` subcommand): `POST /__ipc` to a running daemon, `LPLUS_BACKEND=off/1/host:port`. The in-process mock main (stub devices + audit ring) compiles into **test builds only** (`#[cfg(test)]`); shipped builds without a backend keep the vendor `__unhandled` contract. Tests run mock-only and never touch the network |
 
 ## 3. IPC channel registry (`src/gui/ipc.rs`)
 
@@ -236,7 +236,7 @@ copied over once on first use.
 | Module | Ports |
 | --- | --- |
 | `src/ui/router.rs` | vendor hash router (`home`, `crossfile/*`, `aiSearch`, `screen`, `screenshare`, `remotecontrol`, `settings`, `uploaddownload`, `generic-agent`, `note`) |
-| `src/ui/ipc.rs` | transports (direct / attach / mock), vendor channels as a typed strum `Channel` enum + `__unhandled` audit ring |
+| `src/ui/ipc.rs` | transports (direct / attach; test-only mock filler), vendor channels as a typed strum `Channel` enum + `__unhandled` audit ring |
 | `src/ui/stores/connection.rs` | vuex `connection.js`: found/connected merge, `deviceListSort`, connect state machine (incl. on-device permission wait) |
 | `src/ui/stores/transfer.rs` | vuex `uploadDownload.js`: queue, progress clamp, clear-finished |
 | `src/ui/stores/toast.rs` | vuex `toast.js` |
@@ -245,7 +245,7 @@ copied over once on first use.
 | `src/ui/theme.rs` | design tokens **measured from the live renderer** |
 | `src/ui/e2e.rs` | gpui `TestApp` integration suite (click-walks the sidebar nav, transfer queue) |
 
-Window flags: `--demo` (mock devices + manual-connect lane),
+Window flags: `--demo` (manual-connect lane; device mock is test-builds-only),
 `--dialog [--usb]`, `--start-home`, `--route <name>` (accepted names:
 `settings|screen|aiSearch|crossfile|screenshare|remotecontrol|genericAgent|note|uploaddownload`).
 
@@ -267,7 +267,7 @@ wall 9/9 PASS against vendor references.
 
 | Vendor route | State |
 | --- | --- |
-| `#/home` (device wall, found-device cards, connect lifecycle) | ported (connected/paired-device cards are real-backend rows) |
+| `#/home` (device wall, found-device cards, connect lifecycle) | ported (connected/paired-device cards are real-backend rows; vendor card UX: Connected/Recently connected tags, ⋮ more-menu with Disconnect/Delete device, per-card disconnect glyph, connected-card quick entries Files/Screencast/Screen Collaborate/Content sync, and the three vendor confirm dialogs — Delete this device?, Disconnect this device? (sharing-aware copy), Connect to a new device?) |
 | `#/screen` (mirroring start/stop, quality presets, mute/record) | ported on mock odmf |
 | `#/uploaddownload` (+ MiniUploadDownload header chip) | ported (demo queue) |
 | `#/settings` (general panel subset) | ported (host name through backend `settings_*`) |
@@ -277,6 +277,11 @@ wall 9/9 PASS against vendor references.
 | `#/screenshare`, `#/remotecontrol`, `#/note` | honest stubs: pending channels are invoked and land in the audit ring |
 
 ## 10. Known gaps / honest stubs
+
+- Device cards vs the vendor: the "Mobile network" warning tag and the
+  ability-gated Screen Collaborate entry have no backend data yet
+  (`deviceCellularStatus`, `isHaveScreenShareAbility`), so the tag is
+  omitted and the entry always shows (its route is the audited stub).
 
 - Icons are open-licensed, not vendor copies: every glyph (nav rail, floor
   controls, QR overlays) is a **Lucide** (ISC) SVG embedded from the
