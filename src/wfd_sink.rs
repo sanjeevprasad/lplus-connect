@@ -24,8 +24,9 @@ use base64::Engine as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::rtsp::{RtspMethod, RtspMsg};
-use strum::{EnumString, IntoEnumIterator};
+use protocol::odmf::{AuthFields, AuthInfoFile, AuthResponse, PairMsg, json_reply};
+use protocol::rtsp::{Rtsp, RtspExt, RtspMethod, WfdParam, response_with_body};
+use strum::IntoEnumIterator;
 
 const START_CODE: &[u8] = b"\x00\x00\x00\x01";
 const MAX_NAL: usize = 4 * 1024 * 1024;
@@ -153,13 +154,13 @@ async fn session(
         // buffered for the wire log (phase-1 capture of unknown framing).
         while let Some((req, used)) = try_parse_request(&acc) {
             acc.drain(..used);
-            tracing::info!(
-                "[odmf] {} {} (CSeq {}) body={}B",
-                req.method,
-                req.uri,
-                req.header("CSeq").unwrap_or("-"),
-                req.body.len()
-            );
+            if let (Some(mth), Some(uri)) = (req.method(), req.uri()) {
+                tracing::info!(
+                    "[odmf] {mth} {uri} (CSeq {}) body={}B",
+                    req.header("CSeq").unwrap_or("-"),
+                    req.body().len()
+                );
+            }
             if respond {
                 let replies = build_replies(&req, &mut session_hdr);
                 for r in replies {
@@ -169,8 +170,8 @@ async fn session(
                     tracing::info!(
                         "[odmf] tx {}B | {} {}",
                         bytes.len(),
-                        r.status.unwrap_or(0),
-                        r.reason.clone().unwrap_or_default()
+                        r.status().unwrap_or(0),
+                        r.reason().unwrap_or_default()
                     );
                 }
             }
@@ -185,29 +186,24 @@ async fn session(
                 tracing::info!("[odmf] frame {peer} | {}", redact(&json));
             }
             crate::odmf_pc::handle_inbound(&json);
-            // identity-auth lane: phone answered our OdmfAuthRequest
+            // identity-auth lane: phone answered our OdmfAuthRequest. The
+            // cheap substring gate stays (it also catches frames the typed
+            // parse below rejects, which we then log); only the payload is
+            // typed now.
             if respond && json.contains("\"OdmfAuthResponse\"") {
                 match (
                     OdmfAuth::load(),
-                    serde_json::from_str::<serde_json::Value>(&json),
+                    serde_json::from_str::<AuthResponse>(&json),
                 ) {
-                    (Some(a), Ok(v)) => {
-                        if let Some((reply, k)) = a.auth_success_json(&v) {
+                    (Some(a), Ok(resp)) => {
+                        if let Some((reply, k)) = a.auth_success_json(&resp) {
                             media_key = Some(k);
-                            local_bus = v
-                                .get("local_transportbus_id")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string();
+                            local_bus = resp.local_transportbus_id.clone().unwrap_or_default();
                             peer_note(
                                 &peer_ip,
                                 &local_bus,
-                                v.get("local_user_name")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("heycast_odmf"),
-                                v.get("local_user_id")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or(""),
+                                resp.local_user_name.as_deref().unwrap_or("heycast_odmf"),
+                                resp.local_user_id.as_deref().unwrap_or(""),
                             );
                             let mut out = Vec::with_capacity(reply.len() + 2);
                             out.extend_from_slice(&(reply.len() as u16).to_be_bytes());
@@ -264,9 +260,13 @@ async fn session(
                     continue;
                 };
                 let (rb, rn, rid) = peer_other(&peer_ip, &local_bus);
-                let reply = format!(
-                    "{{\"cmd\":\"PairSuccess\",\"remote_user_name\":\"{rn}\",\"remote_user_id\":\"{rid}\",\"remote_transportbus_id\":\"{rb}\"}}"
-                );
+                let Ok(reply) = serde_json::to_string(&PairMsg::PairSuccess {
+                    remote_user_name: rn,
+                    remote_user_id: rid,
+                    remote_transportbus_id: rb,
+                }) else {
+                    continue;
+                };
                 match encrypt_frame(k, &reply) {
                     Some(payload) => {
                         let mut out = Vec::with_capacity(payload.len() + 2);
@@ -313,14 +313,6 @@ fn try_parse_json_frame(buf: &[u8]) -> Option<(String, usize)> {
         return None;
     }
     Some((json, 2 + len))
-}
-
-/// Keepalive reply table: ping → pong. Unknown frames unanswered (capture).
-fn json_reply(json: &str) -> Option<String> {
-    if json.contains("\"ping\"") {
-        return Some("{\"cmd\":\"pong\"}".to_string());
-    }
-    None
 }
 
 /// Server-side bus hello sent once per connection after the first pong
@@ -556,14 +548,14 @@ impl OdmfAuth {
         let pem_path =
             std::env::var("ODMF_PRIV_PEM").unwrap_or_else(|_| "/tmp/odmf_priv.pem".into());
         let info = std::fs::read_to_string(&info_path).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&info).ok()?;
-        let id_b64 = v.get("id")?.as_str()?.to_string();
+        let v: AuthInfoFile = serde_json::from_str(&info).ok()?;
+        let id_b64 = v.id;
         // Any length: SigIdentityAuthHelper compares raw id bytes; the push
         // flow uses "lplus-pc-<n>" (11+ bytes), random ids are 8.
         b64std(&id_b64)?;
         let pem = std::fs::read_to_string(&pem_path).ok()?;
         let priv_scalar = p256_scalar_from_pem(&pem)?;
-        let auth_version = v.get("auth_version").and_then(|x| x.as_i64()).unwrap_or(1);
+        let auth_version = v.auth_version.unwrap_or(1);
         Some(Self {
             id_b64,
             priv_scalar,
@@ -580,7 +572,7 @@ impl OdmfAuth {
     /// adopts that key for all later encrypted frames. The peer's own
     /// response plaintext is raw id bytes, not JSON.
     #[allow(deprecated)] // aead 0.6 nonce ctor (same pattern as kms::gcm_seal)
-    fn auth_success_json(&self, resp: &serde_json::Value) -> Option<(String, [u8; 32])> {
+    fn auth_success_json(&self, resp: &AuthResponse) -> Option<(String, [u8; 32])> {
         use aes_gcm::aead::{Aead, Payload};
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use p256::PublicKey;
@@ -588,33 +580,25 @@ impl OdmfAuth {
         // Live transcript 17:57:25Z: the phone nests the SigIdentityAuthHelper
         // auth fields as an *escaped JSON string* under "auth_info", beside
         // local/remote transport-bus ids. Accept both nestings.
-        let src = match resp.get("auth_info") {
-            Some(serde_json::Value::String(s)) => {
-                match serde_json::from_str::<serde_json::Value>(s) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!("[odmf] auth: auth_info not JSON: {e}");
-                        return None;
-                    }
+        let src = match resp.auth_info.as_deref() {
+            Some(s) => match serde_json::from_str::<AuthFields>(s) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("[odmf] auth: auth_info not JSON: {e}");
+                    return None;
                 }
-            }
-            Some(v) => v.clone(),
-            None => resp.clone(),
+            },
+            None => resp.fields.clone(),
         };
-        for k in ["public_key", "iv", "encrypt_cipher", "timestamp"] {
-            if src.get(k).is_none() {
-                tracing::warn!(
-                    "[odmf] auth: missing field {k}, have {:?}",
-                    src.as_object().map(|m| m.keys().collect::<Vec<_>>())
-                );
-                return None;
-            }
+        if let Some(missing) = src.missing_field_name() {
+            tracing::warn!("[odmf] auth: missing auth field: {missing}");
+            return None;
         }
-        let pk_b64 = src.get("public_key")?.as_str()?;
-        let iv_b64 = src.get("iv")?.as_str()?;
-        let ct_b64 = src.get("encrypt_cipher")?.as_str()?;
-        let ts = src.get("timestamp")?.as_str()?.to_string();
-        let pk_der = b64std(pk_b64)?;
+        let pk_b64 = src.public_key?;
+        let iv_b64 = src.iv?;
+        let ct_b64 = src.encrypt_cipher?;
+        let ts = src.timestamp?;
+        let pk_der = b64std(&pk_b64)?;
         // Ground truth (odmf.jar odmfi/odmfg::odmfb "decryptForIphone"): the
         // phone's public_key is a 65-byte raw uncompressed point
         // (0x04||X||Y), parsed via ECPoint — SPKI only appears in the
@@ -642,8 +626,8 @@ impl OdmfAuth {
         let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
         // peer's inner payload: {"id":<phone id>,"key":<K>} (verifiable, but
         // we only need to echo K back authenticated)
-        let ct = b64std(ct_b64)?;
-        let iv_in = b64std(iv_b64)?;
+        let ct = b64std(&ct_b64)?;
+        let iv_in = b64std(&iv_b64)?;
         // Ground truth (odmfi/odmfg::odmfb): Java `Cipher("AES/GCM/NoPadding",
         // GCMParameterSpec(128, iv))` with `updateAAD(timestamp)` iff the
         // timestamp string is non-null — the IV is GCM's arbitrary length
@@ -718,18 +702,13 @@ impl OdmfAuth {
                 },
             )
             .ok()?;
-        let local_bus = resp
-            .get("local_transportbus_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let local_bus = resp.local_transportbus_id.as_deref().unwrap_or("");
         Some((
             format!(
                 "{{\"timestamp\":\"{ts_out}\",\"iv\":\"{}\",\"cmd\":\"AuthSuccess\",\"encrypt_cipher\":\"{}\",\"auth_version\":{},\"local_transportbus_id\":\"lplus\",\"remote_transportbus_id\":\"{local_bus}\"}}",
                 b64s(&iv),
                 b64s(&sealed),
-                src.get("auth_version")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(self.auth_version)
+                src.auth_version.unwrap_or(self.auth_version)
             ),
             media_key,
         ))
@@ -747,7 +726,7 @@ fn redact(json: &str) -> String {
 }
 
 /// Parse one RTSP request from the head of `buf` if complete and recognizable.
-fn try_parse_request(buf: &[u8]) -> Option<(RtspMsg, usize)> {
+fn try_parse_request(buf: &[u8]) -> Option<(Rtsp, usize)> {
     if buf.len() < 16 {
         return None;
     }
@@ -760,39 +739,30 @@ fn try_parse_request(buf: &[u8]) -> Option<(RtspMsg, usize)> {
     if !RtspMethod::iter().any(|m| first.starts_with(m.as_ref())) {
         return None;
     }
-    RtspMsg::parse(buf).ok()
-}
-
-/// WFD parameters we answer on GET_PARAMETER; the `serialize` spellings are
-/// the exact lowercase wire names the source asks for.
-#[derive(Debug, Clone, Copy, EnumString)]
-enum WfdParam {
-    #[strum(serialize = "wfd_content_protection")]
-    ContentProtection,
-    #[strum(serialize = "wfd_uibc_capability")]
-    UibcCapability,
-    #[strum(serialize = "wfd_display_edid")]
-    DisplayEdid,
+    Rtsp::parse(buf).ok()
 }
 
 /// Minimal WFD-sink answers; values are deliberately conservative and are
 /// iterated against the live engine (see §7.9 transcript).
-fn build_replies(req: &RtspMsg, session_hdr: &mut Option<String>) -> Vec<RtspMsg> {
+fn build_replies(req: &Rtsp, session_hdr: &mut Option<String>) -> Vec<Rtsp> {
     let cseq: u32 = req
         .header("CSeq")
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(1);
-    let mut rsp = RtspMsg::response(200, "OK", cseq, None, &[]);
-    match req.method_enum() {
-        Some(RtspMethod::Options) => rsp.headers.push((
+    let mut extra: Vec<(String, String)> = Vec::new();
+    let mut reason = Some("OK");
+    let mut rsp_body: Vec<u8> = Vec::new();
+    // Unknown/extension methods and responses: bare 200.
+    match req.method() {
+        Some(RtspMethod::Options) => extra.push((
             "Public".into(),
             "org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, TEARDOWN".into(),
         )),
         Some(RtspMethod::GetParameter) => {
             // WFD capability exchange: echo requested params (values we can
             // honour), pin our RTP sink port, no HDCP.
-            let asked = String::from_utf8_lossy(&req.body).to_string();
-            let mut body = String::new();
+            let asked = String::from_utf8_lossy(req.body()).to_string();
+            let mut body_s = String::new();
             for line in asked.lines() {
                 let Some((k, v)) = line.split_once(':') else {
                     continue;
@@ -807,26 +777,22 @@ fn build_replies(req: &RtspMsg, session_hdr: &mut Option<String>) -> Vec<RtspMsg
                     Err(_) => v.trim().to_string(),             // echo the source's value
                 };
                 if !v.is_empty() {
-                    body.push_str(&format!("{k}: {v}\r\n"));
+                    body_s.push_str(&format!("{k}: {v}\r\n"));
                 }
             }
-            if body.is_empty() {
-                body.push_str("wfd_content_protection: none\r\n");
+            if body_s.is_empty() {
+                body_s.push_str("wfd_content_protection: none\r\n");
             }
             // Always advertise our RTP sink (source may omit the ask).
-            body.push_str(&format!(
+            body_s.push_str(&format!(
                 "wfd_client_rtp_ports: RTP/AVP/UDP;unicast {} 0 mode=play\r\n",
                 std::env::var("ODMF_RTP_PORT")
                     .ok()
                     .and_then(|s| s.parse::<u16>().ok())
                     .unwrap_or(15550)
             ));
-            let bytes = body.into_bytes();
-            rsp.headers
-                .push(("Content-Type".into(), "text/parameters".into()));
-            rsp.headers
-                .push(("Content-Length".into(), bytes.len().to_string()));
-            rsp.body = bytes;
+            rsp_body = body_s.into_bytes();
+            extra.push(("Content-Type".into(), "text/parameters".into())); // CL added
         }
         Some(RtspMethod::Setup) => {
             let id = format!(
@@ -838,10 +804,9 @@ fn build_replies(req: &RtspMsg, session_hdr: &mut Option<String>) -> Vec<RtspMsg
             );
             *session_hdr = Some(format!("{id};timeout=60"));
             if let Some(t) = req.header("Transport") {
-                rsp.headers.push(("Transport".into(), t.to_string()));
+                extra.push(("Transport".into(), t.to_string()));
             }
-            rsp.headers
-                .push(("Session".into(), session_hdr.clone().unwrap()));
+            extra.push(("Session".into(), session_hdr.clone().unwrap()));
             tracing::info!(
                 "[odmf] SETUP transport={:?} — awaiting RTP",
                 req.header("Transport")
@@ -849,20 +814,24 @@ fn build_replies(req: &RtspMsg, session_hdr: &mut Option<String>) -> Vec<RtspMsg
         }
         Some(RtspMethod::Play) => {
             if let Some(s) = session_hdr.clone() {
-                rsp.headers.push(("Session".into(), s));
+                extra.push(("Session".into(), s));
             }
-            rsp.headers.push((
-                "RTP-Info".into(),
-                format!("url={};seq=1;rtptime=0", req.uri),
-            ));
-            rsp.headers.push(("Range".into(), "npt=0.000-".into()));
+            let rtp_info = format!(
+                "url={};seq=1;rtptime=0",
+                req.uri().unwrap_or("rtsp://undefined")
+            );
+            extra.push(("RTP-Info".into(), rtp_info));
+            extra.push(("Range".into(), "npt=0.000-".into()));
             tracing::info!("[odmf] PLAY acked — expecting RTP now");
         }
-        Some(RtspMethod::Teardown) => rsp.reason = Some("bye".into()),
-        // Unknown/extension methods and responses: bare 200.
+        Some(RtspMethod::Teardown) => reason = Some("bye"),
         _ => {}
     }
-    vec![rsp]
+    let refs: Vec<(&str, &str)> = extra
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    vec![response_with_body(200, reason, cseq, None, &refs, rsp_body)]
 }
 
 // ------------------------------------------------- H.265 depacketizer ----
@@ -939,7 +908,7 @@ impl H265Depacketizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtsp::parse_rtp;
+    use protocol::rtsp::{parse_rtp, request, request_with_body};
 
     /// Regression: reproduce Java `BtIdentityAuthHelper` (odmfi/odmfg::odmfb)
     /// exactly — raw 65-B uncompressed peer point, raw ECDH X as AES-256 key,
@@ -999,11 +968,14 @@ mod tests {
             "auth_version": 1,
         })
         .to_string();
-        let resp = serde_json::json!({
+        let wire = serde_json::json!({
             "cmd": "OdmfAuthResponse",
             "auth_info": auth_info,
             "local_transportbus_id": "0000006734474",
-        });
+        })
+        .to_string();
+        let resp: AuthResponse =
+            serde_json::from_str(&wire).expect("typed OdmfAuthResponse parses");
 
         let (out, picked_key) = a.auth_success_json(&resp).expect("AuthSuccess built");
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -1219,7 +1191,7 @@ mod tests {
                     CSeq: 3\r\nContent-Length: 22\r\n\r\nwfd_video_formats: x\r\n"
             .to_vec();
         let (m, used) = try_parse_request(&req).unwrap();
-        assert_eq!(m.method_enum(), Some(RtspMethod::GetParameter));
+        assert_eq!(m.method(), Some(RtspMethod::GetParameter));
         assert_eq!(used, req.len());
         assert!(try_parse_request(b"nonsense bytes 0123456789abcdef").is_none());
         // partial headers → not yet
@@ -1236,7 +1208,6 @@ mod tests {
         assert_eq!(json, p);
         assert_eq!(used, f.len());
         assert_eq!(json_reply(&json).unwrap(), "{\"cmd\":\"pong\"}");
-        assert!(json_reply("{\"cmd\":\"start\",\"x\":1}").is_none());
         // short/partial buffers
         assert!(try_parse_json_frame(&[0x00, 0x0e, b'{']).is_none());
         assert!(try_parse_json_frame(&[0x10, 0x20, b'{', b'}']).is_none()); // len 4152>8192? no: >cap path
@@ -1245,14 +1216,61 @@ mod tests {
         assert!(redact(&long).len() <= 201);
     }
 
+    /// Live keepalive (2026-11-09 23:08 capture): `000e {"cmd":"ping"}` →
+    /// pong, framed off the wire buffer exactly as the lane sees it.
+    #[test]
+    fn keepalive_ping_pongs_and_nested_ping_stays_unanswered() {
+        let body = "{\"cmd\":\"ping\"}";
+        assert_eq!(body.len(), 14, "wire len 0x000e as captured");
+        let mut f = Vec::new();
+        f.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        f.extend_from_slice(body.as_bytes());
+        let (json, used) = try_parse_json_frame(&f).expect("keepalive framed");
+        assert_eq!(used, f.len());
+        assert_eq!(json_reply(&json).unwrap(), "{\"cmd\":\"pong\"}");
+    }
+
+    /// The typed `OdmfAuthResponse` accepts both live nestings: the escaped
+    /// `auth_info` JSON string (17:57:25Z transcript) and auth fields flat on
+    /// the frame, and reports omissions in the legacy check order.
+    #[test]
+    fn auth_response_parses_both_nestings_and_flags_missing_fields() {
+        let flat: AuthResponse = serde_json::from_str(
+            r#"{"cmd":"OdmfAuthResponse","public_key":"P","iv":"I","encrypt_cipher":"C","timestamp":"T","auth_version":1,"local_transportbus_id":"0000006734474","local_user_name":"heycast_odmf","local_user_id":"u"}"#,
+        )
+        .expect("flat OdmfAuthResponse");
+        assert_eq!(flat.fields.auth_version, Some(1));
+        assert_eq!(flat.local_transportbus_id.as_deref(), Some("0000006734474"));
+        assert_eq!(flat.local_user_name.as_deref(), Some("heycast_odmf"));
+        assert_eq!(flat.fields.missing_field_name(), None);
+        let nested: AuthResponse = serde_json::from_str(
+            r#"{"cmd":"OdmfAuthResponse","auth_info":"{\"public_key\":\"P\",\"iv\":\"I\",\"encrypt_cipher\":\"C\",\"timestamp\":\"T\"}"}"#,
+        )
+        .expect("nested OdmfAuthResponse");
+        let inner: AuthFields = serde_json::from_str(nested.auth_info.as_deref().expect("string"))
+            .expect("auth_info JSON");
+        assert_eq!(inner.missing_field_name(), None);
+        // omitted iv is reported before timestamp, matching the old loop
+        let partial: AuthFields =
+            serde_json::from_str(r#"{"public_key":"P","timestamp":"T","encrypt_cipher":"C"}"#)
+                .expect("partial auth fields");
+        assert_eq!(partial.missing_field_name(), Some("iv"));
+    }
+
     #[test]
     fn get_parameter_reply_carries_rtp_ports() {
-        let mut req = RtspMsg::request(RtspMethod::GetParameter, "rtsp://x/wfd1.0", 4, &[]);
-        req.body = b"wfd_content_protection: HDCP2.1\r\n".to_vec();
+        let req = request_with_body(
+            RtspMethod::GetParameter,
+            "rtsp://x/wfd1.0",
+            4,
+            &[],
+            b"wfd_content_protection: HDCP2.1\r\n".to_vec(),
+        )
+        .expect("valid uri");
         let mut sess = None;
         let rs = build_replies(&req, &mut sess);
-        assert_eq!(rs[0].status, Some(200));
-        let body = String::from_utf8(rs[0].body.clone()).unwrap();
+        assert_eq!(rs[0].status(), Some(200));
+        let body = String::from_utf8(rs[0].body().to_vec()).unwrap();
         assert!(body.contains("wfd_content_protection: none"), "{body}");
         assert!(
             body.contains("wfd_client_rtp_ports: RTP/AVP/UDP;unicast"),
@@ -1263,11 +1281,13 @@ mod tests {
     #[test]
     fn setup_play_reply_chain_covers_session() {
         let mut sess = None;
-        let mut setup = RtspMsg::request(RtspMethod::Setup, "rtsp://x/wfd1.0/streamid=0", 5, &[]);
-        setup.headers.push((
-            "Transport".into(),
-            "RTP/AVP/UDP;unicast;client_port=15550-15551".into(),
-        ));
+        let setup = request(
+            RtspMethod::Setup,
+            "rtsp://x/wfd1.0/streamid=0",
+            5,
+            &[("Transport", "RTP/AVP/UDP;unicast;client_port=15550-15551")],
+        )
+        .expect("valid uri");
         let rs = build_replies(&setup, &mut sess);
         assert_eq!(
             rs[0].header("Transport").unwrap(),
@@ -1279,7 +1299,7 @@ mod tests {
                 .unwrap()
                 .starts_with(|c: char| c.is_ascii_digit())
         );
-        let play = RtspMsg::request(RtspMethod::Play, "rtsp://x/wfd1.0/streamid=0", 6, &[]);
+        let play = request(RtspMethod::Play, "rtsp://x/wfd1.0/streamid=0", 6, &[]).expect("uri");
         let rs = build_replies(&play, &mut sess);
         assert!(rs[0].header("RTP-Info").unwrap().contains("seq=1"));
         // rtp payload helper sanity

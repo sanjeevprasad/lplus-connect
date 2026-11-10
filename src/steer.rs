@@ -75,35 +75,22 @@ pub fn parse_set_state(out: &str) -> SetState {
     let Some(start) = out.find('{') else {
         return SetState::Failed("no json in app_function output".into());
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&out[start..]) else {
+    let Ok(env) = serde_json::from_str::<protocol::appfn::AppStateOut>(&out[start..]) else {
         return SetState::Failed("unparseable app_function output".into());
     };
-    let Some(item) = v
-        .get("androidAppfunctionsReturnValue")
-        .and_then(|a| a.as_array())
-        .and_then(|a| a.first())
-    else {
+    let Some(item) = env.items.first() else {
         return SetState::Failed("empty app_function return value".into());
     };
-    let ok = || {
-        item.get("isSuccessful")
-            .and_then(|a| a.as_array())
-            .and_then(|a| a.first())
-            .and_then(|b| b.as_bool())
-            == Some(true)
-    };
-    let reason = || {
-        item.get("failureReason")
-            .and_then(|a| a.as_array())
-            .and_then(|a| a.first())
-            .and_then(|r| r.as_str())
-            .unwrap_or("unspecified")
-            .to_string()
-    };
-    if ok() {
+    let ok = item.is_successful.first().copied().flatten() == Some(true);
+    if ok {
         return SetState::Success;
     }
-    let r = reason();
+    let r = item
+        .failure_reason
+        .first()
+        .and_then(|r| r.as_deref())
+        .unwrap_or("unspecified")
+        .to_string();
     // Stale or absent panel row: the engine simply has not (re)discovered
     // the PC recently. Both strings mean "rescan and come back".
     if r.contains("not find item")
@@ -226,6 +213,9 @@ mod tests {
               "isSuccessful": [false] } ] }"#;
         assert!(matches!(parse_set_state(wedged), SetState::Failed(_)));
 
-        assert!(matches!(parse_set_state("no json here"), SetState::Failed(_)));
+        assert!(matches!(
+            parse_set_state("no json here"),
+            SetState::Failed(_)
+        ));
     }
 }

@@ -34,6 +34,45 @@ enum ConfirmKind {
     ConnectConflict,
 }
 
+impl ConfirmKind {
+    fn labels(
+        self,
+        app: &AppState,
+    ) -> (&'static str, &'static str, &'static str, &'static str, bool) {
+        match self {
+            ConfirmKind::Delete => {
+                let (title, message, cancel, confirm) = delete_confirm_labels();
+                (title, message, cancel, confirm, true)
+            }
+            ConfirmKind::Disconnect => {
+                let (title, message, cancel, confirm) =
+                    disconnect_confirm_labels(app.mirroring.active_listen.is_some());
+                (title, message, cancel, confirm, true)
+            }
+            ConfirmKind::ConnectConflict => {
+                let (title, message, cancel, confirm) = connect_conflict_labels();
+                (title, message, cancel, confirm, false)
+            }
+        }
+    }
+
+    fn cancel(self, app: &mut AppState) {
+        match self {
+            ConfirmKind::Delete => app.cancel_remove_device(),
+            ConfirmKind::Disconnect => app.cancel_disconnect(),
+            ConfirmKind::ConnectConflict => app.cancel_connect_conflict(),
+        }
+    }
+
+    fn confirm(self, app: &mut AppState) {
+        match self {
+            ConfirmKind::Delete => app.confirm_remove_device(),
+            ConfirmKind::Disconnect => app.confirm_disconnect(),
+            ConfirmKind::ConnectConflict => app.confirm_connect_conflict(),
+        }
+    }
+}
+
 impl AppState {
     // ---------------------------------------------------------- home shell
     fn render_home_shell(&mut self, cx: &mut Context<Self>, route: Route) -> AnyElement {
@@ -1126,21 +1165,7 @@ impl AppState {
     /// or primary action) for the three vendor device-section dialogs:
     /// Delete this device, Disconnect this device, Connect to a new device.
     fn render_confirm_dialog(&mut self, cx: &mut Context<Self>, kind: ConfirmKind) -> AnyElement {
-        let (title, message, cancel, confirm, danger) = match kind {
-            ConfirmKind::Delete => {
-                let (title, message, cancel, confirm) = delete_confirm_labels();
-                (title, message, cancel, confirm, true)
-            }
-            ConfirmKind::Disconnect => {
-                let (title, message, cancel, confirm) =
-                    disconnect_confirm_labels(self.mirroring.active_listen.is_some());
-                (title, message, cancel, confirm, true)
-            }
-            ConfirmKind::ConnectConflict => {
-                let (title, message, cancel, confirm) = connect_conflict_labels();
-                (title, message, cancel, confirm, false)
-            }
-        };
+        let (title, message, cancel, confirm, danger) = kind.labels(self);
         div()
             .absolute()
             .left(px(0.))
@@ -1198,13 +1223,7 @@ impl AppState {
                                             .child(cancel),
                                     )
                                     .on_click(cx.listener(move |app, _e, _w, cx| {
-                                        match kind {
-                                            ConfirmKind::Delete => app.cancel_remove_device(),
-                                            ConfirmKind::Disconnect => app.cancel_disconnect(),
-                                            ConfirmKind::ConnectConflict => {
-                                                app.cancel_connect_conflict()
-                                            }
-                                        }
+                                        kind.cancel(app);
                                         cx.notify();
                                     })),
                             )
@@ -1227,13 +1246,7 @@ impl AppState {
                                             .child(confirm),
                                     )
                                     .on_click(cx.listener(move |app, _e, _w, cx| {
-                                        match kind {
-                                            ConfirmKind::Delete => app.confirm_remove_device(),
-                                            ConfirmKind::Disconnect => app.confirm_disconnect(),
-                                            ConfirmKind::ConnectConflict => {
-                                                app.confirm_connect_conflict()
-                                            }
-                                        }
+                                        kind.confirm(app);
                                         cx.notify();
                                     })),
                             ),

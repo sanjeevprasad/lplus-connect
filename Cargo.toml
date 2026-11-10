@@ -4,6 +4,22 @@ description = "L+ Connect — unofficial Linux client for OnePlus/OPPO phones"
 version     = "0.1.0"
 edition     = "2024"
 license     = "MIT"
+# Shipped as a product binary, never published to crates.io; also lets
+# cargo-deny's allow-wildcard-paths exempt our internal `protocol` path dep.
+publish     = false
+
+[workspace]
+members = [".", "protocol"]
+
+# Shared versions/features; `lplus` and `protocol` both reference these.
+[workspace.dependencies]
+anyhow     = { version = "1", default-features = false, features = ["std"] }
+prost      = { version = "0.14", default-features = false, features = ["derive", "std"] }
+rtsp-types = { version = "0.1", default-features = false }
+serde      = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+strum      = { version = "0.28", default-features = false, features = ["std", "derive"] }
+thiserror  = { version = "2", default-features = false, features = ["std"] }
 
 [features]
 default = ["gui"]
@@ -16,7 +32,7 @@ gui = ["dep:gpui", "dep:gpui_platform", "dep:fast_qr", "dep:lucide-static-svg", 
 [dependencies]
 aes                = { version = "0.9", default-features = false }
 aes-gcm            = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
-anyhow             = { version = "1", default-features = false, features = ["std"] }
+anyhow             = { workspace = true }
 base64             = { version = "0.23", default-features = false, features = ["std"] }
 bluer              = { version = "0.17", default-features = false, features = ["bluetoothd"] }
 cbc                = { version = "0.2", default-features = false, features = ["alloc", "block-padding"] }
@@ -29,13 +45,15 @@ futures            = { version = "0.3", default-features = false, features = ["s
 hex                = { version = "0.4", default-features = false, features = ["std"] }
 hkdf               = { version = "0.13", default-features = false }
 hmac               = { version = "0.13", default-features = false }
+# phone↔PC wire contract (workspace member `protocol/`)
+protocol           = { path = "protocol" }
 p256               = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "precomputed-tables", "std"] }
-prost              = { version = "0.14", default-features = false, features = ["derive", "std"] }
+prost              = { workspace = true }
 rand               = { version = "0.10", default-features = false, features = ["thread_rng"] }
-serde              = { version = "1", default-features = false, features = ["std", "derive"] }
-serde_json         = { version = "1", default-features = false, features = ["std"] }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
 sha2               = { version = "0.11", default-features = false, features = ["alloc"] }
-strum              = { version = "0.28", default-features = false, features = ["std", "derive"] }
+strum              = { workspace = true }
 tokio              = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "sync", "net", "io-util", "macros", "process"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "env-filter", "fmt", "registry", "smallvec"] }
 tracing            = { version = "0.1", default-features = false, features = ["std"] }

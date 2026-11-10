@@ -276,7 +276,7 @@ enum WireCmd {
     ConnectDevice(crate::gui::api::IpPayload),
     DisconnectDevice(crate::gui::api::IpPayload),
     // Vendor inventory/probe channels (`ipc_invoke` and plain spellings);
-    // args are typed per handler in `route_invoke`.
+    // args are typed per handler in `WireCmdKind::reply`.
     GenericAgentGetPairedDevices,
     GenericAgentSettingsRemoveDevice,
     GenericAgentGetLocalDeviceId,
@@ -343,55 +343,60 @@ fn args_of<T: serde::de::DeserializeOwned + Default>(payload: &Value) -> T {
     serde_json::from_value(payload.clone()).unwrap_or_default()
 }
 
-/// Registry for `ipcRenderer.invoke` channels. Returns `None` when no
-/// handler exists; callers then record + return [`unhandled`].
-fn route_invoke(channel: WireCmdKind, payload: &Value) -> Option<Value> {
-    use crate::gui::api;
-    use WireCmdKind as W;
-    match channel {
-        // ---- daemon / device inventory ---------------------------------
-        // PAIRED_DEVICES: persistent pairing bonds from the row table
-        // (scp_sync / authorized adb); consumers expect { ok, entries[] }
-        // and read pairedDevices??paired_devices??instances (see
-        // render/genericAgent/binding/gaPairBoundStatus.js).
-        W::GenericAgentGetPairedDevices => Some(wire(&api::paired_devices())),
-        // UNBIND (settings page / card delete): vendor payload
-        // `{ device_id, removeStateDir }`; consumers toast on !ok.
-        W::GenericAgentSettingsRemoveDevice => Some(wire(&api::remove_device(&args_of::<
-            api::RemoveDeviceArgs,
-        >(payload)))),
-        // GET_LOCAL_DEVICE_ID: consumers String(localId || '') — plain id string.
-        W::GenericAgentGetLocalDeviceId => Some(Value::String(api::local_device_id())),
-        // GET_CLOUD_BIND: consumers expect { ok, bound, record? }.
-        W::GenericAgentGetCloudBind => Some(wire(&api::cloud_bind())),
-        W::GenericAgentEnsureRunning => Some(wire(&api::ensure_running())),
-        // GET_CURRENT_CONNECTED_DEVICE_INFO_LIST: consumers iterate an array.
-        W::GetCurrentConnectedDeviceInfoList => Some(wire(&api::connected_devices())),
-        W::PublicGetSystemTheme => Some(Value::String("light".into())),
-        W::SettingsGetPcConnectRunning => Some(Value::Bool(false)),
+/// Registry for `ipcRenderer.invoke` channels. Each kind answers itself
+/// from the payload; `None` means no handler exists and callers then
+/// record + return [`unhandled`].
+impl WireCmdKind {
+    fn reply(self, payload: &Value) -> Option<Value> {
+        use crate::gui::api;
+        use WireCmdKind as W;
+        match self {
+            // ---- daemon / device inventory ---------------------------------
+            // PAIRED_DEVICES: persistent pairing bonds from the row table
+            // (scp_sync / authorized adb); consumers expect { ok, entries[] }
+            // and read pairedDevices??paired_devices??instances (see
+            // render/genericAgent/binding/gaPairBoundStatus.js).
+            W::GenericAgentGetPairedDevices => Some(wire(&api::paired_devices())),
+            // UNBIND (settings page / card delete): vendor payload
+            // `{ device_id, removeStateDir }`; consumers toast on !ok.
+            W::GenericAgentSettingsRemoveDevice => {
+                Some(wire(&api::remove_device(
+                    &args_of::<api::RemoveDeviceArgs>(payload),
+                )))
+            }
+            // GET_LOCAL_DEVICE_ID: consumers String(localId || '') — plain id string.
+            W::GenericAgentGetLocalDeviceId => Some(Value::String(api::local_device_id())),
+            // GET_CLOUD_BIND: consumers expect { ok, bound, record? }.
+            W::GenericAgentGetCloudBind => Some(wire(&api::cloud_bind())),
+            W::GenericAgentEnsureRunning => Some(wire(&api::ensure_running())),
+            // GET_CURRENT_CONNECTED_DEVICE_INFO_LIST: consumers iterate an array.
+            W::GetCurrentConnectedDeviceInfoList => Some(wire(&api::connected_devices())),
+            W::PublicGetSystemTheme => Some(Value::String("light".into())),
+            W::SettingsGetPcConnectRunning => Some(Value::Bool(false)),
 
-        // ---- window probes (viewport / focus) are host-side concerns;
-        //      clients get them from the OS, not this registry. ----------
+            // ---- window probes (viewport / focus) are host-side concerns;
+            //      clients get them from the OS, not this registry. ----------
 
-        // ---- lplus-specific probes (safe defaults) ------------------------
-        W::LplusSidecarStatus => Some(wire(&api::sidecar_status())),
-        W::SettingsGetHostName => Some(Value::String(host_name())),
-        W::GetHttpServerPort => Some(Value::Null),
-        W::IsHttpServerRunning => Some(Value::Bool(false)),
+            // ---- lplus-specific probes (safe defaults) ------------------------
+            W::LplusSidecarStatus => Some(wire(&api::sidecar_status())),
+            W::SettingsGetHostName => Some(Value::String(host_name())),
+            W::GetHttpServerPort => Some(Value::Null),
+            W::IsHttpServerRunning => Some(Value::Bool(false)),
 
-        // ---- device actions (renderer Connect/Disconnect) ------------------
-        // Forwarded to the backend command channel (crate::sdpd::Command);
-        // payload carries {ip} or a bare IP string.
-        W::ConnectDevice | W::DisconnectDevice => {
-            let connect = matches!(channel, W::ConnectDevice);
-            let payload = args_of::<api::IpPayload>(payload);
-            Some(wire(&api::device_action(connect, payload.ip())))
+            // ---- device actions (renderer Connect/Disconnect) ------------------
+            // Forwarded to the backend command channel (crate::sdpd::Command);
+            // payload carries {ip} or a bare IP string.
+            W::ConnectDevice | W::DisconnectDevice => {
+                let connect = matches!(self, W::ConnectDevice);
+                let payload = args_of::<api::IpPayload>(payload);
+                Some(wire(&api::device_action(connect, payload.ip())))
+            }
+            // Device-wall channel (DiscoveredDevices contract): same rows as
+            // the bus, wrapped so `ok`-checking consumers work.
+            W::DeviceFoundList => Some(wire(&api::device_found_list())),
+            // Transport commands are not invoke channels; callers audit them.
+            _ => None,
         }
-        // Device-wall channel (DiscoveredDevices contract): same rows as
-        // the bus, wrapped so `ok`-checking consumers work.
-        W::DeviceFoundList => Some(wire(&api::device_found_list())),
-        // Transport commands are not invoke channels; callers audit them.
-        _ => None,
     }
 }
 
@@ -416,30 +421,36 @@ enum BusEvent {
     GetGeneralConfig,
 }
 
-/// Registry for the app-internal bus (`ipcManager.emit(name, {…success})`).
+/// Registry for the app-internal bus (`ipcManager.emit(name, {…success})`);
+/// each event answers itself.
+impl BusEvent {
+    fn reply(self) -> Value {
+        use crate::gui::api;
+        match self {
+            // App.vue stores the returned value as `isComputerVersion`.
+            BusEvent::ComputerVersion => Value::String(APP_VERSION.into()),
+            // IpcRender event subscriptions: acknowledge, nothing to fan out yet.
+            BusEvent::IpcEventInit | BusEvent::IpcEventDestory => wire(&api::OkFlag::ok()),
+            // Mini window device info sync — empty list keeps views in the
+            // "no devices found" state without throwing.
+            BusEvent::GetAndUpdateDeviceinfo => wire(&api::visible_rows()),
+            // mydevice connect-button broadcasts; answered so the UI does not
+            // sit on an unhandled bus call.
+            BusEvent::OpenGetFeatureEnable => wire(&api::FeatureEnable {
+                ok: true,
+                enable: true,
+            }),
+            // Main window identity (single-window port: always the main window).
+            BusEvent::IsMainWin => Value::Bool(true),
+            // Config probe on the boot path: empty object keeps clients on the
+            // defaults branch.
+            BusEvent::GetGeneralConfig => Value::Object(serde_json::Map::new()),
+        }
+    }
+}
+
 fn route_bus(name: &str) -> Option<Value> {
-    use crate::gui::api;
-    let kind = BusEvent::from_str(name).ok()?;
-    Some(match kind {
-        // App.vue stores the returned value as `isComputerVersion`.
-        BusEvent::ComputerVersion => Value::String(APP_VERSION.into()),
-        // IpcRender event subscriptions: acknowledge, nothing to fan out yet.
-        BusEvent::IpcEventInit | BusEvent::IpcEventDestory => wire(&api::OkFlag::ok()),
-        // Mini window device info sync — empty list keeps views in the
-        // "no devices found" state without throwing.
-        BusEvent::GetAndUpdateDeviceinfo => wire(&api::visible_rows()),
-        // mydevice connect-button broadcasts; answered so the UI does not
-        // sit on an unhandled bus call.
-        BusEvent::OpenGetFeatureEnable => wire(&api::FeatureEnable {
-            ok: true,
-            enable: true,
-        }),
-        // Main window identity (single-window port: always the main window).
-        BusEvent::IsMainWin => Value::Bool(true),
-        // Config probe on the boot path: empty object keeps clients on the
-        // defaults branch.
-        BusEvent::GetGeneralConfig => Value::Object(serde_json::Map::new()),
-    })
+    Some(BusEvent::from_str(name).ok()?.reply())
 }
 
 /// The single IPC entry point, shared by the GPUI direct transport and
@@ -459,7 +470,7 @@ pub fn dispatch(cmd: &str, args: Value) -> Value {
         WireCmd::IpcInvoke(parsed) => {
             match WireCmdKind::from_str(&parsed.channel)
                 .ok()
-                .and_then(|channel| route_invoke(channel, &parsed.payload))
+                .and_then(|channel| channel.reply(&parsed.payload))
             {
                 Some(v) => v,
                 None => {
@@ -550,8 +561,8 @@ pub fn dispatch(cmd: &str, args: Value) -> Value {
         // Vendor inventory/probe channels posted in their plain form:
         // answer from the registry or audit.
         _ => {
-            let kind = WireCmdKind::from_str(cmd).expect("from_wire only yields known kinds");
-            if let Some(v) = route_invoke(kind, &args) {
+            let kind = WireCmdKind::from(&wire_cmd);
+            if let Some(v) = kind.reply(&args) {
                 return v;
             }
             let name = kind.to_string();

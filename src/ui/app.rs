@@ -531,25 +531,30 @@ enum FileCategory {
     Document,
 }
 
-fn mock_files(category: &str) -> Vec<(String, u64)> {
-    let Ok(category) = FileCategory::from_str(category) else {
-        return Vec::new();
-    };
-    match category {
-        FileCategory::Image => vec![
-            ("IMG_2043.jpg".into(), 4_200_000u64),
-            ("passport_scan.pdf".into(), 900_000),
-        ],
-        FileCategory::Video => vec![
-            ("sunset_reel.mp4".into(), 120_000_000),
-            ("holiday-clip.mp4".into(), 98_000_000),
-        ],
-        FileCategory::Audio => vec![("voice_note.m4a".into(), 2_100_000)],
-        FileCategory::Document => vec![
-            ("invoice_april.pdf".into(), 180_000),
-            ("notes_marco.md".into(), 4_200),
-        ],
+impl FileCategory {
+    fn files(self) -> Vec<(String, u64)> {
+        match self {
+            FileCategory::Image => vec![
+                ("IMG_2043.jpg".into(), 4_200_000u64),
+                ("passport_scan.pdf".into(), 900_000),
+            ],
+            FileCategory::Video => vec![
+                ("sunset_reel.mp4".into(), 120_000_000),
+                ("holiday-clip.mp4".into(), 98_000_000),
+            ],
+            FileCategory::Audio => vec![("voice_note.m4a".into(), 2_100_000)],
+            FileCategory::Document => vec![
+                ("invoice_april.pdf".into(), 180_000),
+                ("notes_marco.md".into(), 4_200),
+            ],
+        }
     }
+}
+
+fn mock_files(category: &str) -> Vec<(String, u64)> {
+    FileCategory::from_str(category)
+        .map(FileCategory::files)
+        .unwrap_or_default()
 }
 
 /// Pure label model for headless tests: what the shell shows for a state.

@@ -13,7 +13,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::d2d::D2dConnectionContextV1;
-use crate::protos::{
+use protocol::protos::{
     CipherCommitment, EcP256PublicKey, GenericPublicKey, Ukey2ClientFinished, Ukey2ClientInit,
     Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit, ukey2_message,
 };

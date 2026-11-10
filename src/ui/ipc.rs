@@ -63,7 +63,7 @@ pub enum Channel {
     HistoricalConnections,
     NoteList,
     // Assistant (generic agent) channels: served by the real backend
-    // (`route_invoke` in linux-client/src/gui/ipc.rs); the mock answers the
+    // (`WireCmdKind::reply` in linux-client/src/gui/ipc.rs); the mock answers the
     // same contracts with local bonds.
     GenericAgentEnsureRunning,
     GenericAgentGetPairedDevices,
@@ -99,46 +99,10 @@ fn pairing_url_base() -> String {
         .unwrap_or_else(|_| "heycast://synergy/start".to_string())
 }
 
-/// V1 `Synergy` bean subset fillable locally (field names and casing follow
-/// the bean so the phone's GSON binds them); keys the mock cannot know stay
-/// empty and the phone's pre-dial gate chain fills the rest. `Type` "4" is
-/// `ConnectType::WLAN` (§5.3).
-#[cfg(test)]
-#[derive(Serialize)]
-struct Synergy {
-    #[serde(rename = "Mac")]
-    mac: String,
-    #[serde(rename = "BluetoothMac")]
-    bluetooth_mac: String,
-    #[serde(rename = "Ssid")]
-    ssid: String,
-    #[serde(rename = "Pwd")]
-    pwd: String,
-    #[serde(rename = "Name")]
-    name: String,
-    #[serde(rename = "ServerIp")]
-    server_ip: String,
-    #[serde(rename = "ServerPort")]
-    server_port: String,
-    #[serde(rename = "Type")]
-    conn_type: String,
-    #[serde(rename = "DeviceType")]
-    device_type: String,
-    #[serde(rename = "DeviceId")]
-    device_id: String,
-    #[serde(rename = "DeviceKsc")]
-    device_ksc: String,
-    #[serde(rename = "DeviceKscAlias")]
-    device_ksc_alias: String,
-    #[serde(rename = "ModelId")]
-    model_id: String,
-    #[serde(rename = "AdvFreq")]
-    adv_freq: String,
-    ver: u8,
-}
-
 #[cfg(test)]
 fn pairing_qr_param(host: &str) -> String {
+    use protocol::pair::{HeySynergy, Synergy};
+
     let bean = Synergy {
         mac: String::new(),
         bluetooth_mac: String::new(),
@@ -156,13 +120,6 @@ fn pairing_qr_param(host: &str) -> String {
         adv_freq: String::new(),
         ver: 1,
     };
-    // Vendor GSON binds the wrapper `{"HeySynergy": <bean>}` with the
-    // declared field spellings.
-    #[derive(Serialize)]
-    struct HeySynergy<'a> {
-        #[serde(rename = "HeySynergy")]
-        bean: &'a Synergy,
-    }
     let wrapper = HeySynergy { bean: &bean };
     general_purpose::STANDARD.encode(serde_json::to_string(&wrapper).expect("synergy bean"))
 }
@@ -646,6 +603,13 @@ enum OffToken {
     Off,
 }
 
+/// `LPLUS_BACKEND` spellings that mean "the local daemon".
+#[derive(Debug, Clone, Copy, EnumString)]
+enum OnToken {
+    #[strum(serialize = "1", serialize = "auto")]
+    Local,
+}
+
 /// Resolution of `LPLUS_BACKEND`; `None` = no backend. With `default_backend`
 /// an unset value means the local daemon (launch semantics); without it, no
 /// backend (test semantics: mock filler).
@@ -661,7 +625,7 @@ fn ipc_spec(spec: &str, default_backend: bool) -> Option<SocketAddr> {
     if OffToken::from_str(&lowered).is_ok() {
         return None;
     }
-    if lowered == "1" || lowered == "auto" {
+    if OnToken::from_str(&lowered).is_ok() {
         return DEFAULT_BACKEND_ADDR.parse().ok();
     }
     spec.parse().ok()

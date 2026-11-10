@@ -38,7 +38,6 @@ mod gui;
 mod kms;
 mod logging;
 mod odmf_pc;
-mod protos;
 #[allow(dead_code)] // opt-in video lane (RTSP=1); lane entry via sdpd
 mod rtsp;
 #[allow(dead_code)] // dev/CI surface kept for wire-capture work (was lib-public)

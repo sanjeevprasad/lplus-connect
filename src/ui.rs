@@ -155,11 +155,9 @@ enum StartRoute {
     Note,
 }
 
-/// `--route <name>` picks the initial screen; `--start-home` is the common
-/// shorthand, matching the vendor default (Home).
-fn start_route(route: Option<&str>, start_home: bool) -> Option<Route> {
-    if let Some(name) = route {
-        return StartRoute::from_str(name).ok().map(|r| match r {
+impl StartRoute {
+    fn route(self) -> Route {
+        match self {
             StartRoute::Home => Route::Home,
             StartRoute::Remotecontrol => Route::RemoteControl { device_id: None },
             StartRoute::Screenshare => Route::ScreenShare { device_id: None },
@@ -173,7 +171,15 @@ fn start_route(route: Option<&str>, start_home: bool) -> Option<Route> {
             },
             StartRoute::GenericAgent => Route::GenericAgent,
             StartRoute::Note => Route::Note,
-        });
+        }
+    }
+}
+
+/// `--route <name>` picks the initial screen; `--start-home` is the common
+/// shorthand, matching the vendor default (Home).
+fn start_route(route: Option<&str>, start_home: bool) -> Option<Route> {
+    if let Some(name) = route {
+        return StartRoute::from_str(name).ok().map(StartRoute::route);
     }
     if start_home {
         return Some(Route::Home);

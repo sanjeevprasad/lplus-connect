@@ -133,6 +133,14 @@ pub fn first_line(data: &[u8]) -> String {
     text.split("\r\n").next().unwrap_or("").to_string()
 }
 
+/// lplus-local probe verbs (not in `rtsp::RtspMethod`): the sdp/1 QUERY
+/// that both engines answer with an ANNOUNCE line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+#[strum(serialize_all = "UPPERCASE")]
+enum ProbeVerb {
+    Query,
+}
+
 /// Reply shapes to try for a request verb, mirroring the acceptors the
 /// engines validate (`No contain NS key in service-ack`, etc.).
 pub fn reply_variants(verb: &str) -> Vec<(String, Vec<(&'static str, &'static str)>)> {
@@ -141,8 +149,8 @@ pub fn reply_variants(verb: &str) -> Vec<(String, Vec<(&'static str, &'static st
         ("HTTP/1.1 200 OK".into(), vec![("NSData", "0")]),
         ("ANNOUNCE * HTTP/1.1".into(), vec![]),
     ];
-    if verb != "QUERY" {
-        out.retain(|(line, _)| !line.starts_with(crate::rtsp::RtspMethod::Announce.as_ref()));
+    if ProbeVerb::from_str(verb) != Ok(ProbeVerb::Query) {
+        out.retain(|(line, _)| !line.starts_with(protocol::rtsp::RtspMethod::Announce.as_ref()));
     }
     out
 }
@@ -3232,7 +3240,7 @@ mod tests {
             .collect();
         assert!(
             !v.iter()
-                .any(|l| l.starts_with(crate::rtsp::RtspMethod::Announce.as_ref()))
+                .any(|l| l.starts_with(protocol::rtsp::RtspMethod::Announce.as_ref()))
         );
     }
 }

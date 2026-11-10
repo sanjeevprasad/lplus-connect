@@ -16,7 +16,7 @@ use prost::Message;
 use rand::Rng;
 use sha2::Sha256;
 
-use crate::protos::{
+use protocol::protos::{
     DeviceToDeviceMessage, EncScheme, GcmMetadata, Header, HeaderAndBody, SecureMessage, SigScheme,
 };
 

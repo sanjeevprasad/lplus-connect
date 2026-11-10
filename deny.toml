@@ -167,6 +167,9 @@ registries = [
 multiple-versions = "allow"
 # Lint level for when a crate version requirement is `*`
 wildcards = "deny"
+# …but path deps in our private crates (workspace members) are exempt:
+# `protocol` is versioned by the workspace, not for publish.
+allow-wildcard-paths = true
 # The graph highlighting used when creating dotgraphs for crates
 # with multiple versions
 # * lowest-version - The path to the lowest versioned duplicate is highlighted

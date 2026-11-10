@@ -21,6 +21,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Once, OnceLock};
 
+use protocol::odmf::{
+    ChannelMsg, ConsultReply, Envelope, IceCandidate, Sdp, SendEnvelope, Signaled,
+};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::channel::ChannelId;
 use str0m::format::{Codec, FormatParams};
@@ -76,35 +79,34 @@ pub fn handle_inbound(json: &str) {
 
 /// Testable inbound dispatch.
 fn dispatch(tx: &UnboundedSender<PcEvent>, json: &str) {
-    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return;
-    };
     // The signaling lane nests SDP/candidate JSON inside
     // {"cmd":"send","msg":"<inner json string>"} (odmfr/odmfb.java case
     // CMD_SEND → odmfc(msg)); unwrap before type dispatch.
-    if let Some(s) = v.get("msg").and_then(|m| m.as_str())
-        && let Ok(inner) = serde_json::from_str::<serde_json::Value>(s)
-    {
-        v = inner;
-    }
-    match v.get("type").and_then(|t| t.as_str()) {
-        Some("answer") => {
-            if let Some(sdp) = v.get("sdp").and_then(|s| s.as_str()) {
-                tracing::info!("[webrtc] rx answer ({}B sdp)", sdp.len());
-                let _ = tx.send(PcEvent::Answer {
-                    sdp: sdp.to_string(),
-                });
-            }
+    let inner = serde_json::from_str::<Envelope>(json)
+        .ok()
+        .filter(|e| e.cmd == "send" && !e.msg.is_empty())
+        .map(|e| e.msg);
+    // Tolerant like the old field-peek path: an inner payload that fails to
+    // parse falls through to the outer string, and cast-lane `cmd` traffic,
+    // tagless bus frames and junk simply fail to deserialize → ignored.
+    let Some(sig) = inner
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Signaled>(s).ok())
+        .or_else(|| serde_json::from_str::<Signaled>(json).ok())
+    else {
+        return;
+    };
+    match sig {
+        Signaled::Answer(Sdp { sdp }) => {
+            tracing::info!("[webrtc] rx answer | {} bytes", sdp.len());
+            let _ = tx.send(PcEvent::Answer { sdp });
         }
-        Some("candidate") => {
-            if let Some(c) = v.get("candidate").and_then(|s| s.as_str()) {
-                tracing::info!("[webrtc] rx candidate | {c}");
-                let _ = tx.send(PcEvent::Candidate {
-                    candidate: c.to_string(),
-                });
-            }
+        Signaled::Candidate(IceCandidate { candidate }) => {
+            tracing::info!("[webrtc] rx candidate | {candidate}");
+            let _ = tx.send(PcEvent::Candidate { candidate });
         }
-        _ => {}
+        // Our own direction; the phone never answers an offer it did not get.
+        Signaled::Offer(..) | Signaled::Other => {}
     }
 }
 
@@ -476,22 +478,16 @@ async fn drain(rtc: &mut Rtc, c: &mut DrainCtx<'_>) {
                 Event::ChannelData(d) => {
                     let txt = String::from_utf8_lossy(&d.data).to_string();
                     tracing::info!("[webrtc] channel rx: {txt}");
-                    let command = serde_json::from_str::<serde_json::Value>(&txt)
+                    let command = serde_json::from_str::<ChannelMsg>(&txt)
                         .ok()
-                        .and_then(|v| {
-                            v.get("COMMAND")
-                                .and_then(|c| c.as_str())
-                                .map(|c| c.to_string())
-                        });
-                    if command
-                        .as_deref()
-                        .and_then(|c| c.parse::<crate::rtsp::RtspMethod>().ok())
-                        == Some(crate::rtsp::RtspMethod::SetParameter)
+                        .and_then(|m| m.command);
+                    if command.and_then(|c| c.parse::<protocol::rtsp::RtspMethod>().ok())
+                        == Some(protocol::rtsp::RtspMethod::SetParameter)
                     {
                         // Phone echo (q2/i.java p(b)): consult was accepted.
                         **consult_ack = true;
                     }
-                    if (command.as_deref() == Some("interaction") || !**consult_sent)
+                    if (command == Some("interaction") || !**consult_sent)
                         && consult_gate_open(**connected_at)
                     {
                         let n = send_consult(rtc, chan, Some(d.id));
@@ -542,15 +538,15 @@ fn send_consult(rtc: &mut Rtc, chan: &Option<ChannelId>, extra: Option<ChannelId
         env_or("ODMF_SINK_H", "2772").parse().unwrap_or(2772),
         env_or("ODMF_SINK_FPS", "30").parse().unwrap_or(30),
     );
-    let reply = serde_json::json!({
-        "COMMAND": crate::rtsp::RtspMethod::SetParameter.to_string(),
-        "width": w,
-        "height": h,
-        "fps": fps,
-        "foldRotatesWithContent": false,
-        "rotatesWithContent": false
+    let reply = serde_json::to_string(&ConsultReply {
+        command: protocol::rtsp::RtspMethod::SetParameter.to_string(),
+        width: w,
+        height: h,
+        fps,
+        fold_rotates_with_content: false,
+        rotates_with_content: false,
     })
-    .to_string();
+    .expect("plain fields never fail to serialize");
     let mut targets = Vec::new();
     if let Some(own) = *chan {
         targets.push(own);
@@ -899,8 +895,13 @@ fn offer_or_resend(
                     // the client only dispatches SDP/candidate JSON nested in
                     // {"cmd":"send","msg":"<inner json string>"} —
                     // `onSocketMessage` case CMD_SEND → odmfc(msg).
-                    let inner = serde_json::json!({ "type": "offer", "sdp": sdp }).to_string();
-                    let payload = serde_json::json!({ "cmd": "send", "msg": inner }).to_string();
+                    let inner = serde_json::to_string(&Signaled::Offer(Sdp { sdp }))
+                        .expect("plain fields never fail to serialize");
+                    let payload = serde_json::to_string(&SendEnvelope {
+                        cmd: "send",
+                        msg: &inner,
+                    })
+                    .expect("plain fields never fail to serialize");
                     for tag in tags {
                         let _ = sig_channel().send((tag.clone(), payload.clone()));
                     }
