@@ -17,16 +17,20 @@ use crate::ui::stores::toast::ToastKind;
 use crate::ui::stores::transfer::{Direction, TransferStatus};
 use crate::ui::theme::*;
 use lucide_static_svg::Icon;
+use strum::Display;
 
 /// The three vendor device-section confirm dialogs, sharing the compact
 /// `DsDialog` layout (title, message, Cancel + danger/primary action).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Display)]
+#[strum(serialize_all = "lowercase")]
 enum ConfirmKind {
     /// `MyDeviceDialogsSection` delete confirm (danger Delete).
     Delete,
     /// `DisconnectConfirm` (danger Disconnect; sharing-aware copy).
     Disconnect,
     /// Stop-connect confirm: Connect terminates the active connection.
+    /// Element-id prefix stays the vendor's `conflict`.
+    #[strum(serialize = "conflict")]
     ConnectConflict,
 }
 
@@ -1122,19 +1126,19 @@ impl AppState {
     /// or primary action) for the three vendor device-section dialogs:
     /// Delete this device, Disconnect this device, Connect to a new device.
     fn render_confirm_dialog(&mut self, cx: &mut Context<Self>, kind: ConfirmKind) -> AnyElement {
-        let (id_prefix, title, message, cancel, confirm, danger) = match kind {
+        let (title, message, cancel, confirm, danger) = match kind {
             ConfirmKind::Delete => {
                 let (title, message, cancel, confirm) = delete_confirm_labels();
-                ("delete", title, message, cancel, confirm, true)
+                (title, message, cancel, confirm, true)
             }
             ConfirmKind::Disconnect => {
                 let (title, message, cancel, confirm) =
                     disconnect_confirm_labels(self.mirroring.active_listen.is_some());
-                ("disconnect", title, message, cancel, confirm, true)
+                (title, message, cancel, confirm, true)
             }
             ConfirmKind::ConnectConflict => {
                 let (title, message, cancel, confirm) = connect_conflict_labels();
-                ("conflict", title, message, cancel, confirm, false)
+                (title, message, cancel, confirm, false)
             }
         };
         div()
@@ -1176,7 +1180,7 @@ impl AppState {
                             .gap(px(10.))
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("{id_prefix}-cancel")))
+                                    .id(SharedString::from(format!("{kind}-cancel")))
                                     .h(px(32.))
                                     .px(px(14.))
                                     .rounded(px(PILL_R))
@@ -1194,17 +1198,19 @@ impl AppState {
                                             .child(cancel),
                                     )
                                     .on_click(cx.listener(move |app, _e, _w, cx| {
-                                        match id_prefix {
-                                            "delete" => app.cancel_remove_device(),
-                                            "disconnect" => app.cancel_disconnect(),
-                                            _ => app.cancel_connect_conflict(),
+                                        match kind {
+                                            ConfirmKind::Delete => app.cancel_remove_device(),
+                                            ConfirmKind::Disconnect => app.cancel_disconnect(),
+                                            ConfirmKind::ConnectConflict => {
+                                                app.cancel_connect_conflict()
+                                            }
                                         }
                                         cx.notify();
                                     })),
                             )
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("{id_prefix}-confirm")))
+                                    .id(SharedString::from(format!("{kind}-confirm")))
                                     .h(px(32.))
                                     .px(px(14.))
                                     .rounded(px(PILL_R))
@@ -1221,10 +1227,12 @@ impl AppState {
                                             .child(confirm),
                                     )
                                     .on_click(cx.listener(move |app, _e, _w, cx| {
-                                        match id_prefix {
-                                            "delete" => app.confirm_remove_device(),
-                                            "disconnect" => app.confirm_disconnect(),
-                                            _ => app.confirm_connect_conflict(),
+                                        match kind {
+                                            ConfirmKind::Delete => app.confirm_remove_device(),
+                                            ConfirmKind::Disconnect => app.confirm_disconnect(),
+                                            ConfirmKind::ConnectConflict => {
+                                                app.confirm_connect_conflict()
+                                            }
                                         }
                                         cx.notify();
                                     })),

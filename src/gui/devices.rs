@@ -24,9 +24,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
+use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use strum::EnumString;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -582,6 +585,16 @@ fn spawn_usb_lane() {
     });
 }
 
+/// Classified `DeviceEvent.kind` spellings the model reacts to; anything
+/// else is unclassified accessory chatter (`None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+#[strum(serialize_all = "snake_case")]
+enum EventKind {
+    Epi,
+    Kms,
+    ScpSync,
+}
+
 /// Fold one presence event into the row table (pure over `Inner`). Row
 /// identity is the ip; names only ever come from `scp_sync`, `connected`
 /// flips only on `epi`/`kms` session events. Unknown kinds refresh
@@ -593,7 +606,8 @@ fn ingest_event(i: &mut Inner, kind: &str, ip: &str, name: Option<&str>, connect
     }
     let now = now_secs();
     let known = i.rows.contains_key(ip);
-    if !known && !matches!(kind, "epi" | "kms" | "scp_sync") {
+    let kind = EventKind::from_str(kind).ok();
+    if !known && kind.is_none() {
         return;
     }
     let row = i.rows.entry(ip.to_string()).or_insert_with(|| DeviceRow {
@@ -616,12 +630,12 @@ fn ingest_event(i: &mut Inner, kind: &str, ip: &str, name: Option<&str>, connect
     row.last_seen = now;
     match kind {
         // epi/datatrans or KMS session traffic is the link state.
-        "epi" | "kms" => {
+        Some(EventKind::Epi) | Some(EventKind::Kms) => {
             row.is_connected = connected;
             row.last_session = if connected { now } else { 0 };
         }
         // scp SYNC is a real accessory session and carries the model name.
-        "scp_sync" => {
+        Some(EventKind::ScpSync) => {
             row.last_session = now;
             row.is_paired = true;
             if let Some(n) = name {
@@ -633,7 +647,7 @@ fn ingest_event(i: &mut Inner, kind: &str, ip: &str, name: Option<&str>, connect
                 i.unpaired.remove(&id);
             }
         }
-        _ => {}
+        None => {}
     }
     i.dirty = true;
 }

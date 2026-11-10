@@ -2,7 +2,10 @@
 //! Handlers are pure (testable); the thin `on_click` listeners in
 //! `views.rs` call them and schedule a repaint.
 
+use std::str::FromStr;
+
 use gpui::{Context, Task};
+use strum::EnumString;
 
 use crate::ui::ipc::{ConnectApi, Ipc};
 
@@ -517,22 +520,35 @@ const AI_CORPUS: &[&str] = &[
     "invoice_april.pdf",
 ];
 
+/// Categories the mock file list understands; any other spelling yields the
+/// empty list, as before.
+#[derive(Debug, Clone, Copy, EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum FileCategory {
+    Image,
+    Video,
+    Audio,
+    Document,
+}
+
 fn mock_files(category: &str) -> Vec<(String, u64)> {
+    let Ok(category) = FileCategory::from_str(category) else {
+        return Vec::new();
+    };
     match category {
-        "image" => vec![
+        FileCategory::Image => vec![
             ("IMG_2043.jpg".into(), 4_200_000u64),
             ("passport_scan.pdf".into(), 900_000),
         ],
-        "video" => vec![
+        FileCategory::Video => vec![
             ("sunset_reel.mp4".into(), 120_000_000),
             ("holiday-clip.mp4".into(), 98_000_000),
         ],
-        "audio" => vec![("voice_note.m4a".into(), 2_100_000)],
-        "document" => vec![
+        FileCategory::Audio => vec![("voice_note.m4a".into(), 2_100_000)],
+        FileCategory::Document => vec![
             ("invoice_april.pdf".into(), 180_000),
             ("notes_marco.md".into(), 4_200),
         ],
-        _ => Vec::new(),
     }
 }
 

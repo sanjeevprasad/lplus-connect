@@ -11,6 +11,7 @@
 //! without a phone or daemon.
 
 use std::collections::VecDeque;
+use std::str::FromStr;
 
 #[cfg(test)]
 use base64::{Engine as _, engine::general_purpose};
@@ -638,6 +639,13 @@ impl Transport {
     }
 }
 
+/// `LPLUS_BACKEND` spellings that mean "no backend" (case-insensitive).
+#[derive(Debug, Clone, Copy, EnumString)]
+enum OffToken {
+    #[strum(serialize = "off", serialize = "0", serialize = "mock")]
+    Off,
+}
+
 /// Resolution of `LPLUS_BACKEND`; `None` = no backend. With `default_backend`
 /// an unset value means the local daemon (launch semantics); without it, no
 /// backend (test semantics: mock filler).
@@ -650,7 +658,7 @@ fn ipc_spec(spec: &str, default_backend: bool) -> Option<SocketAddr> {
         };
     }
     let lowered = spec.to_lowercase();
-    if lowered == "off" || lowered == "0" || lowered == "mock" {
+    if OffToken::from_str(&lowered).is_ok() {
         return None;
     }
     if lowered == "1" || lowered == "auto" {

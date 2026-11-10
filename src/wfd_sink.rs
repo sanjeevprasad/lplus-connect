@@ -16,6 +16,7 @@
 
 use std::io::Write;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -24,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::rtsp::{RtspMethod, RtspMsg};
-use strum::IntoEnumIterator;
+use strum::{EnumString, IntoEnumIterator};
 
 const START_CODE: &[u8] = b"\x00\x00\x00\x01";
 const MAX_NAL: usize = 4 * 1024 * 1024;
@@ -762,6 +763,18 @@ fn try_parse_request(buf: &[u8]) -> Option<(RtspMsg, usize)> {
     RtspMsg::parse(buf).ok()
 }
 
+/// WFD parameters we answer on GET_PARAMETER; the `serialize` spellings are
+/// the exact lowercase wire names the source asks for.
+#[derive(Debug, Clone, Copy, EnumString)]
+enum WfdParam {
+    #[strum(serialize = "wfd_content_protection")]
+    ContentProtection,
+    #[strum(serialize = "wfd_uibc_capability")]
+    UibcCapability,
+    #[strum(serialize = "wfd_display_edid")]
+    DisplayEdid,
+}
+
 /// Minimal WFD-sink answers; values are deliberately conservative and are
 /// iterated against the live engine (see §7.9 transcript).
 fn build_replies(req: &RtspMsg, session_hdr: &mut Option<String>) -> Vec<RtspMsg> {
@@ -785,11 +798,13 @@ fn build_replies(req: &RtspMsg, session_hdr: &mut Option<String>) -> Vec<RtspMsg
                     continue;
                 };
                 let k = k.trim();
-                let v = match k.to_ascii_lowercase().as_str() {
-                    "wfd_content_protection" => "none".to_string(),
-                    "wfd_uibc_capability" => "none".to_string(),
-                    "wfd_display_edid" => String::new(), // omit: no EDID
-                    _ => v.trim().to_string(),           // echo the source's value
+                let key = k.to_ascii_lowercase();
+                let v = match WfdParam::from_str(&key) {
+                    Ok(WfdParam::ContentProtection) | Ok(WfdParam::UibcCapability) => {
+                        "none".to_string()
+                    }
+                    Ok(WfdParam::DisplayEdid) => String::new(), // omit: no EDID
+                    Err(_) => v.trim().to_string(),             // echo the source's value
                 };
                 if !v.is_empty() {
                     body.push_str(&format!("{k}: {v}\r\n"));

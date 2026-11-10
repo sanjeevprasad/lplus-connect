@@ -13,9 +13,11 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use strum::{Display, EnumString};
 use tokio::net::{TcpListener, UdpSocket};
 
 /// Configuration for one responder instance.
@@ -699,6 +701,16 @@ pub fn spawn_events_bridge() {
     });
 }
 
+/// Exact-word REPL commands (the prefix forms `connect [ip]` etc. are
+/// parsed separately above this match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum ReplCmd {
+    Connect,
+    Disconnect,
+    Kms,
+}
+
 /// Loopback line REPL to probe open pipes without redoing handshakes:
 /// `list` enumerates live epi sessions; `send <substr> <hex>` injects raw
 /// bytes into every session whose key contains <substr>.
@@ -779,11 +791,11 @@ pub fn spawn_repl() {
                             Command::KmsBootstrap { ip }
                         };
                         out = format!("queued {}\n", send_command(cmd));
-                    } else if t == "connect" || t == "disconnect" || t == "kms" {
-                        let cmd = match t.as_str() {
-                            "connect" => Command::Connect { ip: "phone".into() },
-                            "disconnect" => Command::Disconnect { ip: "phone".into() },
-                            _ => Command::KmsBootstrap { ip: "phone".into() },
+                    } else if let Ok(repl) = ReplCmd::from_str(t.as_str()) {
+                        let cmd = match repl {
+                            ReplCmd::Connect => Command::Connect { ip: "phone".into() },
+                            ReplCmd::Disconnect => Command::Disconnect { ip: "phone".into() },
+                            ReplCmd::Kms => Command::KmsBootstrap { ip: "phone".into() },
                         };
                         out = format!("queued {}\n", send_command(cmd));
                     } else {
@@ -796,6 +808,16 @@ pub fn spawn_repl() {
             });
         }
     });
+}
+
+/// `LINK_ACK` reply flavours for the link-detect probe socket.
+#[derive(Debug, Clone, PartialEq, Eq, EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum AckMode {
+    Echo,
+    Dup,
+    #[strum(default)]
+    Other(String),
 }
 
 /// Run the responder until the process is killed.
@@ -1127,12 +1149,12 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
                             ),
                             Err(e) => tracing::info!("[link-det] reply fail: {e}"),
                         }
-                        match ack_mode.as_str() {
-                            "echo" => {
+                        match AckMode::from_str(&ack_mode) {
+                            Ok(AckMode::Echo) => {
                                 let _ = sock.send_to(&buf[..n], from).await;
                                 tracing::info!("[link-det] ack-echo {n}B to {from}");
                             }
-                            "dup" => {
+                            Ok(AckMode::Dup) => {
                                 let _ = sock.send_to(&out, from).await;
                                 tracing::info!("[link-det] ack-dup to {from}");
                             }
@@ -1213,6 +1235,42 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
             }
         }
     }
+}
+
+/// `SCP_INTERACT` reply flavours for the interact-channel handshake A/B.
+/// Spellings are exact (case-sensitive): the phone echoes its own literals
+/// back verbatim, so each knob keeps its wire form.
+#[derive(Debug, Clone, PartialEq, Eq, EnumString)]
+enum InteractMode {
+    #[strum(serialize = "accept")]
+    Accept,
+    #[strum(serialize = "ACCEPT")]
+    UpperAccept,
+    #[strum(serialize = "only_ACCEPT")]
+    OnlyAccept,
+    #[strum(serialize = "REJECT_lit")]
+    RejectLit,
+    #[strum(serialize = "hello_accept")]
+    HelloAccept,
+    #[strum(default)]
+    Other(String),
+}
+
+/// `RESP` reply-body flavours for the SCP channel-open A/B (lowercase env
+/// spellings); unknown values behave like `echo` (payload echo).
+#[derive(Debug, Clone, PartialEq, Eq, Display, EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum RespVariant {
+    Off,
+    Accept,
+    Empty2,
+    Ok2,
+    Ok1,
+    Echo,
+    Type3,
+    Type1,
+    #[strum(default)]
+    Other(String),
 }
 
 fn spawn_session_logger(
@@ -1915,15 +1973,21 @@ fn spawn_session_logger(
                             if opened.as_deref() == Some(b"interact hello".as_slice()) {
                                 let mode =
                                     std::env::var("SCP_INTERACT").unwrap_or_else(|_| "echo".into());
-                                let bodies: Vec<&[u8]> = match mode.as_str() {
-                                    "accept" => vec![b"accept"],
-                                    "ACCEPT" => vec![b"interact hello", b"ACCEPT"],
-                                    "only_ACCEPT" => vec![b"ACCEPT"],
-                                    "REJECT_lit" => vec![b"interact hello", b"REJECT"],
-                                    "hello_accept" => {
+                                let bodies: Vec<&[u8]> = match InteractMode::from_str(&mode) {
+                                    Ok(InteractMode::Accept) => vec![b"accept"],
+                                    Ok(InteractMode::UpperAccept) => {
+                                        vec![b"interact hello", b"ACCEPT"]
+                                    }
+                                    Ok(InteractMode::OnlyAccept) => vec![b"ACCEPT"],
+                                    Ok(InteractMode::RejectLit) => {
+                                        vec![b"interact hello", b"REJECT"]
+                                    }
+                                    Ok(InteractMode::HelloAccept) => {
                                         vec![b"interact hello", b"accept"]
                                     }
-                                    _ => vec![b"interact hello"],
+                                    Ok(InteractMode::Other(_)) | Err(_) => {
+                                        vec![b"interact hello"]
+                                    }
                                 };
                                 let key = ctx.decode_key();
                                 let iv12: Vec<u8> = ss_iv
@@ -2447,43 +2511,48 @@ fn spawn_session_logger(
                             && sub[4..6] == [0x00, 0x02]
                         {
                             let payload = &sub[8..];
-                            let variant = std::env::var("RESP").unwrap_or_else(|_| "echo".into());
+                            let variant_str =
+                                std::env::var("RESP").unwrap_or_else(|_| "echo".into());
+                            let variant =
+                                RespVariant::from_str(&variant_str).unwrap_or(RespVariant::Echo);
                             let is_active = payload.windows(17).any(|w| w == b"active_connection");
                             let mut body: Vec<u8> = Vec::new();
-                            match variant.as_str() {
+                            match variant {
                                 // no reply at all: every reply body parses on the
                                 // phone as msg_type-omitted = HELLO and lands on
                                 // the ScpItem consumers (`receiveSync` aborts on
                                 // `msgType[0]`); the phone never needed these acks
                                 // — it proceeds past OPEN without them.
-                                "off" => {}
+                                RespVariant::Off => {}
                                 // token only + f3=1 (accept)
-                                "accept" => {
+                                RespVariant::Accept => {
                                     body.extend_from_slice(&payload[..4]);
                                     body.extend_from_slice(&[0x18, 0x01]);
                                 }
                                 // token + empty f2 message
-                                "empty2" => {
+                                RespVariant::Empty2 => {
                                     body.extend_from_slice(&payload[..4]);
                                     body.extend_from_slice(&[0x12, 0x00]);
                                 }
                                 // token + f2{f1=1}
-                                "ok2" => {
+                                RespVariant::Ok2 => {
                                     body.extend_from_slice(&payload[..4]);
                                     body.extend_from_slice(&[0x12, 0x02, 0x08, 0x01]);
                                 }
                                 // token + f1=1 (success in field 1)
-                                "ok1" => {
+                                RespVariant::Ok1 => {
                                     body.extend_from_slice(&payload[..4]);
                                     body.extend_from_slice(&[0x18, 0x01]);
                                 }
-                                _ => body.extend_from_slice(payload),
+                                RespVariant::Echo
+                                | RespVariant::Type3
+                                | RespVariant::Type1
+                                | RespVariant::Other(_) => body.extend_from_slice(payload),
                             }
-                            if variant != "off" {
-                                let rtype: [u8; 2] = match variant.as_str() {
-                                    "echo" => [0x00, 0x00],
-                                    "type3" => [0x00, 0x03],
-                                    "type1" => [0x00, 0x01],
+                            if variant != RespVariant::Off {
+                                let rtype: [u8; 2] = match variant {
+                                    RespVariant::Type3 => [0x00, 0x03],
+                                    RespVariant::Type1 => [0x00, 0x01],
                                     _ => [0x00, 0x00],
                                 };
                                 // body = token(4) || proto; header len excludes the token.

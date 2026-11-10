@@ -395,30 +395,51 @@ fn route_invoke(channel: WireCmdKind, payload: &Value) -> Option<Value> {
     }
 }
 
+/// Bus event names emitted by the renderer (`ipcManager.emit`); vendor
+/// spellings are mixed-case, including the `destory` typo, so each variant
+/// carries an explicit `serialize`.
+#[derive(Debug, Clone, Copy, EnumString)]
+enum BusEvent {
+    #[strum(serialize = "ComputerVersion")]
+    ComputerVersion,
+    #[strum(serialize = "ipc_event_init")]
+    IpcEventInit,
+    #[strum(serialize = "ipc_event_destory")]
+    IpcEventDestory,
+    #[strum(serialize = "get_and_update_deviceinfo")]
+    GetAndUpdateDeviceinfo,
+    #[strum(serialize = "open_getFeatureEnable")]
+    OpenGetFeatureEnable,
+    #[strum(serialize = "isMainWin")]
+    IsMainWin,
+    #[strum(serialize = "get_general_config")]
+    GetGeneralConfig,
+}
+
 /// Registry for the app-internal bus (`ipcManager.emit(name, {…success})`).
 fn route_bus(name: &str) -> Option<Value> {
     use crate::gui::api;
-    match name {
+    let kind = BusEvent::from_str(name).ok()?;
+    Some(match kind {
         // App.vue stores the returned value as `isComputerVersion`.
-        "ComputerVersion" => Some(Value::String(APP_VERSION.into())),
+        BusEvent::ComputerVersion => Value::String(APP_VERSION.into()),
         // IpcRender event subscriptions: acknowledge, nothing to fan out yet.
-        "ipc_event_init" | "ipc_event_destory" => Some(wire(&api::OkFlag::ok())),
+        BusEvent::IpcEventInit | BusEvent::IpcEventDestory => wire(&api::OkFlag::ok()),
         // Mini window device info sync — empty list keeps views in the
         // "no devices found" state without throwing.
-        "get_and_update_deviceinfo" => Some(wire(&api::visible_rows())),
+        BusEvent::GetAndUpdateDeviceinfo => wire(&api::visible_rows()),
         // mydevice connect-button broadcasts; answered so the UI does not
         // sit on an unhandled bus call.
-        "open_getFeatureEnable" => Some(wire(&api::FeatureEnable {
+        BusEvent::OpenGetFeatureEnable => wire(&api::FeatureEnable {
             ok: true,
             enable: true,
-        })),
+        }),
         // Main window identity (single-window port: always the main window).
-        "isMainWin" => Some(Value::Bool(true)),
+        BusEvent::IsMainWin => Value::Bool(true),
         // Config probe on the boot path: empty object keeps clients on the
         // defaults branch.
-        "get_general_config" => Some(Value::Object(serde_json::Map::new())),
-        _ => None,
-    }
+        BusEvent::GetGeneralConfig => Value::Object(serde_json::Map::new()),
+    })
 }
 
 /// The single IPC entry point, shared by the GPUI direct transport and

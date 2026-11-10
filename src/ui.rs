@@ -24,11 +24,13 @@ mod views;
 #[cfg(test)]
 mod e2e;
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use gpui::{
     App, AppContext as _, Bounds, Point, SharedString, Size, WindowBounds, WindowOptions, px,
 };
+use strum::EnumString;
 
 pub use app::AppState;
 use ipc::{Channel, Ipc};
@@ -134,26 +136,44 @@ pub fn run(transport: Transport, flags: UiFlags) {
     });
 }
 
+/// Accepted `--route` names; `serialize_all = "lowercase"` covers most, the
+/// two camelCase vendor spellings carry an explicit `serialize`.
+#[derive(Debug, Clone, Copy, EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum StartRoute {
+    Home,
+    Remotecontrol,
+    Screenshare,
+    Screen,
+    Uploaddownload,
+    Settings,
+    #[strum(serialize = "aiSearch")]
+    AiSearch,
+    Crossfile,
+    #[strum(serialize = "genericAgent")]
+    GenericAgent,
+    Note,
+}
+
 /// `--route <name>` picks the initial screen; `--start-home` is the common
 /// shorthand, matching the vendor default (Home).
 fn start_route(route: Option<&str>, start_home: bool) -> Option<Route> {
     if let Some(name) = route {
-        return match name {
-            "home" => Some(Route::Home),
-            "remotecontrol" => Some(Route::RemoteControl { device_id: None }),
-            "screenshare" => Some(Route::ScreenShare { device_id: None }),
-            "screen" => Some(Route::Screen { device_id: None }),
-            "uploaddownload" => Some(Route::UploadDownload),
-            "settings" => Some(Route::Settings),
-            "aiSearch" => Some(Route::AiSearch),
-            "crossfile" => Some(Route::CrossFile {
+        return StartRoute::from_str(name).ok().map(|r| match r {
+            StartRoute::Home => Route::Home,
+            StartRoute::Remotecontrol => Route::RemoteControl { device_id: None },
+            StartRoute::Screenshare => Route::ScreenShare { device_id: None },
+            StartRoute::Screen => Route::Screen { device_id: None },
+            StartRoute::Uploaddownload => Route::UploadDownload,
+            StartRoute::Settings => Route::Settings,
+            StartRoute::AiSearch => Route::AiSearch,
+            StartRoute::Crossfile => Route::CrossFile {
                 device_id: None,
                 folder: None,
-            }),
-            "genericAgent" => Some(Route::GenericAgent),
-            "note" => Some(Route::Note),
-            _ => None,
-        };
+            },
+            StartRoute::GenericAgent => Route::GenericAgent,
+            StartRoute::Note => Route::Note,
+        });
     }
     if start_home {
         return Some(Route::Home);
