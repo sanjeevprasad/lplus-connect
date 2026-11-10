@@ -14,6 +14,11 @@
 
 use prost::Message;
 
+// Wire types are prost-generated from `proto/protos/scp.proto` (the tags in
+// its header are the same device-verified constants the hand-written
+// structs carried before). Re-exported under the historical names.
+pub use proto::{Hello, ScpMessage, SyncData, SyncSecure};
+
 /// ScpMessageType values.
 pub const MSG_HELLO: u32 = 0;
 pub const MSG_SYNC: u32 = 1;
@@ -32,69 +37,6 @@ pub const KEY_BOTH: u32 = 3;
 
 /// Device type codes (sdp/1 DT and ScpSyncData.deviceType).
 pub const DEVICE_PC: u32 = 6;
-
-/// `ScpSyncData.LinkType` proto enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum LinkType {
-    P2p = 0,
-    Wlan = 1,
-    Cloud = 2,
-    Usb = 3,
-    Spp = 4,
-}
-
-/// `f0`: SCP envelope carried as the cpbus payload after the `7b` marker.
-#[derive(Clone, PartialEq, Message)]
-pub struct ScpMessage {
-    /// Optional so a HELLO (msg_type=0) is still force-emitted; the phone drops
-    /// a frame whose msg_type field is absent.
-    #[prost(uint32, tag = "1", optional)]
-    pub msg_type: Option<u32>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: Vec<u8>,
-}
-
-/// `q`: hello payload with channel routing and sequence number. The peer
-/// requires strictly increasing `sequence_no` (it tracks last+1).
-#[derive(Clone, PartialEq, Message)]
-pub struct Hello {
-    #[prost(uint32, tag = "1")]
-    pub sequence_no: u32,
-    #[prost(string, tag = "2")]
-    pub channel: String,
-    #[prost(string, tag = "3")]
-    pub namespace: String,
-    #[prost(string, tag = "4")]
-    pub service_name: String,
-}
-
-/// `ScpSyncData`: device advertisement sent right after HELLO.
-#[derive(Clone, PartialEq, Message)]
-pub struct SyncData {
-    #[prost(string, tag = "1")]
-    pub device_name: String,
-    /// Real `ScpSyncData`: key_type/device_type/active_trigger_mode are proto
-    /// `int` (varint), NOT strings (the decompiled getters return `int`).
-    #[prost(int32, tag = "2")]
-    pub key_type: i32,
-    /// Real `ScpSyncData`: proto3 `optional bytes`; the phone's own SYNC
-    /// omits fields 3 and 7 entirely and its old parser rejects an
-    /// unexpected `1a`-typed field there (`invalid tag (zero)` at stage
-    /// ReadSync), so omit unless explicitly set.
-    #[prost(bytes = "vec", optional, tag = "3")]
-    pub custom_data: Option<Vec<u8>>,
-    #[prost(int32, tag = "4")]
-    pub device_type: i32,
-    #[prost(int32, tag = "5")]
-    pub active_trigger_mode: i32,
-    #[prost(string, tag = "6")]
-    pub model_id: String,
-    /// proto `LinkType` enum: P2P=0, WLAN=1, CLOUD=2, USB=3, SPP=4. Optional
-    /// for the same reason as `custom_data`.
-    #[prost(enumeration = "LinkType", optional, tag = "7")]
-    pub link_type: Option<i32>,
-}
 
 /// cpbus Packet token prefix after the `7b` marker: field-1 varint 2477,
 /// stable across all frames of an engine pair (seen in every observed frame).
@@ -257,19 +199,6 @@ pub fn msg_frame_sealed(sealed: Vec<u8>) -> Vec<u8> {
     // (0x38 is not picked up there at all -> their 5 s timeout).
     fr[1] = 0x3c;
     fr
-}
-
-/// `ScpSyncSecure` (phone `connection/scp/d0`): `{1: deviceId string,
-/// 2: ksc bytes, 3: kscAlias bytes}` — field numbers from generated
-/// `*_FIELD_NUMBER` constants.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SyncSecure {
-    #[prost(string, optional, tag = "1")]
-    pub device_id: Option<String>,
-    #[prost(bytes = "vec", optional, tag = "2")]
-    pub ksc: Option<Vec<u8>>,
-    #[prost(bytes = "vec", optional, tag = "3")]
-    pub ksc_alias: Option<Vec<u8>>,
 }
 
 /// Server reply to the peer's SYNC_SECURE (`e.java:57` → `n()` `d.java:729`):

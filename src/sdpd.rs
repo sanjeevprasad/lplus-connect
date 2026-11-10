@@ -444,6 +444,42 @@ const fn crc16_table() -> [u16; 256] {
 }
 static CRC16_TABLE: [u16; 256] = crc16_table();
 
+/// Parse the dbr.a DbsMessage out of a DataBus sid-8 payload (after the
+/// `[b0, tid u16be]` prefix: 52 B body, JSON from 55; `kms::dbs_data_frame`
+/// docs). Only broadcast msgTypes 42/82 carry a DbsMessage — the phone's
+/// `DbsDataReceiver` (`bf/c.java` case 0) parses nothing else.
+fn dbs_payload_json(payload: &[u8]) -> Option<serde_json::Value> {
+    let body = payload.get(3..55)?;
+    if !matches!(body[26], 42 | 82) {
+        return None;
+    }
+    serde_json::from_slice(payload.get(55..)?).ok()
+}
+
+/// Best-effort system clipboard write: wl-copy (wayland) then xclip (X11).
+fn set_system_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for (bin, args) in [
+        // wl-copy serves the clipboard selection by default; xclip needs the
+        // selection named explicitly.
+        ("wl-copy", &["-t", "text/plain"][..]),
+        ("xclip", &["-selection", "clipboard"][..]),
+    ] {
+        let Ok(mut child) = Command::new(bin).args(args).stdin(Stdio::piped()).spawn() else {
+            continue;
+        };
+        if let Some(mut si) = child.stdin.take()
+            && si.write_all(text.as_bytes()).is_ok()
+            && let Ok(st) = child.wait()
+            && st.success()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn record(log_path: &str, tag: &str, bytes: &[u8]) {
     let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path) else {
         return;
@@ -1433,6 +1469,12 @@ fn spawn_session_logger(
                 // a capex QUERY; we then must answer its RESPONSE with a
                 // CONFIRM (statusCode 0) to reach AVAILABLE/ATTACHED.
                 let capex_on = std::env::var("EPI_CAPEX").as_deref() != Ok("0");
+                // Clipboard lane (opt-in CLIPBOARD=1): subscribe our side to
+                // `Oplus_PcConnect` via `msg_topic_sync` once the DataBus
+                // session is live, then apply published ClipboardBean text to
+                // the system clipboard.
+                let clipboard_on = std::env::var("CLIPBOARD").is_ok();
+                let mut clip_subscribed = false;
                 let capex_profiles: Vec<String> = std::env::var("EPI_CAPEX_PROFILES")
                     .ok()
                     .map(|s| {
@@ -1590,6 +1632,90 @@ fn spawn_session_logger(
                             };
                             let ack = sess_frame(&[0x0a, tid[0], tid[1]], 8);
                             let _ = sock.write_all(&ack).await;
+                            record(
+                                &path,
+                                &format!(
+                                    "epidatabusframe{epi_port} {peer} b0={mt:02x} tid={:02x}{:02x}",
+                                    tid[0], tid[1]
+                                ),
+                                &payload,
+                            );
+                            if clipboard_on {
+                                // dbr.a DbsMessage from the peer (if any).
+                                if let Some(v) = dbs_payload_json(&payload) {
+                                    match v
+                                        .get("dbs_msg_type")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                    {
+                                        "msg_topic_sync" => tracing::info!(
+                                            "[clip] :{epi_port} peer topic sync: {}",
+                                            String::from_utf8_lossy(
+                                                payload
+                                                    .get(55..payload.len().min(215))
+                                                    .unwrap_or(&[])
+                                            )
+                                        ),
+                                        "msg_normal_topic_data" => {
+                                            let topic = v
+                                                .pointer("/dbs_msg_topic/dbs_topic_name")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("");
+                                            if topic == "Oplus_PcConnect"
+                                                && let Some(s) = v
+                                                    .pointer("/dbs_msg_payload/value")
+                                                    .and_then(|x| x.as_str())
+                                                && let Some(text) = proto::odmf::clipboard_text(s)
+                                            {
+                                                if set_system_clipboard(&text) {
+                                                    tracing::info!(
+                                                        "[clip] :{epi_port} phone→PC clipboard set ({}B)",
+                                                        text.len()
+                                                    );
+                                                } else {
+                                                    tracing::warn!(
+                                                        "[clip] :{epi_port} phone→PC clipboard ({}B) — no wl-copy/xclip: {text:?}",
+                                                        text.len()
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // Register our subscription once the session
+                                // carries a frame: the peer's dbr.a `to`/`from`
+                                // give us both ids verbatim.
+                                if !clip_subscribed && payload.len() >= 23 {
+                                    let phone6: [u8; 6] =
+                                        payload[3..9].try_into().expect("6B phone id");
+                                    let ours6: [u8; 6] =
+                                        payload[17..23].try_into().expect("6B our id");
+                                    let seq = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(1);
+                                    let json = crate::kms::dbs_topic_sync_json(
+                                        &hex::encode(ours6),
+                                        &hex::encode(phone6),
+                                        &["Oplus_PcConnect"],
+                                        seq,
+                                    );
+                                    let f = crate::kms::dbs_data_frame(
+                                        &ours6,
+                                        &phone6,
+                                        seq,
+                                        0x1001,
+                                        json.as_bytes(),
+                                    );
+                                    let _ = sock.write_all(&f).await;
+                                    record(&path, &format!("clipsubscribe{epi_port} {peer}"), &f);
+                                    tracing::info!(
+                                        "[clip] :{epi_port} msg_topic_sync sub=[Oplus_PcConnect] sent"
+                                    );
+                                    clip_subscribed = true;
+                                }
+                            }
                             tracing::info!(
                                 "[epi] :{epi_port} <- DATABUS sid8 b0={mt:02x} tid={:02x}{:02x} len={}B -> ack {}",
                                 tid[0],
@@ -3170,6 +3296,29 @@ fn link_info_payload(mac: &str, ip: &str, gw: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dbs_payload_json_accepts_our_frame_and_rejects_bad_msgtype() {
+        let from = [1u8, 2, 3, 4, 5, 6];
+        let to = [7u8, 8, 9, 10, 11, 12];
+        let json = "{\"dbs_msg_type\":\"msg_topic_sync\",\"dbs_msg_id\":\"x\"}";
+        let frame = crate::kms::dbs_data_frame(&from, &to, 7, 0x1001, json.as_bytes());
+        let payload = &frame[4..];
+        let v = dbs_payload_json(payload).expect("our own frame parses");
+        assert_eq!(v["dbs_msg_type"], "msg_topic_sync");
+        // The phone's DbsDataReceiver only parses dbr.a msgType 42/82.
+        let mut bad = frame.clone();
+        bad[4 + 3 + 26] = 7;
+        assert!(dbs_payload_json(&bad[4..]).is_none());
+    }
+
+    #[test]
+    fn topic_sync_json_carries_sub_list_and_type() {
+        let j = crate::kms::dbs_topic_sync_json("aabb", "ccdd", &["Oplus_PcConnect"], 5);
+        assert!(j.contains(r#""dbs_msg_type":"msg_topic_sync""#));
+        assert!(j.contains(r#""sub":["Oplus_PcConnect"]"#));
+        assert!(j.contains(r#""dbs_msg_from_device":"aabb""#));
+    }
 
     /// The published blob must round-trip the phone parser's contract:
     /// TLV header `2f 33 32`, bincode varint payload length, then the

@@ -1,0 +1,73 @@
+// Vendored SCP (secure connection pairing) wire types — the messages the
+// two ends exchange on the cpbus channel `active_connection` (namespace
+// `com.heytap.accessory`). Field numbers verified against the live phone
+// build (OnePlus/CPH2745IN:17/CP2A.260605.016, AccessoryFramework.apk
+// sha256 e6dc3c55c710850a…778f3b51): the generated protobuf-lite classes
+// `com.oplus.pantaconnect.connection.scp.{f0,q,ScpSyncData,d0}` declare
+// MSGTYPE=1/DATA=2; SEQUENCENO=1/CHANNEL=2/NAMESPACE=3/SERVICENAME=4;
+// DEVICENAME=1..LINKTYPE=7; DEVICEID=1/KSC=2/KSCALIAS=3, and
+// `ScpSyncData.LinkType` = P2P,WLAN,CLOUD,USB,SPP (0–4).
+//
+// `f0`/`q`/`d0` are the phone's obfuscated class names; the messages keep
+// their readable identities. Frame envelope and cpbus framing (the `7b`
+// marker, TOKEN, isServer bit) are NOT protobuf — see `src/scp.rs` in the
+// `lplus` bin. If Oplus's private `connect-protocols` repo ever surfaces
+// publicly, re-vendor from it and retire this hand-tagged mirror
+// (protos/README.md).
+
+syntax = "proto3";
+
+package com.oplus.pantaconnect.connection.scp;
+
+// `f0`: SCP envelope carried as the cpbus payload after the `7b` marker.
+// `msgType` is proto3-optional so a HELLO (0) can be force-emitted: prost
+// omits a plain 0 in a non-optional field, and the phone's parser drops a
+// frame whose msg_type field is absent.
+message ScpMessage {
+  optional uint32 msgType = 1;
+  bytes data = 2;
+}
+
+// `q`: hello payload with channel routing and sequence number. The peer
+// requires strictly increasing `sequenceNo` (it tracks last+1).
+message Hello {
+  uint32 sequenceNo = 1;
+  string channel = 2;
+  string namespace = 3;
+  string serviceName = 4;
+}
+
+// `ScpSyncData`: device advertisement sent right after HELLO.
+// key_type/device_type/active_trigger_mode are proto ints (varint), NOT
+// strings (the decompiled getters return `int`). customData/linkType are
+// proto3 `optional`: the phone's own SYNC omits fields 3 and 7 entirely
+// and its old parser rejects an unexpected `1a`/`38` there
+// (`invalid tag (zero)` at stage ReadSync), so they are omitted unless
+// explicitly set.
+message SyncData {
+  string deviceName = 1;
+  int32 keyType = 2;
+  optional bytes customData = 3;
+  int32 deviceType = 4;
+  int32 activeTriggerMode = 5;
+  string modelId = 6;
+  optional LinkType linkType = 7;
+}
+
+enum LinkType {
+  P2P = 0;
+  WLAN = 1;
+  CLOUD = 2;
+  USB = 3;
+  SPP = 4;
+}
+
+// `d0` (`ScpSyncSecure`): post-ukey2 secure-sync message. All fields are
+// proto3-optional: a reply must be able to OMIT ksc/kscAlias when the peer
+// omitted them (the echo is byte-faithful); a plain singular field would
+// send empty bytes instead.
+message SyncSecure {
+  optional string deviceId = 1;
+  optional bytes ksc = 2;
+  optional bytes kscAlias = 3;
+}

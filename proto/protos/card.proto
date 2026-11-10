@@ -1,0 +1,141 @@
+// Vendored UMS card-service wire types (proto2 — the vendor descriptors are
+// proto2: `required` labels and explicit defaults). Recovered 2026-11-10 from
+// the `internalBuildGeneratedFileFrom` descriptor blobs of the four
+// `com.oplus.pantanal.ums.cardservice.valueobject.model` runtime classes in
+// UMS.apk (see protos/README.md); each block below is one vendor .proto file
+// regenerated from its captured FileDescriptorProto bytes. Field numbers,
+// labels and defaults are the vendor's verbatim.
+
+syntax = "proto2";
+
+package com.oplus.pantanal.ums.cardservice.valueobject.model;
+
+// ---- recovered from vendor .desc: card_action_service.proto ----
+message CardActionProto {
+  required int32 cardType = 1;
+  required int32 cardId = 2;
+  required int32 hostId = 3;
+  required int32 action = 4;
+  map<string, string> param = 5;
+  enum ACTION {
+    CLICK = 1;
+    LIFE_CIRCLE = 2;
+    EXPOSED_STATE = 3;
+    INVALIDATE = 4;
+  }
+}
+
+// ---- recovered from vendor .desc: card_config_info_service.proto ----
+message CardConfigInfoListProto {
+  repeated com.oplus.pantanal.ums.cardservice.valueobject.model.CardConfigInfoListProto.CardConfigInfoProto list = 1;
+  optional int32 cardConfigResultStatus = 2[default = 0];
+  message CardConfigInfoProto {
+    required int32 groupId = 1;
+    required string groupTitle = 2;
+    required string groupIcon = 3;
+    required int32 type = 4;
+    required string name = 5;
+    required string desc = 6;
+    required string preview = 7;
+    required com.oplus.pantanal.ums.cardservice.valueobject.model.CardConfigInfoListProto.CardConfigInfoProto.SIZE size = 8;
+    optional int32 orderInGroup = 9[default = 0];
+    required string packageName = 10;
+    required string componentName = 11;
+    required int32 category = 12;
+    required bool resizable = 13;
+    required com.oplus.pantanal.ums.cardservice.valueobject.model.CardConfigInfoListProto.CardConfigInfoProto.OPERATION operatingIcon = 14;
+    required string settingUrl = 15;
+    optional int32 displayArea = 16[default = 0];
+    optional int32 minWidth = 17[default = 0];
+    optional int32 minHeight = 18[default = 0];
+    optional string loadingIcon = 19[default = ""];
+    optional string loadingBgIcon = 20[default = ""];
+    optional int32 reservedFlag = 21[default = 0];
+    optional int32 defaultSubscribed = 22[default = 0];
+    optional int32 groupOrder = 23[default = -1];
+    optional string previewSw480 = 24[default = ""];
+    required string serviceId = 25[default = ""];
+    optional int32 dragonFlyType = 51[default = 0];
+    optional bool dragonFlySecure = 52[default = false];
+    optional string dragonFlyService = 53[default = ""];
+    optional string skeletonPicPath = 54[default = ""];
+    optional string skeletonDarkPicPath = 55[default = ""];
+    optional string loadFailPicPath = 56[default = ""];
+    optional string loadFailDp = 57[default = ""];
+    optional int32 showTitle = 58[default = 0];
+    optional string miniAppIcon = 59[default = ""];
+    optional bool isDarkStyle = 60[default = false];
+    required bool showWhenLocked = 61[default = false];
+    optional string instantCardUrl = 62[default = ""];
+    optional bool supportSuperChannel = 63[default = false];
+    optional string identification = 64[default = ""];
+    optional com.oplus.pantanal.ums.cardservice.valueobject.model.CardConfigInfoListProto.CardConfigInfoProto.CardMaintainProto cardMaintain = 65;
+    optional string materialPreview = 66[default = ""];
+    optional string distributeType = 67[default = ""];
+    optional string bizPkgName = 68[default = ""];
+    optional string extras = 69[default = ""];
+    message CardMaintainProto {
+      optional string style = 1[default = ""];
+      optional string description = 2[default = ""];
+    }
+    enum SIZE {
+      TWO_PLUS_TWO = 1;
+      TWO_PLUS_FOUR = 2;
+      FOUR_PLUS_FOUR = 3;
+      N_PLUS_FOUR = 4;
+      ONE_PLUS_TWO = 5;
+      WIDGET_ONE_PLUS_ONE = 6;
+      NOTIFICATION_SM = 7;
+      NOTIFICATION_MD = 8;
+      NOTIFICATION_LG = 9;
+      ONE_PLUS_ONE = 10;
+    }
+    enum CATEGORY {
+      INSTANT = 1;
+      APP = 2;
+      CONTENT_OPERATION = 3;
+      SERVICE = 4;
+      SEEDING = 100;
+    }
+    enum OPERATION {
+      NONE = 1;
+      NEW = 2;
+      HOT = 3;
+      UNAVAILABLE = 4;
+    }
+  }
+}
+
+// ---- recovered from vendor .desc: card_ui_data_client.proto ----
+message UIDataClientProto {
+  required int32 cardId = 1;
+  required string data = 2;
+  map<string, int32> idMaps = 3;
+  optional string name = 4;
+  optional int64 version = 5;
+  optional int32 themeId = 6;
+  optional bytes value = 7;
+  optional bool forceChangeCardUI = 8;
+  optional com.oplus.pantanal.ums.cardservice.valueobject.model.UIDataClientProto.DataCompress compress = 9;
+  optional string layoutName = 10;
+  optional string extraMsg = 11;
+  enum DataCompress {
+    NONE = 0;
+    FLATER = 1;
+    SIMPLIFY = 2;
+  }
+}
+
+// ---- recovered from vendor .desc: card_ui_data_service.proto ----
+message UIDataProto {
+  required int32 cardId = 1;
+  required bytes data = 2;
+  map<string, int32> idMaps = 3;
+  optional string name = 4;
+  optional int64 version = 5;
+  optional int32 themeId = 6;
+  optional bytes value = 7;
+  optional bool forceChangeCardUI = 8;
+  optional string layoutName = 10;
+  optional string extraMsg = 11;
+}

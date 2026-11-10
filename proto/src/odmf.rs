@@ -171,6 +171,59 @@ impl AuthFields {
     }
 }
 
+/// Cross-device clipboard payload published on the DataBus topics
+/// `Oplus_PcConnect`/`Oplus_PadConnect`/`Oplus_MacConnect` by the phone's
+/// `ClipBoardDataBusScene` (`com.oplus.linker` / OPSynergy,
+/// `wisetransfer/clipboard/scene/ClipBoardDataBusScene.publishClipMsg`).
+/// Mirrors the phone's Gson beans
+/// `wisetransfer/clipboard/data/{ClipboardBean,DataBean,TextBean}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClipboardBean {
+    #[serde(rename = "crossdeviceClipboardVersion", default)]
+    pub crossdevice_clipboard_version: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub data: ClipboardData,
+}
+
+/// `DataBean`: only `text`/`htmlData` are used by the PC lane in practice;
+/// image/files ride as URIs or base64 strings.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ClipboardData {
+    #[serde(default)]
+    pub text: Option<ClipboardText>,
+    #[serde(default)]
+    pub html: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub files: Option<String>,
+    #[serde(rename = "htmlData", default)]
+    pub html_data: Option<serde_json::Value>,
+}
+
+/// `TextBean` — the copy payload; `encoding` is charset metadata.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClipboardText {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
+/// Extract the plain-text clipboard content from the `value` string of a
+/// `DbsMessage` payload (`{"key":…,"value":"<ClipboardBean json>"}` — the
+/// inner JSON is escaped one level, which serde_json has already unwrapped
+/// by the time we see it).
+pub fn clipboard_text(value_json: &str) -> Option<String> {
+    let bean: ClipboardBean = serde_json::from_str(value_json).ok()?;
+    bean.data
+        .text
+        .filter(|t| !t.content.is_empty())
+        .map(|t| t.content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +333,19 @@ mod tests {
         assert_eq!(r.fields.auth_version, Some(1));
         assert_eq!(r.local_transportbus_id.as_deref(), Some("0000006734474"));
         assert_eq!(r.local_user_name.as_deref(), Some("heycast_odmf"));
+    }
+
+    #[test]
+    fn clipboard_bean_parses_phone_publish_shape() {
+        // Shape of the `value` string in
+        // ClipBoardDataBusScene.publishClipMsg (Gson of ClipboardBean):
+        // version, source, and data.text{content,encoding}.
+        let value = r#"{"crossdeviceClipboardVersion":"1.0","source":"phone","data":{"text":{"content":"hello from phone","encoding":"utf-8"},"html":null,"image":null,"files":null}}"#;
+        assert_eq!(clipboard_text(value).as_deref(), Some("hello from phone"));
+        let empty =
+            r#"{"crossdeviceClipboardVersion":"1.0","source":"pc","data":{"text":{"content":""}}}"#;
+        assert_eq!(clipboard_text(empty), None);
+        let no_text = r#"{"source":"pc","data":{"image":"file://x.png"}}"#;
+        assert_eq!(clipboard_text(no_text), None);
     }
 }

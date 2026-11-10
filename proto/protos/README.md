@@ -16,9 +16,11 @@ headers intact:
 | `device_to_device_messages.proto` | `b9e94a97db693bc8…4d5610` |
 | `securegcm.proto` | `f33b7a49768e6b61…04ceb5` |
 | `oplus.proto` | ours — the phone-forked `Ukey2ClientFinished.iv_spec`, decode-only; mirrors Oplus's own `{public_key=1, ivSpec=2}` |
+| `card.proto` | `cdf931e136f97e6a…ef0f` — recovered (below), proto2 |
+| `scp.proto` | `c41e9def1392a999…d88b` — hand-tagged mirror of the phone lite classes (header), proto3 |
 
 Full digests: `cargo run`-independent; regenerate with
-`sha256sum protocol/proto/*.proto`.
+`sha256sum proto/protos/*.proto` (from `linux-client/`).
 
 ## Why beto-rust and not `google/ukey2` master
 
@@ -48,11 +50,12 @@ Google's networked-transports Gerrit, not here.
 
 There is no ColorOS/OnePlus source release covering the connectivity stack:
 the OSS releases (OnePlusOSS GitHub, open.oppomobile) are kernel + HAL only.
-`ScpMessage`/`Hello`/`SyncData`/`SyncSecure` (`src/scp.rs`) and the
-`oplus.proto` fork were reconstructed from the phone's generated
-protobuf-lite classes and re-verified against `com.heytap.accessory`
+`ScpMessage`/`Hello`/`SyncData`/`SyncSecure` are vendored as
+[`scp.proto`](scp.proto) and prost-generated (2026-11-10 migration); the
+`oplus.proto` fork was re-verified against `com.heytap.accessory`
 AccessoryFramework.apk on a live device — see the header comment of
-`src/scp.rs` for the exact `*_FIELD_NUMBER` corroboration.
+`scp.proto` for the exact `*_FIELD_NUMBER` corroboration the hand-written
+structs carried before.
 
 ### The authoritative .proto does exist — privately
 
@@ -74,8 +77,8 @@ plus its prost field-name pools, which give the original definitions:
 - `pantaChannelService.exe` carries the C++ side: `ukey.proto`,
   `securemessage.proto` (package `securegcm`, full protobuf)
 
-If `connect-protocols` ever surfaces publicly, re-vendor these as .proto
-files and retire the hand-tagged structs in `src/scp.rs`.
+If `connect-protocols` ever surfaces publicly, re-vendor from it and
+replace `scp.proto`/`oplus.proto` with the authoritative files.
 
 ### Extracted descriptors (oracle, not build input)
 
@@ -99,3 +102,34 @@ the exe and parse the largest valid prefix at each. Findings:
   `HeaderAndBodyInternal{bytes header, bytes body}` (Google's RawHAB) that
   beto-rust dropped. No `AES_256_GCM_SIV`/`AEAD`/`nonce`; our superset
   again safe.
+
+## UMS card-service protos — `card.proto` (recovered)
+
+Source: `apks/com.oplus.pantanal.ums/UMS.apk` @
+`0714feef…ec44` (device copy, CPH2745/ColorOS 17). The four
+`com.oplus.pantanal.ums.cardservice.valueobject.model` classes
+(`CardActionProto`, `CardConfigInfoListProto`, `UIDataClientProto`,
+`UIDataProto`) are **full-runtime protobuf** (`GeneratedMessageV3`), so each
+embeds its complete `FileDescriptorProto` in an
+`internalBuildGeneratedFileFrom(String[] descriptorData)` literal. Recipe:
+`jadx --no-res` the APK, pull each class's descriptor string-array
+constants (Java `\u` escapes → bytes), concatenate in order, parse with
+`google.protobuf.descriptor_pb2.FileDescriptorProto` — the four files are
+`card_{action_service,config_info_service,ui_data_client,ui_data_service}.proto`
+(`.desc` bytes are runtime-derived from a proprietary APK, so — like the
+`pantaChannelService` dumps above — they are not checked in; the
+regenerated `.proto` text is). The merged `card.proto` keeps one block per
+vendor file; labels/numbers/defaults are verbatim (`required` ⇒ proto2).
+Card-service lane use: widget-card payloads on the DataBus/CPBus side
+lanes, not the clipboard (that lane is Gson, see `odmf.rs`).
+
+`interconnect_share.proto.desc` (one more UMS runtime descriptor, the cpbus
+RPC share types) is decoded but deliberately **not** vendored yet: the RPC
+envelope tags are still unknown (docs/protocol.md §7.4); vendor it together
+with the envelope once pinned. The companion `connect.proto` rough
+recovery (from `GeneratedMessageLite` in `com.oplus.linker`'s
+`ConnectProto`, 110 messages) is likewise NOT build input: it systematically
+dropped all repeated/map/oneof labels (35 `…Count()` accessors in source,
+zero in the text) and is parked at `../capture/connect_recovered.proto`
+with a defect header until re-derived per-message from the `*OrBuilder`
+interfaces.

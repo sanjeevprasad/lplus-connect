@@ -243,6 +243,30 @@ pub fn dbs_message_json(
     )
 }
 
+/// DbsMessage JSON that registers our topics with the peer's `DbsManager`
+/// (phone `dbs/DbsUtilKt.broadcastLocalTopic` → `j.b`: type
+/// `msg_topic_sync`, payload `{"sub":[…],"pub":[…]}`; the peer's
+/// `dbs/e.java processMsgReceived` routes it to `f.h(peer, msg)`, which
+/// updates the per-peer subscriber registry). Without this the peer's
+/// broker drops our topic frames ("remote do not have subscriber"), and
+/// never routes its own publishes (e.g. `Oplus_PcConnect` clipboard) to us.
+pub fn dbs_topic_sync_json(from_hex: &str, to_hex: &str, sub: &[&str], seq: u64) -> String {
+    let quoted = |list: &[&str]| {
+        list.iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "{{\"dbs_msg_to_device\":\"{to_hex}\",\"dbs_msg_from_device\":\"{from_hex}\",\
+         \"dbs_msg_priority\":100,\"dbs_msg_type\":\"msg_topic_sync\",\
+         \"dbs_msg_id\":\"lplus-sync-{seq}\",\
+         \"dbs_msg_payload\":{{\"sub\":[{}],\"pub\":[]}},\
+         \"dbs_msg_encrypt\":true,\"time\":{seq}}}",
+        quoted(sub)
+    )
+}
+
 /// Unencrypted DataBus (NDSF sid 8) DATA frame (`len`, hdr `0x0020`,
 /// `b0=0x00`, `tid`) plus dbr.a message (phone `pl/b.f` and `g5/b.s`),
 /// as accepted by `session/reserved/d.java` case 1 without AppCipher
@@ -342,12 +366,7 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                             acc.extend_from_slice(&tmp[..n]);
                             if last_ev.elapsed() >= std::time::Duration::from_secs(60) {
                                 last_ev = tokio::time::Instant::now();
-                                crate::sdpd::emit_device(
-                                    "kms",
-                                    peer.ip().to_string(),
-                                    None,
-                                    true,
-                                );
+                                crate::sdpd::emit_device("kms", peer.ip().to_string(), None, true);
                             }
                         }
                     }
