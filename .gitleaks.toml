@@ -1,0 +1,73 @@
+# lplus: default gitleaks ruleset + local deny rules that keep personal
+# machine/phone/network identifiers out of this repo.
+#
+# Rules match by SHAPE + key context only — no real values are embedded here
+# (a config full of secrets would defeat its purpose). Real values live in
+# ~/.config/lplus/settings.json. Any hard-coded IPv4 beyond example/test
+# ranges (RFC 5737) and protocol constants is treated as a personal leak.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "lplus synthetic scrub stand-ins + well-known protocol constants (safe to commit)"
+paths = [
+    '''(?:^|/)vendor(?:/.*)?$''',
+    '''(?:^|/)target(?:/.*)?$''',
+]
+regexes = [
+    '''(?i)\b00112233445566778899aabbccddeeff\b''',   # fake KSC
+    '''(?i)\b(?:0123456789AB|A1B2C3D4E5F6)\b''',      # fake PDIDs
+    '''(?i)\bFAKESERIAL000001\b''',                   # fake adb serial
+    '''(?i)\b(?:02|00):00:00:00:00:0[0-9a-f]\b''',    # locally-administered fake MACs
+    # IPs: default-deny. All fake hosts live in TEST-NET 192.0.2.0/24 —
+    # the range itself marks them synthetic. Only other accepted quads are
+    # these exact protocol constants.
+    '''\b192\.0\.2\.\d{1,3}\b''',
+    '''\b127\.0\.0\.1\b''',
+    '''\b0\.0\.0\.0\b''',
+    '''\b8\.8\.8\.8\b''',
+    '''\b239\.255\.255\.250\b''',
+    '''\b1\.4\.341\.0\b''',                            # firmware version string, not an IP
+]
+
+[[rules]]
+id = "lplus-scp-ksc"
+description = "32-hex session key bound to a ksc/scpKsc key name that is not the synthetic test KSC."
+regex = '''(?i)\b(?:scp[-_ ]?)?ksc["'\s:=,]{0,8}([0-9a-f]{32})'''
+keywords = ["ksc"]
+
+[[rules]]
+id = "lplus-pdid-kpd"
+description = "12-hex pairing id bound to a pdid/linkKpd key name that is not a synthetic test PDID."
+regex = '''(?i)\b(?:pdid|link[-_ ]?kpd)["'\s:=,]{0,8}([0-9a-f]{12})'''
+keywords = ["pdid", "kpd"]
+
+[[rules]]
+id = "lplus-device-serial"
+description = "16-char device serial in a serial/adb context that is not the synthetic test serial."
+regex = '''(?i)(?:serial|usb-adb-)[ "'\s:=\-]{0,5}([A-Z0-9]{16})'''
+keywords = ["serial", "usb-adb-"]
+
+[[rules]]
+id = "lplus-pc-hostname"
+description = "PC hostname in the NW####### serial-number shape."
+regex = '''\bNW\d{7}\b'''
+keywords = ["nw"]
+
+[[rules]]
+id = "lplus-ipv4-address"
+description = "Hard-coded IPv4 outside example ranges and protocol constants — treat as a home/phone network leak; use RFC 5737 TEST-NET or config."
+regex = '''\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b'''
+
+[[rules]]
+id = "lplus-mac-address"
+description = "MAC address in an explicit mac key context that is not a synthetic/locally-administered test MAC."
+regex = '''(?i)\b(?:bt[-_ ]?mac|wifi[-_ ]?mac|macaddr|mac)["'\s:=]{0,5}([0-9a-f]{2}(?::[0-9a-f]{2}){5})'''
+keywords = ["mac"]
+
+[[rules]]
+id = "lplus-pc-nic"
+description = "Predictable interface name (enXsY format) of the home PC."
+regex = '''\ben[a-z]\d+s\d+\b'''
+keywords = ["en"]
