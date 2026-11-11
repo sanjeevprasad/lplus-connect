@@ -217,7 +217,7 @@ success).
 | TCP | phone **:7236** | PC | classic WFD RTSP client lane (`src/rtsp.rs`) |
 | UDP | **15550** (`ODMF_RTP_PORT`) | phone | RTP (H.265/H.264) |
 | UDP BLE | FD70 adv + GATT | phone | near-field attach |
-| TCP | loopback **1421** | GUI/attach | contract server: 4-byte BE length + prost `lplus_ipc::pb::Request` → `Response` (typed control verbs + `Invoke` method/JSON channels) |
+| TCP | loopback **1421** | control clients | contract server: 4-byte BE length + prost `Frame{method,error,payload}`; `service Lplusd` rpcs, all strictly typed (Ping, ListDevices, Connect/Disconnect/RemoveDevice, GetHostName/SetHostName, GetPairedDevices, GetLocalDeviceId, EnsureRunning, GetCloudBind, SidecarStatus, PollEvents, Status, CastPush/OdmfStart/KmsBootstrap, SinkList/InjectFrame, RequestLive/TakeFrame) |
 | TCP | loopback `LPLUS_EVENTS_PORT` | dev | NDJSON presence bus |
 
 Opt-in env: `ODMF_SINK=1`, `ODMF_LISTEN`, `ODMF_RTP_PORT`, `ODMF_OUT`,

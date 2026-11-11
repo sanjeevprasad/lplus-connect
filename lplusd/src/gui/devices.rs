@@ -1,5 +1,5 @@
-//! Daemon-backed device inventory feeding the vendored renderer's device
-//! list.
+//! Daemon-backed device inventory: the single source for the contract's
+//! `ListDevices` / `GetPairedDevices` responses.
 //!
 //! Presence is **typed, not scraped**: the in-process backend publishes
 //! `DeviceEvent{kind,ip,name,connected,ts_ms}` on a tokio broadcast
@@ -15,11 +15,9 @@
 //! visible exactly while the backend reports events for it. Every event
 //! mirrors to the log as `[presence] event …`.
 //!
-//! Rows are exposed two ways: the `/__devices` route on the loopback server
-//! (the row shape is the vendor `devicesList` electron-store entry that the
-//! mydevice screen renders from) and `ipc_renderer_event` bus pushes
-//! (`push_search_devices_in_deivce_list`) for clients that subscribe via
-//! `ipc_event_init`.
+//! The row shape mirrors the vendor `devicesList` entry (RE reference for
+//! the mydevice screen); consumers read it through the contract — the
+//! renderer-era bus push lane was cut with the parked window.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -31,13 +29,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use strum::EnumString;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::sdpd::DeviceEvent;
 
-/// Event name the mydevice card listens on (spelling is the renderer's).
-const PUSH_EVENT: &str = "push_search_devices_in_deivce_list";
-const PUSH_INTERVAL_SECS: u64 = 1;
 /// Rows with no event for this long are dropped.
 const ROW_TTL_SECS: u64 = 5 * 60;
 /// Rows without an event for this long drop the discovered flag.
@@ -52,11 +47,11 @@ const CONN_STALE_SECS: u64 = 120;
 const BRIDGE_RETRY: Duration = Duration::from_secs(2);
 
 /// Host-local addresses: the backend may report its own side of sessions
-/// (`--vip`, primary NIC, loopback) — never accessories.
+/// (primary NIC, loopback) — never accessories.
 fn local_ips() -> &'static std::collections::HashSet<String> {
     static LOCALS: LazyLock<std::collections::HashSet<String>> = LazyLock::new(|| {
         let mut set = std::collections::HashSet::new();
-        set.insert(std::env::var("LPLUS_VIP").unwrap_or_else(|_| crate::sdpd::default_vip()));
+        set.insert(crate::sdpd::default_vip());
         if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
             && sock.connect(("8.8.8.8", 80)).is_ok()
             && let Ok(addr) = sock.local_addr()
@@ -73,10 +68,10 @@ fn is_local(ip: &str) -> bool {
 }
 
 /// One card row, shaped to what mydevice/`devicesList` consumers read —
-/// the generated contract type (`lplus_ipc::pb::DeviceRow`, from
-/// `protos/ui.proto`), re-exported so in-crate callers keep saying
-/// `crate::gui::devices::DeviceRow`.
-pub use lplus_ipc::pb::DeviceRow;
+/// the generated contract type (`lplus_ipc::pb::Device`, from
+/// `protos/lplus.proto`), re-exported so in-crate callers keep saying
+/// `crate::gui::devices::Device`.
+pub use lplus_ipc::pb::Device;
 
 /// NDJSON wire form of `crate::sdpd::DeviceEvent` for external-bridge
 /// subscribers. (The backend type derives `Serialize` only; this mirror
@@ -93,7 +88,7 @@ struct WireEvent {
 #[derive(Default)]
 struct Inner {
     /// Visible rows keyed by ip (dedupe); minted only by backend events.
-    rows: HashMap<String, DeviceRow>,
+    rows: HashMap<String, Device>,
     /// Last persisted serialization of the paired rows (`paired-devices.json`).
     paired_saved: String,
     /// User-removed device ids (`generic_agent_settings_remove_device`,
@@ -102,10 +97,6 @@ struct Inner {
     unpaired: HashSet<String>,
     /// Last persisted serialization of `unpaired` (`unpaired.json`).
     unpaired_saved: String,
-    /// Bus events the renderer subscribed to (`ipc_event_init`).
-    subscribed: HashSet<String>,
-    dirty: bool,
-    last_push: u64,
 }
 
 /// Vendor `CONNECT_TYPE` bits (renderer `Ve.gy`): LAN discovery vs adb/USB.
@@ -120,7 +111,7 @@ pub fn usb_lane_on() -> bool {
 }
 
 /// Surface-level visibility for one row (pure for tests).
-fn usb_hidden(row: &DeviceRow, usb_on: bool) -> bool {
+fn usb_hidden(row: &Device, usb_on: bool) -> bool {
     !usb_on && row.connect_type == CONNECT_TYPE_USB
 }
 
@@ -148,7 +139,7 @@ fn paired_path() -> std::path::PathBuf {
 }
 
 /// Registry key a persisted row belongs to; `None` for unusable rows.
-fn row_key(row: &DeviceRow) -> Option<String> {
+fn row_key(row: &Device) -> Option<String> {
     if row.connect_type == CONNECT_TYPE_USB {
         row.usb_serial.as_deref().map(|s| format!("usb:{s}"))
     } else if row.ip.is_empty() {
@@ -159,11 +150,11 @@ fn row_key(row: &DeviceRow) -> Option<String> {
 }
 
 /// Load persisted paired rows; any read/parse failure means "no bonds".
-fn load_paired(path: &std::path::Path) -> Vec<DeviceRow> {
+fn load_paired(path: &std::path::Path) -> Vec<Device> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    match serde_json::from_str::<Vec<DeviceRow>>(&raw) {
+    match serde_json::from_str::<Vec<Device>>(&raw) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("[pair] paired bond file unusable ({}): {e}", path.display());
@@ -173,13 +164,13 @@ fn load_paired(path: &std::path::Path) -> Vec<DeviceRow> {
 }
 
 /// Persist paired rows when they differ from the last saved state.
-fn save_paired(path: &std::path::Path, rows: &[&DeviceRow]) -> std::io::Result<()> {
+fn save_paired(path: &std::path::Path, rows: &[&Device]) -> std::io::Result<()> {
     std::fs::write(path, serde_json::to_string_pretty(&rows)?.as_bytes())
 }
 
 /// Write the paired set if its serialization changed since last save.
 fn sync_paired(i: &mut Inner) {
-    let mut rows: Vec<&DeviceRow> = i.rows.values().filter(|r| r.is_paired).collect();
+    let mut rows: Vec<&Device> = i.rows.values().filter(|r| r.is_paired).collect();
     rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
     let Ok(json) = serde_json::to_string_pretty(&rows) else {
         return;
@@ -197,11 +188,11 @@ fn sync_paired(i: &mut Inner) {
 /// Rows carrying a persistent pairing bond — authority for
 /// `generic_agent_get_paired_devices` (consumers read `entries[]` /
 /// `pairedDevices`, e.g. gaPairBoundStatus).
-pub fn paired_rows() -> Vec<DeviceRow> {
+pub fn paired_rows() -> Vec<Device> {
     let mut i = inner().lock().expect("devices lock poisoned");
     refresh_ephemeral(&mut i);
     sync_paired(&mut i);
-    let mut rows: Vec<&DeviceRow> = i
+    let mut rows: Vec<&Device> = i
         .rows
         .values()
         .filter(|r| r.is_paired && !usb_hidden(r, usb_lane_on()))
@@ -303,7 +294,7 @@ fn init_inner() {
         let mut ids: Vec<&String> = i.unpaired.iter().collect();
         ids.sort();
         i.unpaired_saved = serde_json::to_string_pretty(&ids).unwrap_or_default();
-        let mut rows: Vec<&DeviceRow> = i.rows.values().filter(|r| r.is_paired).collect();
+        let mut rows: Vec<&Device> = i.rows.values().filter(|r| r.is_paired).collect();
         rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         i.paired_saved = serde_json::to_string_pretty(&rows).unwrap_or_default();
     }
@@ -324,81 +315,20 @@ fn init_inner() {
     spawn_bridge_consumers();
 }
 
-/// Poller hook: rate-limit pushes onto the GUI bus (consumed by the SSE
-/// stream and the window alike). Event ingest is push-driven
-/// (broadcast + bridge threads), so nothing else to pump. Pushes fire while
-/// the renderer subscribed to the row-push event (via `ipc_event_init`) or
-/// any bus consumer (SSE client, window push) could still receive them.
-pub fn tick() {
-    let mut i = inner().lock().expect("devices lock poisoned");
-    if !i.dirty || !(i.subscribed.contains(PUSH_EVENT) || crate::gui::bus_has_listeners()) {
-        return;
-    }
-    let now = now_secs();
-    if now.saturating_sub(i.last_push) < PUSH_INTERVAL_SECS {
-        return;
-    }
-    i.last_push = now;
-    i.dirty = false;
-    let mut rows: Vec<DeviceRow> = i.rows.values().cloned().collect();
-    rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-    drop(i);
-    for row in rows {
-        let frame = BusEventFrame {
-            event: PUSH_EVENT,
-            data: &row,
-        };
-        crate::gui::bus_publish(
-            RENDERER_EVENT_CHANNEL,
-            serde_json::to_value(&frame).unwrap_or_default(),
-        );
-    }
-}
-
-/// One bus row push: `{event, data}` with `data` as a JSON object (never
-/// a stringified blob — consumers iterate it).
-#[derive(Serialize)]
-struct BusEventFrame<'a> {
-    event: &'static str,
-    data: &'a DeviceRow,
-}
-
-const RENDERER_EVENT_CHANNEL: &str = "ipc_renderer_event";
-
-/// Record a bus-event subscription from `ipc_event_init`.
-pub fn note_subscription(name: &str) {
-    inner()
-        .lock()
-        .expect("devices lock poisoned")
-        .subscribed
-        .insert(name.to_string());
-}
-
-/// True when the renderer subscribed to `name` via `ipc_event_init`
-/// (test hook: proves the bus path registered the subscription).
-#[cfg(test)]
-pub fn is_subscribed(name: &str) -> bool {
-    inner()
-        .lock()
-        .expect("devices lock poisoned")
-        .subscribed
-        .contains(name)
-}
-
 /// Serializable visible rows (sorted, ephemeral flags refreshed, stale
 /// rows pruned) as typed rows — the API surface.
-pub fn visible_device_rows() -> Vec<DeviceRow> {
+pub fn visible_device_rows() -> Vec<Device> {
     let mut i = inner().lock().expect("devices lock poisoned");
     visible_rows(&mut i)
 }
 
-fn visible_rows(i: &mut Inner) -> Vec<DeviceRow> {
+fn visible_rows(i: &mut Inner) -> Vec<Device> {
     visible_rows_gated(i, usb_lane_on())
 }
 
-fn visible_rows_gated(i: &mut Inner, usb_on: bool) -> Vec<DeviceRow> {
+fn visible_rows_gated(i: &mut Inner, usb_on: bool) -> Vec<Device> {
     refresh_ephemeral(i);
-    let mut rows: Vec<&DeviceRow> = i.rows.values().filter(|r| !usb_hidden(r, usb_on)).collect();
+    let mut rows: Vec<&Device> = i.rows.values().filter(|r| !usb_hidden(r, usb_on)).collect();
     rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
     rows.into_iter().cloned().collect()
 }
@@ -454,7 +384,7 @@ fn ingest_event(i: &mut Inner, kind: &str, ip: &str, name: Option<&str>, connect
     if !known && kind.is_none() {
         return;
     }
-    let row = i.rows.entry(ip.to_string()).or_insert_with(|| DeviceRow {
+    let row = i.rows.entry(ip.to_string()).or_insert_with(|| Device {
         device_id: device_id_for(ip),
         device_name: format!("Phone {}", ip.rsplit('.').next().unwrap_or(ip)),
         ip: ip.to_string(),
@@ -493,7 +423,6 @@ fn ingest_event(i: &mut Inner, kind: &str, ip: &str, name: Option<&str>, connect
         }
         None => {}
     }
-    i.dirty = true;
 }
 
 fn device_id_for(ip: &str) -> String {
@@ -533,9 +462,7 @@ fn refresh_ephemeral(i: &mut Inner) {
             );
         }
     }
-    if !stale_conn.is_empty() {
-        i.dirty = true;
-    }
+    if !stale_conn.is_empty() {}
 }
 
 /// Adopt an `scp_sync` name; keep an existing model name over weaker
@@ -553,7 +480,6 @@ fn set_name(i: &mut Inner, ip: &str, name: &str) {
         && (row.device_name.starts_with("Phone ") || is_model_name(&clean))
     {
         row.device_name = clean;
-        i.dirty = true;
     }
 }
 
@@ -618,8 +544,8 @@ mod tests {
         ingest_event(i, kind, ip, name, connected);
     }
 
-    fn usb_row(serial: &str, paired: bool) -> DeviceRow {
-        DeviceRow {
+    fn usb_row(serial: &str, paired: bool) -> Device {
+        Device {
             device_id: format!("usb-{serial}"),
             device_name: "Phone".into(),
             ip: String::new(),
@@ -710,7 +636,7 @@ mod tests {
         i.rows
             .insert("usb:BONDED".to_string(), usb_row("BONDED", true));
         ev(&mut i, "epi", "192.0.2.2", None, false);
-        let rows: Vec<&DeviceRow> = i.rows.values().filter(|r| r.is_paired).collect();
+        let rows: Vec<&Device> = i.rows.values().filter(|r| r.is_paired).collect();
         assert_eq!(rows.len(), 1, "transport presence alone is not a bond");
         save_paired(&path, &rows).expect("save");
         let loaded = load_paired(&path);
@@ -863,36 +789,5 @@ mod tests {
         let rows = visible_rows_gated(&mut i, true);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows.iter().filter(|r| r.connect_type == 128).count(), 1);
-    }
-
-    #[test]
-    fn bus_row_push_carries_object_not_stringified_json() {
-        let mut rx = crate::gui::bus_subscribe();
-        apply_event(&DeviceEvent {
-            kind: "epi",
-            ip: "192.0.2.4".into(),
-            name: None,
-            connected: true,
-            ts_ms: 0,
-        });
-        tick();
-        let mut found = None;
-        for _ in 0..64 {
-            match rx.try_recv() {
-                Ok(frame) => {
-                    if frame["payload"]["event"] == PUSH_EVENT {
-                        found = Some(frame["payload"]["data"].clone());
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let data = found.expect("row push published on the GUI bus");
-        assert!(
-            data.is_object(),
-            "pushed row must be a JSON object, got {data}"
-        );
-        assert_eq!(data["deviceId"], "192-0-2-4");
     }
 }

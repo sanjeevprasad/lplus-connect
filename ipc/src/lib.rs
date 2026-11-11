@@ -1,16 +1,21 @@
-//! L+ connect daemon↔ui contract: the single crate both `lplusd`
-//! and `lplus-ui` depend on (and the only thing they share).
+//! L+ connect backend contract: the crate the daemon serves and any
+//! external control client speaks.
 //!
-//! * [`pb`] — prost types generated from `protos/ui.proto`: the `POST /rpc`
-//!   `Request`/`Response` envelope plus the `DeviceRow` card contract.
-//!   Control verbs (connect/disconnect/remove/click/poll) are typed arms;
-//!   every other channel rides `InvokeCall` — method string + JSON bytes,
-//!   the same shape the phone's own `cpbus.networking` RPC uses.
-//! * [`api`] — the typed channel arg/reply structs both ends parse.
-//! * [`ui_clicks`] — the element-click queue (contract server pushes, ui drains).
-//! * [`dispatcher`] — the Direct-mode registry: the daemon installs its
-//!   channel dispatcher at startup so the merged window can invoke
-//!   without the ui crate ever naming the daemon.
+//! * [`pb`] — prost types generated from `protos/lplus.proto`: the
+//!   `service Lplusd` rpc surface (ping, devices, connect/disconnect/
+//!   remove, identity, pairing, probes, events, status, cast/odmf/kms,
+//!   sinks/inject, screencast), each rpc's request/response messages,
+//!   and the `Frame` envelope of the loopback contract server (4-byte BE
+//!   length + one prost frame per connection). `pb::SERVICE_METHODS` —
+//!   extracted from the descriptor at build time — is the authoritative
+//!   rpc list the server's dispatch table must cover. The contract is
+//!   strictly typed: every rpc has a real protobuf response, no JSON
+//!   carriers.
+//! * [`api`] — the daemon's two persisted JSON shapes (`SettingsFile`,
+//!   `local_device_id`); the contract itself carries no JSON.
+//! * the process-global event ring ([`push_device_event`],
+//!   [`push_log_event`], [`push_bus_event`] → [`take_events`]), drained
+//!   by the `PollEvents` rpc.
 //!
 //! No sockets, no tokio, no daemon state.
 
@@ -18,67 +23,113 @@ pub mod api;
 pub mod live;
 
 mod pb_mod {
-    include!(concat!(env!("OUT_DIR"), "/lplus.ui.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lplus.backend.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 }
 
-/// Generated `/rpc` envelope + row contract (see `protos/ui.proto`).
+/// Generated contract surface (see `protos/lplus.proto`).
 pub mod pb {
     pub use super::pb_mod::{
-        Ack, ClickCmd, Clicks, ConnectCmd, DeviceRow, DisconnectCmd, Error, InvokeCall,
-        InvokeResult, PollClicks, RemoveDeviceCmd, Request, Response, request, response,
+        Ack, BusEvent, CastPushRequest, CastPushResult, CloudBindResult, ConnectCmd, Device,
+        DeviceEvent, Devices, DisconnectCmd, EnsureRunningRequest, EnsureRunningResult, Event,
+        Events, FileInfo, Frame, FrameReply, GetCloudBindRequest, GetHostNameRequest,
+        GetLocalDeviceIdRequest, GetPairedDevicesRequest, HostName, InjectFrameRequest,
+        KmsBootstrapRequest, ListDevicesRequest, LocalDeviceId, LogEvent, LplusStatus, OdmfInfo,
+        OdmfStartRequest, OdmfStartResult, PairEntry, PairedDevices, PingRequest,
+        PollEventsRequest, Pong, RemoveDeviceCmd, RemoveDeviceResult, RequestLiveRequest, RtspInfo,
+        SERVICE_METHODS, SetHostNameCmd, SetHostNameResult, SidecarLane, SidecarStatusRequest,
+        SinkListRequest, SinkRoster, StatusRequest, TakeFrameRequest, event,
     };
 }
 
-// ------------------------------------------------------------- ui clicks --
+// ---------------------------------------------------------------- events --
 
+use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 
-static UI_CLICKS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(Mutex::default);
+use pb::{BusEvent, DeviceEvent, Event, LogEvent, event};
 
-fn clicks() -> &'static Mutex<Vec<String>> {
-    &UI_CLICKS
+/// Event ring capacity; older happenings are dropped first.
+pub const EVENT_RING: usize = 512;
+
+static EVENTS: LazyLock<Mutex<(u64, VecDeque<Event>)>> = LazyLock::new(Mutex::default);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-/// Queue one element id for the window (contract-server `Click` frame).
-pub fn push_ui_click(id: impl Into<String>) {
-    if let Ok(mut q) = clicks().lock() {
-        q.push(id.into());
+/// Queue one daemon happening; stampers own the sequence and clock.
+fn push(body: event::Body) {
+    if let Ok(mut g) = EVENTS.lock() {
+        g.0 += 1;
+        let seq = g.0;
+        g.1.push_back(Event {
+            seq,
+            ts_ms: now_ms(),
+            body: Some(body),
+        });
+        while g.1.len() > EVENT_RING {
+            g.1.pop_front();
+        }
     }
 }
 
-/// UI presence tick: drain every queued element id (Direct mode shares
-/// this process-global queue; served mode goes through `/rpc PollClicks`).
-pub fn take_ui_clicks() -> Vec<String> {
-    clicks()
+/// Lane presence change (`lane`: epi|kms|sdp). Producer: `sdpd::emit_device`.
+pub fn push_device_event(lane: &str, ip: &str, name: Option<&str>, connected: bool) {
+    push(event::Body::Device(DeviceEvent {
+        lane: lane.to_string(),
+        ip: ip.to_string(),
+        name: name.unwrap_or_default().to_string(),
+        connected,
+    }));
+}
+
+/// Mirrored console line. Producer: the renderer console bridge.
+pub fn push_log_event(level: &str, text: &str) {
+    push(event::Body::Log(LogEvent {
+        level: level.to_string(),
+        text: text.to_string(),
+    }));
+}
+
+/// Renderer-bus reply (`ok` = a route handled the event name).
+/// Producer: the channel dispatcher's bus arm.
+pub fn push_bus_event(name: &str, ok: bool) {
+    push(event::Body::Bus(BusEvent {
+        name: name.to_string(),
+        ok,
+    }));
+}
+
+/// Drain events with `seq > since_seq`, keeping the newest `limit`
+/// (0 = everything retained). Returns `(next_seq, events)`; feed
+/// `next_seq` back as `since_seq`. A `since_seq` older than the ring
+/// yields the retained tail.
+pub fn take_events(since_seq: u64, limit: u32) -> (u64, Vec<Event>) {
+    EVENTS
         .lock()
-        .map(|mut q| std::mem::take(&mut *q))
-        .unwrap_or_default()
-}
-
-// ------------------------------------------------------------- dispatcher --
-
-/// Channel dispatcher entry (`lplusd::gui::ipc::dispatch`).
-pub type Dispatcher = fn(&str, serde_json::Value) -> serde_json::Value;
-
-static DISPATCHER: LazyLock<Mutex<Option<Dispatcher>>> = LazyLock::new(Mutex::default);
-
-fn slot() -> &'static Mutex<Option<Dispatcher>> {
-    &DISPATCHER
-}
-
-/// Daemon startup (Direct mode): publish the in-process dispatcher;
-/// returns the previous registration.
-pub fn install_dispatcher(d: Dispatcher) -> Option<Dispatcher> {
-    slot().lock().ok().and_then(|mut s| s.replace(d))
-}
-
-/// UI Direct transport: run a channel through the installed dispatcher;
-/// `None` when no daemon registered one (window is Attach-only).
-pub fn dispatch(name: &str, args: serde_json::Value) -> Option<serde_json::Value> {
-    slot()
-        .lock()
-        .ok()
-        .and_then(|s| s.as_ref().map(|f| f(name, args)))
+        .map(|g| {
+            let cap = if limit == 0 {
+                usize::MAX
+            } else {
+                limit as usize
+            };
+            let evs: Vec<Event> =
+                g.1.iter()
+                    .filter(|e| e.seq > since_seq)
+                    .rev()
+                    .take(cap)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .cloned()
+                    .collect();
+            (g.0, evs)
+        })
+        .unwrap_or((since_seq, Vec::new()))
 }
 
 #[cfg(test)]
@@ -87,8 +138,8 @@ mod tests {
     use prost::Message as _;
 
     #[test]
-    fn device_row_json_keeps_camel_case_and_vendor_typo() {
-        let row = pb::DeviceRow {
+    fn device_json_keeps_camel_case_and_vendor_typo() {
+        let row = pb::Device {
             device_id: "d1".into(),
             device_name: "Phone".into(),
             ip: "192.0.2.7".into(),
@@ -112,68 +163,70 @@ mod tests {
         assert_eq!(v["protcol_device_id"], "p1");
         assert_eq!(v["lastSeen"], 1);
         assert_eq!(v["lastSession"], 2);
-        let back: pb::DeviceRow = serde_json::from_value(v).expect("deserialize");
+        let back: pb::Device = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, row);
     }
 
     #[test]
-    fn request_response_oneofs_round_trip_over_prost() {
-        let req = pb::Request {
-            call: Some(pb::request::Call::Connect(pb::ConnectCmd {
+    fn frame_envelope_round_trips_and_methods_are_extracted() {
+        let req = pb::Frame {
+            method: "lplus.backend.v1.Lplusd/Connect".into(),
+            error: String::new(),
+            payload: pb::ConnectCmd {
                 ip: "192.0.2.7".into(),
-            })),
+            }
+            .encode_to_vec(),
         };
         let bytes = req.encode_to_vec();
-        assert_eq!(pb::Request::decode(&bytes[..]).expect("decode"), req);
+        let back = pb::Frame::decode(&bytes[..]).expect("decode");
+        assert_eq!(back, req);
+        assert_eq!(
+            pb::ConnectCmd::decode(&back.payload[..]).expect("inner").ip,
+            "192.0.2.7"
+        );
 
-        let invoke = pb::Request {
-            call: Some(pb::request::Call::Invoke(pb::InvokeCall {
-                method: "paired_devices".into(),
-                payload: br#"{}"#.to_vec(),
-            })),
-        };
-        let bytes = invoke.encode_to_vec();
-        assert_eq!(pb::Request::decode(&bytes[..]).expect("decode"), invoke);
-
-        let res = pb::Response {
-            res: Some(pb::response::Res::Ack(pb::Ack {
-                ok: true,
-                ip: Some("192.0.2.7".into()),
-                error: None,
-                code_success: Some(true),
-            })),
-        };
-        let bytes = res.encode_to_vec();
-        assert_eq!(pb::Response::decode(&bytes[..]).expect("decode"), res);
+        assert!(pb::SERVICE_METHODS.contains(&"lplus.backend.v1.Lplusd/Ping"));
+        assert!(
+            pb::SERVICE_METHODS
+                .iter()
+                .all(|m| m.starts_with("lplus.backend.v1.Lplusd/"))
+        );
+        assert!(pb::SERVICE_METHODS.contains(&"lplus.backend.v1.Lplusd/GetHostName"));
+        assert_eq!(pb::SERVICE_METHODS.len(), 21);
     }
 
     #[test]
-    fn ui_click_queue_is_fifo_and_drains_once() {
-        // Other tests may interleave: assert relative behaviour, not emptiness.
-        let base = take_ui_clicks().len();
-        push_ui_click("card-disconnect:192-0-2-100");
-        push_ui_click("confirm");
-        let taken = take_ui_clicks();
-        assert_eq!(taken.len(), base + 2);
-        assert_eq!(taken[taken.len() - 2], "card-disconnect:192-0-2-100");
-        assert_eq!(taken[taken.len() - 1], "confirm");
-        assert!(take_ui_clicks().is_empty() || true); // drained or other-test noise
-    }
+    fn event_ring_sequences_filters_and_trims() {
+        let marker = format!("ring-probe-{}", std::process::id());
+        let (base, _) = take_events(0, 0);
+        for i in 0..3 {
+            push_log_event("info", &format!("{marker}-{i}"));
+        }
+        let (next, evs) = take_events(base, 0);
+        assert_eq!(next, base + 3, "sequence advances per push");
+        let mine: Vec<&Event> = evs
+            .iter()
+            .filter(|e| {
+                matches!(&e.body,
+                Some(pb::event::Body::Log(l)) if l.text.starts_with(&marker))
+            })
+            .collect();
+        assert_eq!(mine.len(), 3);
+        assert!(
+            mine.windows(2).all(|w| w[0].seq < w[1].seq),
+            "ascending seq"
+        );
 
-    #[test]
-    fn dispatcher_install_call_and_remove() {
-        let prev =
-            install_dispatcher(|name, args| serde_json::json!({"channel": name, "echo": args}));
-        let out =
-            dispatch("device_action", serde_json::json!({"ip": "192.0.2.9"})).expect("installed");
-        assert_eq!(out["channel"], "device_action");
-        assert_eq!(out["echo"]["ip"], "192.0.2.9");
-        install_dispatcher(prev.unwrap_or(|_, _| serde_json::Value::Null));
-        let _ = install_dispatcher(prev.unwrap_or_else(|| {
-            fn none(_: &str, _: serde_json::Value) -> serde_json::Value {
-                serde_json::Value::Null
-            }
-            none
-        }));
+        // since_seq filters the tail; limit caps to the newest.
+        let since = mine[1].seq - 1;
+        let (_, evs) = take_events(since, 0);
+        assert!(evs.iter().all(|e| e.seq > since));
+        let (_, capped) = take_events(base, 2);
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[1].seq, next);
+
+        // The ring stays bounded no matter how many pushes happened.
+        let (_, all) = take_events(0, 0);
+        assert!(all.len() <= EVENT_RING);
     }
 }

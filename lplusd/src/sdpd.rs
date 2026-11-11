@@ -107,24 +107,12 @@ pub fn default_vip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".into())
 }
 
-/// The machine's own name: Linux kernel hostname, `/etc/hostname`, or
-/// the Windows/Node-style env vars, in that order.
+/// The machine's own name (cross-platform, via `whoami`).
 pub fn system_hostname() -> Option<String> {
-    let from_file = |p: &str| -> Option<String> {
-        std::fs::read_to_string(p)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    from_file("/proc/sys/kernel/hostname")
-        .or_else(|| from_file("/etc/hostname"))
-        .or_else(|| {
-            std::env::var("COMPUTERNAME")
-                .or_else(|_| std::env::var("NODENAME"))
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
+    whoami::hostname()
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// First line of an sdp/1 datagram: e.g. `QUERY * HTTP/1.1`.
@@ -856,6 +844,7 @@ pub(crate) fn emit_device(kind: &'static str, ip: String, name: Option<String>, 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+    lplus_ipc::push_device_event(kind, &ip, name.as_deref(), connected);
     let _ = DEVICE_TX.send(DeviceEvent {
         kind,
         ip,
@@ -1069,14 +1058,7 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
         //  entry{0b 01 fd | mac6 LE | 0*8} entry{0b 01 fc | ip4 LE 0*2 0*6}
         //  entry{01 fc | gw-ish 6B}` with our identity substituted.
         let link_reply: Vec<u8> = link_pub_bytes.clone().unwrap_or_else(|| {
-            let mac = std::env::var("LINK_MAC")
-                .ok()
-                .or_else(|| {
-                    std::fs::read_to_string("/sys/class/net/eth0/address")
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                })
-                .unwrap_or_else(|| "aa:bb:cc:dd:ee:ff".into());
+            let mac = link_mac_spec();
             let mut macb: Vec<u8> = mac
                 .split(':')
                 .map(|h| u8::from_str_radix(h, 16).unwrap_or(0))
@@ -1119,14 +1101,7 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
         let mut pdid12 = [b'0'; 12];
         let pdid_s = format!("{:0<12}", cfg.pdid).to_uppercase();
         pdid12.copy_from_slice(&pdid_s.as_bytes()[..12]);
-        let mac_spec = std::env::var("LINK_MAC")
-            .ok()
-            .or_else(|| {
-                std::fs::read_to_string("/sys/class/net/eth0/address")
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            })
-            .unwrap_or_else(|| "aa:bb:cc:dd:ee:ff".into());
+        let mac_spec = link_mac_spec();
         let mut mac6 = [0u8; 6];
         for (i, h) in mac_spec.split(':').take(6).enumerate() {
             mac6[i] = u8::from_str_radix(h, 16).unwrap_or(0);
@@ -3306,17 +3281,41 @@ fn bincode_str(s: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// Identity MAC for link frames: `LINK_MAC`, else `eth0`, else synthetic.
+/// Identity MAC for link frames: the first physical NIC's sysfs address,
+/// else any non-loopback interface with a plausible MAC, else synthetic.
 fn link_mac_spec() -> String {
-    std::env::var("LINK_MAC")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/sys/class/net/eth0/address")
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "aa:bb:cc:dd:ee:ff".into())
+    let valid = |mac: &str| {
+        mac.len() == 17
+            && mac.bytes().all(|b| b == b':' || b.is_ascii_hexdigit())
+            && mac != "00:00:00:00:00:00"
+    };
+    let mac_of = |name: &str| -> Option<String> {
+        std::fs::read_to_string(format!("/sys/class/net/{name}/address"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|m| valid(m))
+    };
+    if let Ok(ifaces) = std::fs::read_dir("/sys/class/net") {
+        let mut names: Vec<String> = ifaces
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n != "lo")
+            .collect();
+        names.sort();
+        // Physical NICs (have a `device` link) win over virtual ones.
+        for pass in [true, false] {
+            for name in &names {
+                let physical =
+                    std::fs::symlink_metadata(format!("/sys/class/net/{name}/device")).is_ok();
+                if physical == pass
+                    && let Some(mac) = mac_of(name)
+                {
+                    return mac;
+                }
+            }
+        }
+    }
+    "aa:bb:cc:dd:ee:ff".into()
 }
 
 /// Gateway string derived from the VIP's first three octets.

@@ -1,27 +1,51 @@
-//! Loopback contract server: the attach-mode lane of the unified binary.
+//! Loopback contract server: the machine-facing lane of the daemon.
 //!
 //! One TCP listener on `127.0.0.1:1421` (ephemeral fallback); every
-//! connection carries exactly one frame — a 4-byte big-endian length and a
-//! prost [`lplus_ipc::pb::Request`], answered with the matching
-//! `Response` — the same framing the phone lanes use. The GPUI window in
-//! Direct mode calls `ipc::dispatch` through the `lplus-ipc` dispatcher
-//! registry; a window attached to a remote daemon speaks these frames.
-//!
-//! Control verbs (connect / disconnect / remove / click / poll) are typed
-//! arms landing on the daemon API lanes; everything else rides `Invoke`
-//! into the *same* `ipc::dispatch` the in-process UI calls — unknown
-//! channels answer `{ok:false,__unhandled}`, never a crash.
+//! connection carries exactly one frame — a 4-byte big-endian length and
+//! a prost [`lplus_ipc::pb::Frame`] — answered with one reply frame.
+//! `Frame.method` selects an rpc of `service Lplusd`
+//! (`ipc/protos/lplus.proto`); the payload is the rpc's request message
+//! and the reply's payload its response message (or `Frame.error`).
+//! The contract is strictly typed: each handler converts the daemon's
+//! internal channel shapes (`lplus_ipc::api`) into protobuf at this
+//! boundary — no JSON crosses. The dispatch table is test-enforced
+//! complete against the descriptor-extracted `pb::SERVICE_METHODS`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
-use lplus_ipc::pb::{Ack, Clicks, InvokeResult, Request, Response, request::Call, response::Res};
+use image::ImageEncoder as _;
+use lplus_ipc::pb::{self, Frame};
 use prost::Message as _;
-use serde_json::Value;
 
 /// Frame size cap, matching the phone-lane readers.
 const MAX_FRAME: usize = 4 * 1024 * 1024;
+
+/// gRPC-style full names, one per rpc of `service Lplusd`.
+mod m {
+    pub const PING: &str = "lplus.backend.v1.Lplusd/Ping";
+    pub const LIST_DEVICES: &str = "lplus.backend.v1.Lplusd/ListDevices";
+    pub const CONNECT: &str = "lplus.backend.v1.Lplusd/Connect";
+    pub const DISCONNECT: &str = "lplus.backend.v1.Lplusd/Disconnect";
+    pub const REMOVE_DEVICE: &str = "lplus.backend.v1.Lplusd/RemoveDevice";
+    pub const GET_HOST_NAME: &str = "lplus.backend.v1.Lplusd/GetHostName";
+    pub const SET_HOST_NAME: &str = "lplus.backend.v1.Lplusd/SetHostName";
+    pub const GET_PAIRED_DEVICES: &str = "lplus.backend.v1.Lplusd/GetPairedDevices";
+    pub const GET_LOCAL_DEVICE_ID: &str = "lplus.backend.v1.Lplusd/GetLocalDeviceId";
+    pub const ENSURE_RUNNING: &str = "lplus.backend.v1.Lplusd/EnsureRunning";
+    pub const GET_CLOUD_BIND: &str = "lplus.backend.v1.Lplusd/GetCloudBind";
+    pub const SIDECAR_STATUS: &str = "lplus.backend.v1.Lplusd/SidecarStatus";
+    pub const POLL_EVENTS: &str = "lplus.backend.v1.Lplusd/PollEvents";
+    pub const STATUS: &str = "lplus.backend.v1.Lplusd/Status";
+    pub const CAST_PUSH: &str = "lplus.backend.v1.Lplusd/CastPush";
+    pub const ODMF_START: &str = "lplus.backend.v1.Lplusd/OdmfStart";
+    pub const KMS_BOOTSTRAP: &str = "lplus.backend.v1.Lplusd/KmsBootstrap";
+    pub const SINK_LIST: &str = "lplus.backend.v1.Lplusd/SinkList";
+    pub const INJECT_FRAME: &str = "lplus.backend.v1.Lplusd/InjectFrame";
+    pub const REQUEST_LIVE: &str = "lplus.backend.v1.Lplusd/RequestLive";
+    pub const TAKE_FRAME: &str = "lplus.backend.v1.Lplusd/TakeFrame";
+}
 
 fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>> {
     let mut head = [0u8; 4];
@@ -48,73 +72,159 @@ fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
     stream.flush()
 }
 
-/// Decode one prost `Request`, run its arm, and encode the `Response` —
-/// the attach-mode twin of the in-process bridge.
-fn rpc_reply(body: &[u8]) -> Vec<u8> {
-    fn ack(ok: bool, ip: Option<String>, error: Option<String>) -> Response {
-        Response {
-            res: Some(Res::Ack(Ack {
-                ok,
-                ip,
-                error,
-                code_success: None,
-            })),
-        }
-    }
+fn decode<T: prost::Message + Default>(method: &str, payload: &[u8]) -> Result<T, String> {
+    T::decode(payload).map_err(|e| format!("decode {method}: {e}"))
+}
 
-    let req = match Request::decode(body) {
+fn ack(ok: bool, ip: Option<String>, error: Option<String>) -> Vec<u8> {
+    pb::Ack { ok, ip, error }.encode_to_vec()
+}
+
+/// Encode one queued screencast frame as JPEG (the image lane ships
+/// 8-bit colour only).
+fn take_frame_payload() -> Result<Vec<u8>, String> {
+    let img = lplus_ipc::live::take_frame().ok_or_else(|| "no frame".to_string())?;
+    let (width, height) = (img.width(), img.height());
+    let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+    let mut buf = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80)
+        .write_image(rgb.as_raw(), width, height, image::ExtendedColorType::Rgb8)
+        .map_err(|e| format!("frame encode: {e}"))?;
+    Ok(pb::FrameReply {
+        width,
+        height,
+        seq: lplus_ipc::live::produced() as u64,
+        format: "jpeg".into(),
+        image: buf,
+    }
+    .encode_to_vec())
+}
+
+/// Run one rpc; `Err(message)` becomes `Frame.error` on the reply.
+fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    use crate::gui::{api, cast};
+    match method {
+        m::PING => Ok(pb::Pong {
+            version: env!("CARGO_PKG_VERSION").into(),
+            backend_up: crate::gui::backend_up(),
+        }
+        .encode_to_vec()),
+        m::LIST_DEVICES => Ok(pb::Devices {
+            devices: api::visible_rows(),
+        }
+        .encode_to_vec()),
+        m::CONNECT => {
+            let c = decode::<pb::ConnectCmd>(method, payload)?;
+            let act = api::device_action(true, &c.ip);
+            Ok(act.encode_to_vec())
+        }
+        m::DISCONNECT => {
+            let c = decode::<pb::DisconnectCmd>(method, payload)?;
+            let act = api::device_action(false, &c.ip);
+            Ok(act.encode_to_vec())
+        }
+        m::REMOVE_DEVICE => {
+            let c = decode::<pb::RemoveDeviceCmd>(method, payload)?;
+            // `remove_state_dir` is accepted for contract stability; the
+            // daemon keeps pairing material in one state dir today.
+            let _ = c.remove_state_dir;
+            Ok(pb::RemoveDeviceResult {
+                ok: crate::gui::devices::remove_device(&c.device_id),
+                device_id: c.device_id,
+            }
+            .encode_to_vec())
+        }
+        m::GET_HOST_NAME => Ok(pb::HostName {
+            host_name: crate::gui::ipc::host_name(),
+        }
+        .encode_to_vec()),
+        m::SET_HOST_NAME => {
+            let c = decode::<pb::SetHostNameCmd>(method, payload)?;
+            Ok(api::set_host_name(&c.name).encode_to_vec())
+        }
+        m::GET_PAIRED_DEVICES => Ok(api::paired_devices().encode_to_vec()),
+        m::GET_LOCAL_DEVICE_ID => Ok(pb::LocalDeviceId {
+            device_id: lplus_ipc::api::local_device_id(),
+        }
+        .encode_to_vec()),
+        m::ENSURE_RUNNING => Ok(pb::EnsureRunningResult {
+            ok: true,
+            status: "idle".into(),
+        }
+        .encode_to_vec()),
+        // No cloud lane yet: bound=false is the whole story.
+        m::GET_CLOUD_BIND => Ok(pb::CloudBindResult {
+            ok: true,
+            bound: false,
+        }
+        .encode_to_vec()),
+        m::SIDECAR_STATUS => Ok(api::sidecar_status().encode_to_vec()),
+        m::POLL_EVENTS => {
+            let p = decode::<pb::PollEventsRequest>(method, payload)?;
+            let (next_seq, events) = lplus_ipc::take_events(p.since_seq, p.limit);
+            Ok(pb::Events { next_seq, events }.encode_to_vec())
+        }
+        m::STATUS => Ok(cast::status().encode_to_vec()),
+        m::CAST_PUSH => {
+            let c = decode::<pb::CastPushRequest>(method, payload)?;
+            Ok(cast::cast_push(&c.key, &c.value).encode_to_vec())
+        }
+        m::ODMF_START => Ok(cast::odmf_start().encode_to_vec()),
+        m::KMS_BOOTSTRAP => {
+            let c = decode::<pb::KmsBootstrapRequest>(method, payload)?;
+            let act = api::kms_bootstrap(&c.ip);
+            Ok(act.encode_to_vec())
+        }
+        m::SINK_LIST => Ok(pb::SinkRoster {
+            keys: crate::sdpd::EPI_SINKS
+                .blocking_lock()
+                .keys()
+                .cloned()
+                .collect(),
+        }
+        .encode_to_vec()),
+        m::INJECT_FRAME => {
+            let c = decode::<pb::InjectFrameRequest>(method, payload)?;
+            let bytes = hex::decode(c.hex.trim()).map_err(|e| format!("bad hex: {e}"))?;
+            let queued = crate::sdpd::send_command(crate::sdpd::Command::SendFrame {
+                key_substr: c.key_substr,
+                hex: hex::encode(bytes),
+            });
+            Ok(ack(queued, None, None))
+        }
+        m::REQUEST_LIVE => Ok(ack(lplus_ipc::live::request_native(), None, None)),
+        m::TAKE_FRAME => take_frame_payload(),
+        other => Err(format!("unknown method: {other}")),
+    }
+}
+
+/// Decode one request frame, run its rpc, and encode the reply frame.
+fn rpc_reply(body: &[u8]) -> Vec<u8> {
+    let req = match Frame::decode(body) {
         Ok(req) => req,
         Err(e) => {
-            tracing::warn!("[rpc] undecodable request: {e}");
-            return Response {
-                res: Some(Res::Error(lplus_ipc::pb::Error {
-                    message: format!("decode: {e}"),
-                })),
+            tracing::warn!("[contract] undecodable frame: {e}");
+            return Frame {
+                method: String::new(),
+                error: format!("decode: {e}"),
+                payload: Vec::new(),
             }
             .encode_to_vec();
         }
     };
-    let reply = match req.call {
-        Some(Call::Connect(c)) => {
-            let act = crate::gui::api::device_action(true, &c.ip);
-            ack(act.ok, Some(act.ip), act.error)
+    let (error, payload) = match handle_method(&req.method, &req.payload) {
+        Ok(payload) => (String::new(), payload),
+        Err(error) => {
+            tracing::warn!("[contract] {} failed: {error}", req.method);
+            (error, Vec::new())
         }
-        Some(Call::Disconnect(c)) => {
-            let act = crate::gui::api::device_action(false, &c.ip);
-            ack(act.ok, Some(act.ip), act.error)
-        }
-        Some(Call::RemoveDevice(c)) => {
-            let resp = crate::gui::api::remove_device(&lplus_ipc::api::RemoveDeviceArgs {
-                device_id: c.device_id,
-                remove_state_dir: false,
-            });
-            ack(resp.ok, None, None)
-        }
-        Some(Call::Click(c)) => {
-            lplus_ipc::push_ui_click(c.id);
-            ack(true, None, None)
-        }
-        Some(Call::PollClicks(_)) => Response {
-            res: Some(Res::Clicks(Clicks {
-                ids: lplus_ipc::take_ui_clicks(),
-            })),
-        },
-        Some(Call::Invoke(inv)) => {
-            let args = serde_json::from_slice(&inv.payload).unwrap_or(Value::Null);
-            let json = crate::gui::ipc::dispatch(&inv.method, args);
-            Response {
-                res: Some(Res::InvokeResult(InvokeResult {
-                    json: serde_json::to_vec(&json).unwrap_or_else(|_| b"null".to_vec()),
-                })),
-            }
-        }
-        None => Response {
-            res: Some(Res::Error(lplus_ipc::pb::Error {
-                message: "empty request".into(),
-            })),
-        },
     };
-    reply.encode_to_vec()
+    Frame {
+        method: req.method,
+        error,
+        payload,
+    }
+    .encode_to_vec()
 }
 
 fn handle(stream: &mut TcpStream) -> std::io::Result<()> {
@@ -129,7 +239,7 @@ fn handle(stream: &mut TcpStream) -> std::io::Result<()> {
 pub fn spawn() -> Result<u16, String> {
     let listener = TcpListener::bind(("127.0.0.1", 1421))
         .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
-        .map_err(|e| format!("bind seam rpc: {e}"))?;
+        .map_err(|e| format!("bind contract server: {e}"))?;
     serve_on(listener)
 }
 
@@ -139,13 +249,13 @@ fn serve_on(listener: TcpListener) -> Result<u16, String> {
         .map_err(|e| format!("local_addr: {e}"))?
         .port();
     thread::Builder::new()
-        .name("seam-rpc".into())
+        .name("contract-rpc".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
                 // One thread per connection; a stalled client must not
-                // starve the window's ticks.
+                // starve other lanes' ticks.
                 let _ = thread::Builder::new()
-                    .name("seam-rpc-conn".into())
+                    .name("contract-rpc-conn".into())
                     .spawn(move || {
                         let mut stream = stream;
                         // Client disconnects mid-frame are the normal end
@@ -154,7 +264,7 @@ fn serve_on(listener: TcpListener) -> Result<u16, String> {
                     });
             }
         })
-        .map_err(|e| format!("spawn seam rpc thread: {e}"))?;
+        .map_err(|e| format!("spawn contract server thread: {e}"))?;
     Ok(port)
 }
 
@@ -162,43 +272,39 @@ fn serve_on(listener: TcpListener) -> Result<u16, String> {
 mod tests {
     use std::io::{Read, Write};
 
-    use lplus_ipc::pb;
+    use lplus_ipc::pb::{self, Frame};
     use prost::Message as _;
 
-    fn rpc_round(port: u16, req: &pb::Request) -> pb::Response {
+    use super::m;
+
+    /// One request/response round trip on the frame socket.
+    fn call(port: u16, method: &str, payload: &[u8]) -> Frame {
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         s.set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .expect("timeout");
-        let body = req.encode_to_vec();
+        let req = Frame {
+            method: method.into(),
+            error: String::new(),
+            payload: payload.to_vec(),
+        }
+        .encode_to_vec();
         let mut frame = Vec::new();
-        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&body);
+        frame.extend_from_slice(&(req.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&req);
         s.write_all(&frame).expect("send");
         let mut head = [0u8; 4];
         s.read_exact(&mut head).expect("read head");
         let len = u32::from_be_bytes(head) as usize;
         let mut payload = vec![0u8; len];
         s.read_exact(&mut payload).expect("read body");
-        pb::Response::decode(&payload[..]).expect("decode response")
+        Frame::decode(&payload[..]).expect("decode reply")
     }
 
-    fn invoke(method: &str, args: serde_json::Value) -> pb::Request {
-        pb::Request {
-            call: Some(pb::request::Call::Invoke(pb::InvokeCall {
-                method: method.into(),
-                payload: serde_json::to_vec(&args).expect("args"),
-            })),
-        }
-    }
-
-    fn invoke_json(port: u16, method: &str, args: serde_json::Value) -> serde_json::Value {
-        let res = rpc_round(port, &invoke(method, args)).res;
-        match res {
-            Some(pb::response::Res::InvokeResult(r)) => {
-                serde_json::from_slice(&r.json).expect("invoke json")
-            }
-            other => panic!("expected InvokeResult, got {other:?}"),
-        }
+    fn ok(port: u16, method: &str, payload: &[u8]) -> Vec<u8> {
+        let reply = call(port, method, payload);
+        assert!(reply.error.is_empty(), "{}: {}", method, reply.error);
+        assert_eq!(reply.method, method);
+        reply.payload
     }
 
     fn serve() -> u16 {
@@ -209,87 +315,247 @@ mod tests {
     }
 
     #[test]
-    fn invoke_dispatches_known_channel() {
-        let port = serve();
-        let v = invoke_json(
-            port,
-            "ipc_invoke",
-            serde_json::json!({"channel": "settings_get_host_name", "payload": null}),
-        );
-        assert!(v.to_string().contains("linux-panel"), "{v}");
+    fn dispatch_table_covers_every_service_method() {
+        // The schema is the source of truth: every rpc of
+        // `service Lplusd` must be dispatched (empty payloads exercise
+        // the arm without needing live state).
+        for method in pb::SERVICE_METHODS {
+            let (error, _) = call_probe(method);
+            assert!(
+                !error.contains("unknown method"),
+                "rpc {method} missing from the dispatch table: {error}"
+            );
+        }
+    }
+
+    /// In-process dispatch probe (no socket needed).
+    fn call_probe(method: &str) -> (String, Vec<u8>) {
+        match super::handle_method(method, &[]) {
+            Ok(payload) => (String::new(), payload),
+            Err(error) => (error, Vec::new()),
+        }
     }
 
     #[test]
-    fn invoke_unhandled_channel_is_typed() {
+    fn ping_pong_reports_version() {
         let port = serve();
-        let v = invoke_json(
-            port,
-            "ipc_invoke",
-            serde_json::json!({"channel": "totally_unhandled_chan_zzz"}),
+        let pong = pb::Pong::decode(&ok(port, m::PING, &[])[..]).expect("pong");
+        assert_eq!(pong.version, env!("CARGO_PKG_VERSION"));
+        // The descriptor list and the dispatch table agree on spellings.
+        assert!(pb::SERVICE_METHODS.contains(&m::PING));
+    }
+
+    #[test]
+    fn list_devices_answers_with_the_device_model() {
+        let port = serve();
+        pb::Devices::decode(&ok(port, m::LIST_DEVICES, &[])[..]).expect("devices");
+    }
+
+    #[test]
+    fn poll_events_drains_the_presence_ring() {
+        let port = serve();
+        crate::sdpd::emit_device(
+            "epi",
+            "192.0.2.210".into(),
+            Some("ring-probe-phone".into()),
+            true,
         );
+        let body = ok(
+            port,
+            m::POLL_EVENTS,
+            &pb::PollEventsRequest {
+                since_seq: 0,
+                limit: 0,
+            }
+            .encode_to_vec(),
+        );
+        let events = pb::Events::decode(&body[..]).expect("events");
+        assert!(
+            events.events.iter().any(|ev| matches!(
+                &ev.body,
+                Some(pb::event::Body::Device(d))
+                    if d.lane == "epi"
+                        && d.ip == "192.0.2.210"
+                        && d.name == "ring-probe-phone"
+                        && d.connected
+            )),
+            "presence event missing from ring"
+        );
+        assert!(events.next_seq >= events.events.iter().map(|ev| ev.seq).max().unwrap_or(0));
+    }
+
+    #[test]
+    fn status_rpc_answers_fully_typed() {
+        let port = serve();
+        let st = pb::LplusStatus::decode(&ok(port, m::STATUS, &[])[..]).expect("status");
+        assert!(st.ok);
+        // Message-valued fields must be populated, not silently absent.
+        let odmf = st.odmf.expect("odmf lane info");
+        odmf.session_bin.expect("session_bin");
+        odmf.video.expect("video");
+        st.rtsp.expect("rtsp info");
+    }
+
+    #[test]
+    fn connect_rpc_without_ip_is_rejected_as_ack() {
+        let port = serve();
+        let ack = pb::Ack::decode(
+            &ok(
+                port,
+                m::CONNECT,
+                &pb::ConnectCmd { ip: String::new() }.encode_to_vec(),
+            )[..],
+        )
+        .expect("ack");
+        assert!(!ack.ok);
+        assert_eq!(ack.error.as_deref(), Some("missing ip"));
+    }
+
+    #[test]
+    fn remove_device_rpc_echoes_the_identity() {
+        let port = serve();
+        let r = pb::RemoveDeviceResult::decode(
+            &ok(
+                port,
+                m::REMOVE_DEVICE,
+                &pb::RemoveDeviceCmd {
+                    device_id: "no-such-device-zzz".into(),
+                    remove_state_dir: false,
+                }
+                .encode_to_vec(),
+            )[..],
+        )
+        .expect("remove result");
+        assert_eq!(r.device_id, "no-such-device-zzz");
+    }
+
+    #[test]
+    fn identity_and_probe_rpcs_answer_typed() {
+        let port = serve();
+        let hn = pb::HostName::decode(&ok(port, m::GET_HOST_NAME, &[])[..]).expect("host name");
+        assert!(!hn.host_name.is_empty());
+
+        // Blank names are refused without touching the stored value.
+        let refusal = pb::SetHostNameResult::decode(
+            &ok(
+                port,
+                m::SET_HOST_NAME,
+                &pb::SetHostNameCmd { name: "  ".into() }.encode_to_vec(),
+            )[..],
+        )
+        .expect("set-host-name result");
+        assert!(!refusal.ok);
+        assert!(refusal.error.is_some(), "{refusal:?}");
+
+        let paired =
+            pb::PairedDevices::decode(&ok(port, m::GET_PAIRED_DEVICES, &[])[..]).expect("paired");
+        assert!(paired.ok);
+
+        let id = pb::LocalDeviceId::decode(&ok(port, m::GET_LOCAL_DEVICE_ID, &[])[..])
+            .expect("agent id");
+        assert_eq!(id.device_id, lplus_ipc::api::local_device_id());
+
+        let run =
+            pb::EnsureRunningResult::decode(&ok(port, m::ENSURE_RUNNING, &[])[..]).expect("ready");
+        assert!(run.ok && !run.status.is_empty(), "{run:?}");
+
+        let bind =
+            pb::CloudBindResult::decode(&ok(port, m::GET_CLOUD_BIND, &[])[..]).expect("bind");
+        assert!(bind.ok && !bind.bound, "no cloud lane yet: {bind:?}");
+
+        pb::SidecarLane::decode(&ok(port, m::SIDECAR_STATUS, &[])[..]).expect("sidecar");
+    }
+
+    #[test]
+    fn sink_and_inject_rpcs_answer() {
+        let port = serve();
+        let roster = pb::SinkRoster::decode(&ok(port, m::SINK_LIST, &[])[..]).expect("roster");
+        let _ = roster.keys;
+        // Keep a command subscriber alive so the queue verdict is true.
+        let _rx = crate::sdpd::subscribe_commands();
+        let ack = pb::Ack::decode(
+            &ok(
+                port,
+                m::INJECT_FRAME,
+                &pb::InjectFrameRequest {
+                    key_substr: "46888".into(),
+                    hex: "deadbeef".into(),
+                }
+                .encode_to_vec(),
+            )[..],
+        )
+        .expect("ack");
+        assert!(ack.ok);
+        let reply = call(
+            port,
+            m::INJECT_FRAME,
+            &pb::InjectFrameRequest {
+                key_substr: "46888".into(),
+                hex: "zzz".into(),
+            }
+            .encode_to_vec(),
+        );
+        assert!(reply.error.contains("bad hex"), "{:?}", reply.error);
+    }
+
+    #[test]
+    fn cast_and_odmf_rpcs_report_their_lanes() {
+        let port = serve();
+        let cast = pb::CastPushResult::decode(
+            &ok(
+                port,
+                m::CAST_PUSH,
+                &pb::CastPushRequest {
+                    key: String::new(),
+                    value: "{}".into(),
+                }
+                .encode_to_vec(),
+            )[..],
+        )
+        .expect("cast push result");
+        assert!(!cast.ok, "blank key must fail typed");
+        assert!(cast.error.is_some(), "{cast:?}");
+
+        pb::OdmfStartResult::decode(&ok(port, m::ODMF_START, &[])[..]).expect("odmf result");
+    }
+
+    #[test]
+    fn screencast_rpcs_arm_and_pop_a_frame() {
+        let port = serve();
+        pb::Ack::decode(&ok(port, m::REQUEST_LIVE, &[])[..]).expect("ack");
+        // No producer in this process: typed "no frame" until one is queued.
+        let reply = call(port, m::TAKE_FRAME, &[]);
+        assert!(reply.error.contains("no frame"), "{:?}", reply.error);
+        lplus_ipc::live::push_frame(image::RgbaImage::from_pixel(
+            4,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let frame = pb::FrameReply::decode(&ok(port, m::TAKE_FRAME, &[])[..]).expect("frame reply");
         assert_eq!(
-            v["__unhandled"].as_str(),
-            Some("totally_unhandled_chan_zzz")
+            (frame.width, frame.height, frame.format.as_str()),
+            (4, 2, "jpeg")
         );
-        let v = invoke_json(port, "totally_unhandled_chan_zzz", serde_json::Value::Null);
-        assert!(v["__unhandled"].is_string(), "{v}");
+        assert!(!frame.image.is_empty());
+        assert_eq!(&frame.image[..2], &[0xff, 0xd8], "jpeg magic");
     }
 
     #[test]
-    fn connect_arm_without_ip_is_rejected_as_ack() {
+    fn unknown_method_and_garbage_payload_answer_with_error() {
         let port = serve();
-        let res = rpc_round(
-            port,
-            &pb::Request {
-                call: Some(pb::request::Call::Connect(pb::ConnectCmd {
-                    ip: String::new(),
-                })),
-            },
-        )
-        .res;
-        match res {
-            Some(pb::response::Res::Ack(ack)) => {
-                assert!(!ack.ok);
-                assert_eq!(ack.error.as_deref(), Some("missing ip"));
-            }
-            other => panic!("expected Ack, got {other:?}"),
-        }
+        let reply = call(port, "lplus.backend.v1.Lplusd/Nope", &[]);
+        assert!(reply.error.contains("unknown method"), "{:?}", reply.error);
+        let reply = call(port, m::CONNECT, b"not a prost ConnectCmd");
+        assert!(reply.error.contains("decode"), "{:?}", reply.error);
     }
 
     #[test]
-    fn click_arm_feeds_the_poll_clicks_queue() {
-        let port = serve();
-        let id = "card-more:192-0-2-100";
-        let res = rpc_round(
-            port,
-            &pb::Request {
-                call: Some(pb::request::Call::Click(pb::ClickCmd { id: id.into() })),
-            },
-        )
-        .res;
-        assert!(matches!(res, Some(pb::response::Res::Ack(a)) if a.ok));
-        let res = rpc_round(
-            port,
-            &pb::Request {
-                call: Some(pb::request::Call::PollClicks(pb::PollClicks {})),
-            },
-        )
-        .res;
-        match res {
-            Some(pb::response::Res::Clicks(clicks)) => {
-                assert!(clicks.ids.iter().any(|i| i == id), "{:?}", clicks.ids);
-            }
-            other => panic!("expected Clicks, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn garbage_frame_answers_with_error_arm() {
+    fn undecodable_frame_answers_with_error() {
         let port = serve();
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         s.set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .expect("timeout");
-        let junk = b"not a prost request";
+        let junk = b"not a prost frame";
         let mut frame = Vec::new();
         frame.extend_from_slice(&(junk.len() as u32).to_be_bytes());
         frame.extend_from_slice(junk);
@@ -298,10 +564,7 @@ mod tests {
         s.read_exact(&mut head).expect("read head");
         let mut payload = vec![0u8; u32::from_be_bytes(head) as usize];
         s.read_exact(&mut payload).expect("read body");
-        let res = pb::Response::decode(&payload[..]).expect("decode").res;
-        match res {
-            Some(pb::response::Res::Error(e)) => assert!(e.message.contains("decode"), "{e:?}"),
-            other => panic!("expected Error, got {other:?}"),
-        }
+        let reply = Frame::decode(&payload[..]).expect("decode");
+        assert!(reply.error.contains("decode"), "{reply:?}");
     }
 }

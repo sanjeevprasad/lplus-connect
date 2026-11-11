@@ -1,7 +1,7 @@
 //! L+ connect daemon: the phone-facing protocol stack and the loopback
-//! backend. The GPUI window lives in `lplus-ui`; both sides speak only
-//! through `lplus-ipc` (prost `/rpc` envelope, channel dispatcher,
-//! ui-click queue, live frame bus). The `lplus` binary wires the two.
+//! backend. Everything machine-facing speaks only `lplus-ipc` (the
+//! `protos/lplus.proto` contract served on :1421, the channel dispatcher,
+//! the event ring, the live frame bus). The `lplus` binary wires it up.
 
 pub mod ble;
 pub mod d2d;

@@ -1,0 +1,329 @@
+// L+ connect backend control-plane contract (contract server on
+// 127.0.0.1:1421).
+//
+// The `service` block is the sole API surface: one rpc per backend
+// capability, each with its own request/response message — strictly
+// typed, no JSON carriers anywhere on this wire. The transport is the
+// phone-lane framing — a 4-byte big-endian length and one prost `Frame`
+// per connection; `Frame.method` carries the full rpc name
+// (`lplus.backend.v1.Lplusd/Ping`), `Frame.payload` the request
+// message, and the reply frame's payload the response message (or
+// `Frame.error` for transport-level failures). `build.rs` extracts the
+// rpc list from the descriptor (`pb::SERVICE_METHODS`) so the server's
+// dispatch table is test-enforced complete.
+//
+// Field names mirror the daemon's typed api structs; `protcol_device_id`
+// keeps the vendor typo. The channel dispatcher's internal Value seam
+// (vendor phone JSON) never crosses into these messages — each rpc
+// handler converts at the boundary.
+syntax = "proto3";
+
+package lplus.backend.v1;
+
+// Transport envelope: one request per connection; the reply echoes
+// nothing but payload/error. Stable forever — new capabilities add
+// rpcs, never envelope fields.
+message Frame {
+  string method = 1;   // full rpc name, gRPC spelling
+  string error = 2;    // transport/dispatch failure (payload empty)
+  bytes payload = 3;   // request or response message bytes
+}
+
+// Handshake/liveness probe.
+message PingRequest {}
+
+message Pong {
+  string version = 1;    // serving binary package version
+  bool backend_up = 2;   // backend runtime alive (sdpd::run)
+}
+
+// The device wall: every discovered and connected device.
+message ListDevicesRequest {}
+
+// One device, shaped to what mydevice/devicesList consumers read
+// (the daemon's wall model, `lplusd` devices.rs).
+message Device {
+  string device_id = 1;
+  string device_name = 2;
+  string ip = 3;
+  uint32 connect_type = 4;
+  uint32 device_type = 5;
+  bool is_same_account = 6;
+  string status = 7;
+  uint64 time = 8;
+  optional string usb_serial = 9;
+  bool is_discovered = 10;
+  bool is_connected = 11;
+  bool is_paired = 12;
+  string protcol_device_id = 13;
+  uint64 last_seen = 14;
+  uint64 last_session = 15;
+}
+
+message Devices {
+  repeated Device devices = 1;
+}
+
+// Connect lane (queues sdpd Command::Connect: LAN dial + KMS bootstrap
+// + RpcFrame candidates on the live session).
+message ConnectCmd {
+  string ip = 1;
+}
+
+// Disconnect lane (queues Command::Disconnect: DISCONNECT frame on the
+// live lanes + aborts the session pumps).
+message DisconnectCmd {
+  string ip = 1;
+}
+
+// Unbind/Delete (prunes the row set, blocks stale re-mints; optionally
+// drops the per-device state dir with the stored bonds).
+message RemoveDeviceCmd {
+  string device_id = 1;
+  bool remove_state_dir = 2;
+}
+
+message RemoveDeviceResult {
+  bool ok = 1;
+  string device_id = 2;
+}
+
+// Identity lane: the advertised PC name (settings `name`/`hostName`).
+message GetHostNameRequest {}
+
+message HostName {
+  string host_name = 1;
+}
+
+message SetHostNameCmd {
+  string name = 1;
+}
+
+message SetHostNameResult {
+  bool ok = 1;
+  optional string name = 2;   // stored name on success
+  optional string error = 3;  // refusal reason (blank name)
+}
+
+// Persistent pairing bonds (scp_sync / authorized adb) plus the row
+// table copies consumers read.
+message GetPairedDevicesRequest {}
+
+message PairEntry {
+  string device_id = 1;
+  string display_name = 2;
+}
+
+message PairedDevices {
+  bool ok = 1;
+  repeated PairEntry entries = 2;
+  repeated Device devices = 3;
+  repeated Device paired_devices = 4;
+}
+
+// This PC's agent id (LPLUS_PC_DEVICE_ID, vendor default otherwise).
+message GetLocalDeviceIdRequest {}
+
+message LocalDeviceId {
+  string device_id = 1;
+}
+
+// Agent readiness probe: the daemon answers idle-ok.
+message EnsureRunningRequest {}
+
+message EnsureRunningResult {
+  bool ok = 1;
+  string status = 2;
+}
+
+// Cloud bind state: no cloud lane yet, so `bound` is the whole story.
+message GetCloudBindRequest {}
+
+message CloudBindResult {
+  bool ok = 1;
+  bool bound = 2;
+}
+
+// Presence-lane probe (logTailing is the historical lane name).
+message SidecarStatusRequest {}
+
+message SidecarLane {
+  bool running = 1;
+  string log_tailing = 2;
+}
+
+// Drain the event ring: events with seq > since_seq, newest-capped by
+// limit (0 = no cap). Stale since_seq returns the retained ring tail.
+message PollEventsRequest {
+  uint64 since_seq = 1;
+  uint32 limit = 2;
+}
+
+// Lane presence change on a named lane (epi|kms|sdp).
+message DeviceEvent {
+  string lane = 1;
+  string ip = 2;
+  string name = 3;
+  bool connected = 4;
+}
+
+// Mirrored console line from the renderer bridge.
+message LogEvent {
+  string level = 1;
+  string text = 2;
+}
+
+// Renderer-bus reply: which event answered and whether a route handled
+// it (unhandled names still reply, vendor-code_success-style).
+message BusEvent {
+  string name = 1;
+  bool ok = 2;
+}
+
+// One daemon happening — strictly one of the three kinds.
+message Event {
+  uint64 seq = 1;   // process-global ring sequence
+  int64 ts_ms = 2;  // wall clock at push time
+  oneof body {
+    DeviceEvent device = 3;
+    LogEvent log = 4;
+    BusEvent bus = 5;
+  }
+}
+
+message Events {
+  uint64 next_seq = 1;   // pass back as since_seq on the next poll
+  repeated Event events = 2;
+}
+
+// lplus_status snapshot: backend runtime, KMS listener, ODMF sink
+// readiness and RTSP target — every field typed, file facts included.
+message StatusRequest {}
+
+message FileInfo {
+  bool exists = 1;
+  uint64 size = 2;
+  optional uint64 mtime_secs = 3;
+}
+
+message OdmfInfo {
+  bool enabled = 1;
+  string listen = 2;
+  string rtp_port = 3;
+  string out_dir = 4;
+  FileInfo session_bin = 5;
+  FileInfo video = 6;
+}
+
+message RtspInfo {
+  bool enabled = 1;
+  string target = 2;
+}
+
+message LplusStatus {
+  bool ok = 1;
+  bool backend_up = 2;
+  bool kms_listening = 3;
+  OdmfInfo odmf = 4;
+  RtspInfo rtsp = 5;
+}
+
+// Push one DbsMessage key/value onto the live :46888 session (the DataBus
+// cast lane).
+message CastPushRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message CastPushResult {
+  bool ok = 1;
+  optional string key = 2;
+  optional uint64 frame_bytes = 3;
+  optional string frame_hex = 4;   // hex dump of the injected frame
+  optional bool queued = 5;        // sink accepted the push
+  optional string error = 6;
+}
+
+// Fire the two DataBus pushes that make the phone dial the ODMF sink
+// (screen mirror trigger).
+message OdmfStartRequest {}
+
+message OdmfStartResult {
+  bool ok = 1;
+  optional string id = 2;
+  optional uint32 pushes = 3;
+  repeated bool queued = 4;         // per-push acceptance
+  optional string listen = 5;
+  optional string rtp_port = 6;
+  optional string error = 7;
+}
+
+// Push the CastMessage msg_type 61 KMS bootstrap on the live :46888
+// session so the phone dials our KMS server.
+message KmsBootstrapRequest {
+  string ip = 1;
+}
+
+// Live EPI/KMS session sinks ("{port} {peer}" keys).
+message SinkListRequest {}
+
+message SinkRoster {
+  repeated string keys = 1;
+}
+
+// Inject raw hex onto every sink whose key contains the substring
+// (manual frame push onto the open session, no re-handshake).
+message InjectFrameRequest {
+  string key_substr = 1;
+  string hex = 2;
+}
+
+// Screencast lane: arm the bridge to emit one native frame, then pop
+// the newest queued frame (JPEG bytes) with its dimensions.
+message RequestLiveRequest {}
+
+message TakeFrameRequest {}
+
+message FrameReply {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint64 seq = 3;        // frames produced so far on the live bus
+  string format = 4;     // "jpeg"
+  bytes image = 5;
+}
+
+// Command acks: `error` present iff `ok` is false; `ip` echoes the
+// targeted device where the lane has one.
+message Ack {
+  bool ok = 1;
+  optional string ip = 2;
+  optional string error = 3;
+}
+
+// The backend API surface. Method names are matched verbatim by the
+// contract server; the dispatch table is test-enforced complete against
+// the descriptor-extracted `pb::SERVICE_METHODS`. There is no JSON
+// anywhere: an unknown rpc answers Frame.error, never a passthrough.
+service Lplusd {
+  rpc Ping(PingRequest) returns (Pong);
+  rpc ListDevices(ListDevicesRequest) returns (Devices);
+  rpc Connect(ConnectCmd) returns (Ack);
+  rpc Disconnect(DisconnectCmd) returns (Ack);
+  rpc RemoveDevice(RemoveDeviceCmd) returns (RemoveDeviceResult);
+  rpc GetHostName(GetHostNameRequest) returns (HostName);
+  rpc SetHostName(SetHostNameCmd) returns (SetHostNameResult);
+  rpc GetPairedDevices(GetPairedDevicesRequest) returns (PairedDevices);
+  rpc GetLocalDeviceId(GetLocalDeviceIdRequest) returns (LocalDeviceId);
+  rpc EnsureRunning(EnsureRunningRequest) returns (EnsureRunningResult);
+  rpc GetCloudBind(GetCloudBindRequest) returns (CloudBindResult);
+  rpc SidecarStatus(SidecarStatusRequest) returns (SidecarLane);
+  rpc PollEvents(PollEventsRequest) returns (Events);
+  rpc Status(StatusRequest) returns (LplusStatus);
+  rpc CastPush(CastPushRequest) returns (CastPushResult);
+  rpc OdmfStart(OdmfStartRequest) returns (OdmfStartResult);
+  rpc KmsBootstrap(KmsBootstrapRequest) returns (Ack);
+  rpc SinkList(SinkListRequest) returns (SinkRoster);
+  rpc InjectFrame(InjectFrameRequest) returns (Ack);
+  rpc RequestLive(RequestLiveRequest) returns (Ack);
+  rpc TakeFrame(TakeFrameRequest) returns (FrameReply);
+}

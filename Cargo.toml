@@ -8,11 +8,11 @@ license     = "MIT"
 # cargo-deny's allow-wildcard-paths exempt our internal path deps.
 publish     = false
 
-# Workspace layout: `ipc/` is the daemon↔ui contract (both sides depend
-# on it, neither on the other); `lplusd/` implements it (phone stack +
-# loopback backend); `ui/` consumes it (GPUI renderer). This root crate
+# Workspace layout: `ipc/` is the backend contract (the control-plane both the daemon and
+# external clients speak); `lplusd/` serves it (phone stack +
+# loopback backend); `ui/` (parked) once consumed it. This root crate
 # is only the wiring: the CLI and the product binary that starts the
-# daemon and opens the window. `proto/` is the separate phone wire.
+# daemon and serves the contract server. `proto/` is the separate phone wire.
 [workspace]
 members = [".", "proto", "ipc", "lplusd"]
 # UI wiring parked: "ui" (GPUI window member) joins the workspace again
@@ -21,13 +21,19 @@ members = [".", "proto", "ipc", "lplusd"]
 # Shared versions/features; `lplus` and `protocol` both reference these.
 [workspace.dependencies]
 anyhow     = { version = "1", default-features = false, features = ["std"] }
-prost      = { version = "0.14", default-features = false, features = ["derive", "std"] }
+# cross-platform machine identity: machine-uid (OS-native machine id)
+# and whoami (hostname); both OSV-clean, actively maintained (see member
+# Cargo.toml notes).
+machine-uid = { version = "0.6", default-features = false }
+prost       = { version = "0.14", default-features = false, features = ["derive", "std"] }
 prost-build = { version = "0.14", default-features = false }
-rtsp-types = { version = "0.1", default-features = false }
-serde      = { version = "1", default-features = false, features = ["std", "derive"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
-strum      = { version = "0.28", default-features = false, features = ["std", "derive"] }
-thiserror  = { version = "2", default-features = false, features = ["std"] }
+prost-types = { version = "0.14", default-features = false, features = ["std"] }
+rtsp-types  = { version = "0.1", default-features = false }
+serde       = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json  = { version = "1", default-features = false, features = ["std"] }
+strum       = { version = "0.28", default-features = false, features = ["std", "derive"] }
+whoami      = { version = "2", default-features = false }
+thiserror   = { version = "2", default-features = false, features = ["std"] }
 
 [features]
 default = []
@@ -40,7 +46,6 @@ anyhow             = { workspace = true }
 clap               = { version = "4", default-features = false, features = ["std", "derive", "help", "error-context"] }
 # daemon↔ui contract member (cli_tests drive its queue/dispatcher)
 lplusd             = { path = "lplusd" }
-lplus-ipc          = { path = "ipc" }
 # lplus-ui         = { path = "ui", optional = true }
 hex                = { version = "0.4", default-features = false, features = ["std"] }
 serde_json         = { workspace = true }

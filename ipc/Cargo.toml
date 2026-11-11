@@ -4,22 +4,28 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 publish    = false
-# daemon↔ui contract only: the prost `Request`/`Response` envelope and
-# `DeviceRow` come from protos/ui.proto; the typed channel arg/reply
-# structs (`api`) are the shared JSON shapes both sides parse. No
-# sockets, no tokio, no state — the ui-click queue and the Direct-mode
-# dispatcher registry are pure process-global plumbing that both members
-# may touch. Anything that reads daemon state belongs to `lplusd`.
+# backend control-plane contract only: `protos/lplus.proto` (the
+# `service Lplusd` rpc surface, its messages, the `Frame` transport
+# envelope, `DeviceRow`) is codegen'd by prost-build; the typed channel
+# arg/reply structs (`api`) are the shared JSON shapes. No sockets, no
+# tokio, no daemon state — the event ring and the dispatcher registry
+# are pure process-global plumbing. Anything that reads daemon state
+# belongs to `lplusd`.
 
 [dependencies]
 image      = { version = "0.25", default-features = false }
+# agent identity: the OS-native machine id (systemd/dbus machine-id,
+# BSD hostid, gethostuuid, MachineGuid) in one call (OSV: no advisories).
+machine-uid = { workspace = true }
 prost      = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 
 # Codegen from protos/. Requires protoc.
 [build-dependencies]
+prost       = { workspace = true }
 prost-build = { workspace = true }
+prost-types = { workspace = true }
 
 [dev-dependencies]
 prost = { workspace = true }

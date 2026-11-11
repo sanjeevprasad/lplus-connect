@@ -10,17 +10,15 @@ compile against each other:
 
 | Member | Role |
 | --- | --- |
-| `ipc/` (`lplus-ipc`) | the daemon↔ui contract: prost `Request`/`Response` (`protos/ui.proto`, served as length-prefixed frames on `127.0.0.1:1421`), `DeviceRow`, the shared channel structs (`api`), the ui-click queue, the Direct-mode dispatcher registry, the live-frame bus |
-| `lplusd/` (`lplusd`) | phone stack + loopback backend: `sdpd`, `scp/scpc/rpc`, `kms`, `odmf_pc/rtsp/wfd_sink`, `ble/d2d`, and the seam (`lplusd/src/gui/{ipc,server,devices,cast}.rs`) implementing the contract |
+| `ipc/` (`lplus-ipc`) | the backend contract: `protos/lplus.proto` — `service Lplusd` with one rpc per capability (ping, device wall, connect/disconnect/remove, identity, pairing, probes, event ring, status, cast/ODMF/KMS, sink list/inject, screencast frames), **strictly typed — no JSON carriers**, served over the `Frame{method,error,payload}` envelope as length-prefixed frames on `127.0.0.1:1421`; also `Device`, the internal channel structs (`api`, the vendor phone-JSON seam), the event ring and the live-frame bus |
+| `lplusd/` (`lplusd`) | phone stack + loopback backend: `sdpd`, `scp/scpc/rpc`, `kms`, `odmf_pc/rtsp/wfd_sink`, `ble/d2d`, and the contract implementation (`lplusd/src/gui/{ipc,server,devices,cast}.rs`) |
 | `ui/` (`lplus-ui`) | the GPUI port (screens, stores, view tree, e2e); deps on `lplus-ipc` only — never on `lplusd`. **Parked**: not a workspace member until the `gui` feature returns |
 | `.` (`lplus`) | the wiring: CLI + the product binary that starts the daemon and the contract server (`cargo run`, `daemon`, `panel`) |
 | `proto/` | the separate phone↔PC wire contract |
 
-`cargo run` starts the backend **in-process**, installs the channel
-dispatcher into `lplus-ipc`, and opens the GPUI window; the same process
-serves the contract server (length-prefixed prost frames on
-`127.0.0.1:1421`) — the attach transport for `lplus gui` and
-`--probe-transport`. The legacy
+`cargo run` starts the backend **in-process** and serves the contract
+server (length-prefixed prost frames on `127.0.0.1:1421`) — the sole
+machine-facing lane for control clients and automation. The legacy
 `loopback/pair/connect/sdpd/ble` subcommands stay for dev/CI.
 
 **Status: the GPUI port (`ui/`) is the UI — currently parked.** The root
@@ -32,11 +30,10 @@ vendored
 vuex + vue-i18n) is no longer served or booted — the in-page Electron-era
 shim (`shim.js`) was removed together with the browser path. The bundle
 stays in the tree as the behaviour reference: its `.js.map` sources drive
-the port's screens, channel names and response shapes. Electron/Node is
-replaced in Rust by the IPC channel registry (`lplusd/src/gui/ipc.rs`),
-which the GPUI window calls through the `lplus-ipc` dispatcher in-process
-and an attached window reaches through the frame socket (`lplus_ipc::pb`
-`Request`/`Response`, one frame per connection).
+the port's screens, channel names and response shapes — and the typed
+contract messages mirror those shapes. Control clients reach the daemon
+through the contract server (`lplus_ipc::pb` `Frame`, one rpc per
+connection; see §11); there is no other in-process seam.
 
 ## 1. What the Electron app is
 
@@ -74,27 +71,27 @@ were used to drive this port (call sites, response shapes, boot order).
 
 | Concern | Solution |
 |---|---|
-| `ipcMain` side | `lplusd/src/gui/ipc.rs`: registry commands; unknown channels answer `{ok:false,__unhandled}` — never a crash. The GPUI window calls `dispatch` through the `lplus-ipc` dispatcher; attached windows go through the contract server (`lplusd/src/gui/server.rs`, frame socket on 127.0.0.1:1421) |
-| Renderer bus (`ipc_main_event`) | `ipc_bus` → the process-global `GUI_BUS` (`{callbackId, code, data}` envelopes, exactly the Electron bus helper's shape); in-process subscribers only |
-| Console mirror | `console_log` IPC channel mirrors remote client logs onto the host log |
+| `ipcMain` side | the contract server (`lplusd/src/gui/server.rs`, frame socket on 127.0.0.1:1421) is the only control entry point; the webview-era channel registry in `lplusd/src/gui/ipc.rs` was cut with the parked window (the module now owns only the `settings.json` identity blob) |
+| Renderer bus (`ipc_main_event`) | the bus arm left with the window; `GUI_BUS` today carries `devices::tick` row pushes. The ring keeps its `bus`/`log` event variants in the schema (`PollEvents`) for the revived renderer's producers |
+| Console mirror | `lplus_ipc::push_log_event` records mirrored renderer logs; the producer (the webview console bridge) returns with the window |
 | Reference bundle | `vendor/renderer` is served nowhere; the `.html`/`.js`/`.css` keep the historical `app://`→`/` rewrite so RE diffs against the asar stay line-aligned |
 | Locale | The port authors English strings; the bundle's bundled zh packs remain as reference data |
-| UI transports | direct (merged default): the window invokes `gui::ipc::dispatch` through the `lplus-ipc` dispatcher registry (installed by `start_backend`); attach (`gui` subcommand): length-prefixed prost frames to a running daemon's contract server (`LPLUS_BACKEND=off/1/host:port`). The in-process mock main (stub devices + audit ring) compiles into **test builds only** (`#[cfg(test)]`); shipped builds without a backend keep the vendor `__unhandled` contract. Tests run mock-only and never touch the network |
+| UI transports | the window is parked; on revival it speaks the contract server's typed rpcs (length-prefixed prost frames on 127.0.0.1:1421) instead of the deleted in-process dispatcher registry |
 
-## 3. IPC channel registry (`lplusd/src/gui/ipc.rs`)
+## 3. Vendor channel reference (the old `ipc_invoke` surface)
 
-`ipc_invoke` routes `ipcRenderer.invoke` channels; `ipc_bus` routes bus
-`name`s and answers `code_success` envelopes; unknown names are recorded in
-a 400-entry audit ring (`ipc_registry` command returns it) and answered with
-`{ok:false,__unhandled}`. The GPUI UI's direct transport calls the same
-`dispatch` entry point, so every channel is served identically whether it
-arrives over the wire or in-process.
+Every capability these webview channels served now lives on the contract
+as a typed rpc (§11); the JSON channel layer they rode in on was cut with
+the parked window. The table remains as vendor RE reference — `Status`
+marks what the daemon serves, `Answer` is the vendor JSON shape the phone
+and the future renderer speak, and `__unhandled` rows are daemon-side gaps
+to add as new rpcs.
 
 | Channel (value as sent) | Status | Answer |
 |---|---|---|
 | `generic_agent_get_paired_devices` | implemented | `{ok:true,entries,devices,pairedDevices}` from the daemon-backed device model |
 | `generic_agent_settings_remove_device` | implemented | `{device_id,removeStateDir}` → `{ok}` (rows actually removed); block-set in `unpaired.json` |
-| `generic_agent_get_local_device_id` | implemented | PC device id (`LPLUS_PC_DEVICE_ID` env) |
+| `generic_agent_get_local_device_id` | implemented | PC device id (OS-native machine id via `machine-uid`) |
 | `generic_agent_get_cloud_bind` | implemented | `{ok:true,bound:false}` |
 | `generic_agent_ensure_running` | implemented | `{ok:true,status:'idle'}` |
 | `get_current_connected_device_info_list` | implemented | connected rows of the device model |
@@ -129,8 +126,8 @@ lplus backend (in-process, same binary)
                         │
                         ▼
         rows {deviceId,deviceName,ip,isDiscovered,isConnected,…}
-        ├── GPUI device wall (ui) ──► renders the cards directly
-        ├── frame socket :1421 ───────► attach windows (prost Request/Response)
+        ├── ListDevices rpc ────────► control clients (prost Devices)
+        ├── event ring ───────────────► PollEvents (presence/bus/log)
         │     (row shape = the vendor `devicesList` electron-store entry)
         └── tick(): bus push to subscribers
               {event:"push_search_devices_in_deivce_list",
@@ -168,7 +165,7 @@ lplus backend (in-process, same binary)
   and **fails loudly** naming each port and the holder (`ss -ltnp` /
   `ss -lunp` lines), never deferring: only one `lplus` owns the network
   stack. A backend bind failure after preflight also exits non-zero.
-- Rows are consumed verbatim by the GPUI device wall and the attach contract server:
+- Rows are consumed verbatim by the contract server's `ListDevices` rpc:
   `protcol_device_id` keeps the renderer's typo and the row shape matches
   the vendor `devicesList` electron-store entry, so attach clients see the
   same JSON mydevice used to render its cards from. The wall re-pulls on a
@@ -187,11 +184,13 @@ EPI sink pushes).
 
 ## 4. Verification reference
 
-- Boot (`./target/debug/lplus` under sway/Wayland): the "L+ connect" window
-  opens on Home; backend markers `[kms] listening :36863`,
-  `[repl] listening 127.0.0.1:47991`, `[events] NDJSON bridge :14752`,
+- Boot (`./target/debug/lplus panel`): the log shows
+  `[gui] serving contract server 127.0.0.1:1421 (frames:
+  pb::Frame{method,error,payload})`, `[kms] listening :36863`,
+  `[events] NDJSON bridge :14752`,
   `sdpd up: :10150 (mcast 239.255.255.250) :10151 (uni)
-  tcp[10152,10153,10151,10150,46888,47888,48888]`.
+  tcp[10152,10153,10151,10150,46888,47888,48888]`. The GPUI window is
+  parked; every capability is driven through the frame socket (§11).
 - Event-fed device rows: with the backend live, the row table reports
   the paired rows (`deviceName CPH2745`, `isConnected true`) while the log
   shows `[presence] event kind=scp_sync …` / `kind=epi …` lines.
@@ -208,15 +207,15 @@ EPI sink pushes).
 
 ```sh
 cd oneplus/linux-client    # from the repo root (the dir holding this document)
-cargo run                       # daemon + GPUI window
+cargo run                       # daemon + contract server
 cargo run -- daemon             # headless backend, stdout logs
-cargo run -- panel              # daemon + contract server only (no window)
-cargo run -- gui                # window attached to a running daemon
+cargo run -- panel              # same as default (backend + contract server)
+cargo run -- gui                # parked with the ui/ member (prints a notice)
 ./target/debug/lplus --csp 10152          # name from settings.json/hostname, vip auto-detected
 ./connect.sh <resp> <linkpub-hex>   # one scripted connect attempt (restarts sdpd, taps phone, waits on markers)
 ./waitlex.sh <ERE> [timeout_s]      # block until regex appears in the live taplog (TAPLOG override honored)
-# seam: speak 4-byte-BE-length + lplus_ipc::pb::Request frames to
-#   127.0.0.1:1421 (typed control verbs + Invoke channels; §11 shows one)
+# contract: 4-byte-BE-length + lplus_ipc::pb::Request frames to
+#   127.0.0.1:1421 (Frame{method,error,payload}; §11 shows the layout)
 ```
 
 `lplus` is **the** daemon: default csp 10152, EPI lanes (46888/47888/48888),
@@ -259,7 +258,7 @@ copied over once on first use.
 | Module | Ports |
 | --- | --- |
 | `ui/src/router.rs` | vendor hash router (`home`, `crossfile/*`, `aiSearch`, `screen`, `screenshare`, `remotecontrol`, `settings`, `uploaddownload`, `generic-agent`, `note`) |
-| `ui/src/ipc.rs` | transports (direct via the `lplus-ipc` dispatcher / served via the daemon's length-prefixed prost frame socket; test-only mock filler), vendor channels as a typed strum `Channel` enum + `__unhandled` audit ring |
+| `ui/src/ipc.rs` | (parked) old direct transport against the deleted `lplus-ipc` dispatcher — on revival it re-targets the contract server's length-prefixed prost frames; vendor channels as a typed strum `Channel` enum |
 | `ui/src/stores/connection.rs` | vuex `connection.js`: found/connected merge, `deviceListSort`, connect state machine (incl. on-device permission wait) |
 | `ui/src/stores/transfer.rs` | vuex `uploadDownload.js`: queue, progress clamp, clear-finished |
 | `ui/src/stores/toast.rs` | vuex `toast.js` |
@@ -322,25 +321,40 @@ wall 9/9 PASS against vendor references.
 - The QR pairing payload awaits the real pairing lane (`get_pairing_qr_code`
   is mock-filled and audited).
 
-## 11. Element-click lane
+## 11. Control-client contract (frame socket)
 
-Every user-facing button shares one stable id (`ui/src/views.rs::element`)
-between the real GPUI tree (`.id(...)`) and the click lane. Automation
-pushes ids as contract-server `ClickCmd` frames — a 4-byte BE length over
-the prost `Request` below — on `127.0.0.1:1421`:
+The API surface is `service Lplusd` in `ipc/protos/lplus.proto`
+(`lplus.backend.v1`) — one rpc per capability, each with its own
+request/response message. Transport: one frame per connection on
+`127.0.0.1:1421` — a 4-byte big-endian length and a prost `Frame`
+`{method, error, payload}`; `method` carries the full rpc name
+(`lplus.backend.v1.Lplusd/Ping`), `payload` the request message, and the
+reply's `payload` the response message (or `Frame.error`). The server's
+dispatch table is test-enforced complete against the descriptor-extracted
+`pb::SERVICE_METHODS`, so the `service` block is the single source of
+truth.
+
+Rpcs: `Ping`, `ListDevices`, `Connect`/`Disconnect`/`RemoveDevice`,
+`GetHostName`/`SetHostName`, `GetPairedDevices`, `GetLocalDeviceId`,
+`EnsureRunning`, `GetCloudBind`, `SidecarStatus`, `PollEvents` (drains the
+ring: `sdpd::emit_device` presence today; `bus`/`log` variants return with
+the renderer), `Status`, `CastPush`, `OdmfStart`, `KmsBootstrap`,
+`SinkList`/`InjectFrame` (raw frames onto live EPI/KMS sessions, no
+re-handshake), `RequestLive`/`TakeFrame` (JPEG screencast). Nothing speaks
+JSON: handlers project the internal `api` shapes onto protobuf at the
+boundary, and an rpc missing from the table is a compile-time schema bug,
+not a runtime `{ok:false,__unhandled}`.
 
 ```python
-call = b'\x0a' + bytes([len(b"card-disconnect:192-168-0-100")]) \
-     + b"card-disconnect:192-168-0-100"          # ClickCmd.id = 1
-req  = b'\x22' + bytes([len(call)]) + call       # Request.click = 4
-s.sendall(len(req).to_bytes(4, "big") + req)     # → Ack{ok:true}
-```
+import socket
+def call(method, payload=b""):      # one request per connection
+    s = socket.create_connection(('127.0.0.1', 1421), 2); s.settimeout(3)
+    frame = b'\x0a' + bytes([len(method)]) + method.encode() \
+          + b'\x1a' + bytes([len(payload)]) + payload   # Frame{1:method,3:payload}
+    s.sendall(len(frame).to_bytes(4, 'big') + frame)
+    n = int.from_bytes(s.recv(4), 'big'); body = s.recv(n); s.close(); return body
 
-Ids: `device-connect:<wall-index-or-device-id>`, `card-disconnect:…`,
-`menu-delete:…`, `card-more:…`, plus `confirm`/`cancel` (also the dialog's
-`{kind}-confirm`/`{kind}-cancel` forms). The server queues them in the
-shared `lplus-ipc` click queue; the window drains on its presence tick
-(`AppState::drain_ui_clicks`), invoking the very handlers the on-screen
-buttons call — `request_connect`, `request_disconnect` (+ vendor confirm
-dialog), `request_remove_device`, `toggle_more_menu`. Log line:
-`[ui] click … (daemon queue)`. 
+print(call("lplus.backend.v1.Lplusd/Ping"))
+# PollEventsRequest {since_seq=0, limit=0} → payload field 1 varint
+print(call("lplus.backend.v1.Lplusd/PollEvents", b"\x08\x00"))
+```

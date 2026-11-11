@@ -21,6 +21,9 @@ cbc                = { version = "0.2", default-features = false, features = ["a
 # for the per-user state files; hand-rolling the per-OS fallback rules is
 # the bug-prone part (OSV: no advisories).
 directories        = { version = "6", default-features = false }
+# hostname without shelling out or reading Linux-only files
+# (OSV: no advisories).
+whoami               = { workspace = true }
 futures            = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 hex                = { version = "0.4", default-features = false, features = ["std"] }
 hkdf               = { version = "0.13", default-features = false }

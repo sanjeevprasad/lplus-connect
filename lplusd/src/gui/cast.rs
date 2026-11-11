@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::json;
 
-use crate::gui::api::{CastPushResp, FileInfo, LplusStatus, OdmfInfo, OdmfStartResp, RtspInfo};
+use lplus_ipc::pb::{CastPushResult, FileInfo, LplusStatus, OdmfInfo, OdmfStartResult, RtspInfo};
 
 /// Our fixed peer id on the DataBus session (castpush.py `PC`).
 pub const PC_ID_HEX: &str = "A1B2C3D4E5F6";
@@ -148,12 +148,11 @@ pub fn push_value(key: &str, value_json: &str) -> (Vec<u8>, bool) {
     (frame, queued)
 }
 
-// ----------------------------------------------------------- ipc channels
-/// `cast_push {key, value}`: inject one DbsMessage frame and report its
-/// size and hex alongside the queue verdict.
-pub fn cast_push(key: &str, value: &str) -> CastPushResp {
+/// Inject one DbsMessage frame and report its size and hex alongside
+/// the queue verdict (contract rpc `CastPush`).
+pub fn cast_push(key: &str, value: &str) -> CastPushResult {
     if key.trim().is_empty() {
-        return CastPushResp {
+        return CastPushResult {
             ok: false,
             key: None,
             frame_bytes: None,
@@ -163,10 +162,10 @@ pub fn cast_push(key: &str, value: &str) -> CastPushResp {
         };
     }
     let (frame, queued) = push_value(key, value);
-    CastPushResp {
+    CastPushResult {
         ok: true,
         key: Some(key.to_string()),
-        frame_bytes: Some(frame.len()),
+        frame_bytes: Some(frame.len() as u64),
         frame_hex: Some(hex::encode(&frame)),
         queued: Some(queued),
         error: None,
@@ -179,17 +178,17 @@ pub fn cast_push(key: &str, value: &str) -> CastPushResp {
 /// `CastDbsReceiver` looks the key up in the `CastDispatchMessage` list and
 /// anything else dispatches with type 0 and is silently dropped — the inner
 /// `msg_cmd` is what routes inside `CastSceneManager.handleReceiveData`.
-pub fn odmf_start() -> OdmfStartResp {
+pub fn odmf_start() -> OdmfStartResult {
     let pub_file = env_or("ODMF_PUB_FILE", "/tmp/odmf_pub.b64");
     let raw = match std::fs::read_to_string(&pub_file) {
         Ok(raw) => raw,
         Err(e) => {
             tracing::warn!("[cast] odmf_start: cannot read public key {pub_file}: {e}");
-            return OdmfStartResp {
+            return OdmfStartResult {
                 ok: false,
                 id: None,
                 pushes: None,
-                queued: None,
+                queued: Vec::new(),
                 listen: None,
                 rtp_port: None,
                 error: Some(format!("missing ODMF public key ({pub_file})")),
@@ -198,7 +197,7 @@ pub fn odmf_start() -> OdmfStartResp {
     };
     let n = next_seq();
     let id = general_purpose::STANDARD.encode(format!("lplus-pc-{n}"));
-    let server_ip = env_or("LPLUS_PC_IP", &crate::sdpd::default_vip());
+    let server_ip = crate::sdpd::default_vip();
     let auth = json!({ "id": id, "public_key": raw.trim(), "auth_version": 1 }).to_string();
     // The sink must echo exactly this id (the phone compares raw bytes in
     // SigIdentityAuthHelper), so persist it for OdmfAuth::load()'s per-auth
@@ -210,11 +209,11 @@ pub fn odmf_start() -> OdmfStartResp {
     let (body1, body2) = odmf_bodies(&server_ip, &auth);
     let (_, q1) = push_value("cast_ability_sync", &body1);
     let (_, q2) = push_value("cast_ability_sync", &body2);
-    OdmfStartResp {
+    OdmfStartResult {
         ok: true,
         id: Some(id),
         pushes: Some(2),
-        queued: Some(vec![q1, q2]),
+        queued: vec![q1, q2],
         // The sink the phone will dial (what the GUI shows under the
         // mirroring toggle; `env_or` mirrors the sink's own defaults).
         listen: Some(env_or("ODMF_LISTEN", "0.0.0.0:7236")),
@@ -264,27 +263,27 @@ fn cast_message(msg_cmd: &str, msg_body: &str) -> String {
 }
 
 // -------------------------------------------------------------- status/ops
-/// `lplus_status {}`: env-read snapshot of backend liveness, KMS lane,
-/// ODMF sink files and the RTSP lane. Never panics; the KMS probe
-/// is bounded to 300 ms.
+/// Backend liveness, KMS lane, ODMF sink files and the RTSP lane
+/// (contract rpc `Status`). Never panics; the KMS probe is bounded
+/// to 300 ms.
 pub fn status() -> LplusStatus {
     let out = out_dir();
     LplusStatus {
         ok: true,
         backend_up: crate::gui::backend_up(),
         kms_listening: tcp_probe(kms_port()),
-        odmf: OdmfInfo {
+        odmf: Some(OdmfInfo {
             enabled: env_flag("ODMF_SINK"),
             listen: env_or("ODMF_LISTEN", "0.0.0.0:7236"),
             rtp_port: env_or("ODMF_RTP_PORT", "15550"),
             out_dir: out.display().to_string(),
-            session_bin: file_info(&out.join(SESSION_BIN_NAME)),
-            video: file_info(&out.join(VIDEO_NAME)),
-        },
-        rtsp: RtspInfo {
+            session_bin: Some(file_info(&out.join(SESSION_BIN_NAME))),
+            video: Some(file_info(&out.join(VIDEO_NAME))),
+        }),
+        rtsp: Some(RtspInfo {
             enabled: env_flag("RTSP"),
             target: env_or("RTSP_TARGET", ""),
-        },
+        }),
     }
 }
 
@@ -438,12 +437,13 @@ mod tests {
     fn status_shape_is_complete() {
         let s = status();
         assert!(s.ok);
+        let odmf = s.odmf.expect("odmf info");
         assert_eq!(
-            s.odmf.rtp_port,
+            odmf.rtp_port,
             std::env::var("ODMF_RTP_PORT").unwrap_or_else(|_| "15550".into())
         );
         assert_eq!(
-            s.odmf.listen,
+            odmf.listen,
             std::env::var("ODMF_LISTEN").unwrap_or_else(|_| "0.0.0.0:7236".into())
         );
     }
