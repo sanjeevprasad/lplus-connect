@@ -33,9 +33,6 @@
 mod logging;
 
 // dev/CI surface kept for wire-capture work lives in `lplusd`.
-// ui wiring parked (ui/ member + `gui` feature commented in Cargo.toml):
-// #[cfg(feature = "gui")]
-// use lplus_ui as ui;
 use lplusd::{ble, gui, scpc, sdpd, state, ukey2};
 
 use anyhow::{Context, Result};
@@ -48,10 +45,11 @@ use ukey2::{Role, Ukey2Handshake};
 #[derive(Parser)]
 #[command(
     name = "lplus",
-    about = "O+ Connect Linux client: SDP/KMS/EPI backend + GUI"
+    about = "O+ Connect Linux client: SDP/KMS/EPI backend + contract server"
 )]
 struct Cli {
-    /// Run the backend only (no window); same config as the GUI lane.
+    /// Run the backend only (no contract server); same config as the
+    /// default command.
     #[arg(long)]
     headless: bool,
     /// Advertised device name (DN). Defaults to the settings-pinned name,
@@ -64,41 +62,17 @@ struct Cli {
     /// Advertised VIP. Defaults to the primary interface address.
     #[arg(long, default_value_t = sdpd::default_vip())]
     vip: String,
-    // ---- window flags (default / `gui` entry points) ---------------------
-    /// Demo state: manual-connect lane (the device mock only compiles into
-    /// test builds).
-    #[arg(long, global = true)]
-    demo: bool,
-    /// Open the manual-connect dialog at launch.
-    #[arg(long, global = true)]
-    dialog: bool,
-    /// Open the dialog on the USB tab.
-    #[arg(long, global = true)]
-    usb: bool,
-    /// Start on Home explicitly.
-    #[arg(long, global = true)]
-    start_home: bool,
-    /// Start on a named route (vendor screen names); empty starts Home.
-    #[arg(long, global = true, default_value = "")]
-    route: String,
-    /// Headless transport self-check: probe the backend channels and exit
-    /// (exit 0 only when every probed channel was answered by the backend).
-    #[arg(long, global = true)]
-    probe_transport: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Headless backend only (no window, no loopback server): stdout logs.
+    /// Headless backend only (no loopback server): stdout logs.
     Daemon,
-    /// Backend + loopback HTTP seam, no window (attach clients on the
-    /// raw `/__ipc` / `/__events` surface).
+    /// Backend + loopback contract server (attach clients on the
+    /// length-prefixed frame socket).
     Panel,
-    /// Desktop window only, attached to an already-running daemon
-    /// (`LPLUS_BACKEND` respected; falls back to the mock when none runs).
-    Gui,
     /// Run both handshake roles locally to self-test crypto/framing.
     Loopback,
     /// Wait for a peer (the phone) on a TCP port.
@@ -115,7 +89,7 @@ enum Cmd {
     /// port via `EPI_DIAL_PORT`, default 46888).
     Epi { addr: String },
     /// pantaconnect LAN SDP responder headless (dev/CI lane; the default
-    /// command embeds the same backend inside the GUI).
+    /// command embeds the same backend).
     Sdpd {
         #[arg(long, default_value = "scp.device")]
         ns: String,
@@ -429,11 +403,6 @@ fn main() -> Result<()> {
             preflight_or_die(&cfg);
             gui::serve(cfg).map_err(|e| anyhow::anyhow!(e))
         }
-        Some(Cmd::Gui) => {
-            // ui wiring parked: ui::run(ui::Transport::Attach, ui_flags(&cli));
-            tracing::error!("the GPUI window is parked — run `lplus daemon` or `lplus panel`");
-            Ok(())
-        }
         None => {
             apply_daemon_env();
             let (name, csp, vip) = (cli.name.clone(), cli.csp, cli.vip.clone());
@@ -444,12 +413,8 @@ fn main() -> Result<()> {
 }
 
 /// Default entry (`lplus`): the daemon and the contract server in one
-/// process, no window (the GPUI lane is parked with the ui/ member).
+/// process. `--headless` runs the backend only (old `lplus sdpd` UX).
 fn product(cli: &Cli, cfg: sdpd::SdpdConfig) -> Result<()> {
-    if cli.probe_transport {
-        tracing::error!("--probe-transport is parked with the GPUI window");
-        std::process::exit(2);
-    }
     preflight_or_die(&cfg);
     if cli.headless {
         headless(cfg)
@@ -458,30 +423,8 @@ fn product(cli: &Cli, cfg: sdpd::SdpdConfig) -> Result<()> {
     }
 }
 
-// ui wiring parked (restore with the ui/ member and the `gui` feature):
-// fn ui_flags(cli: &Cli) -> ui::UiFlags {
-//     ui::UiFlags {
-//         demo: cli.demo,
-//         dialog: cli.dialog,
-//         usb: cli.usb,
-//         start_home: cli.start_home,
-//         route: (!cli.route.is_empty()).then(|| cli.route.clone()),
-//     }
-// }
-//
-// /// Cheap single-instance guard: a loopback GUI server already answering
-// /// means another `lplus` daemon owns the ports.
-// fn daemon_running() -> bool {
-//     std::net::TcpStream::connect_timeout(
-//         &"127.0.0.1:1421".parse().expect("static"),
-//         std::time::Duration::from_millis(200),
-//     )
-//     .is_ok()
-// }
-
-/// `--headless`: the same backend as the GUI lane, stdout logs, no window
-/// (old `lplus sdpd` UX). Presence events mirror to stdout as
-/// `[presence] event …` lines.
+/// `--headless`: the backend alone with stdout logs (old `lplus sdpd`
+/// UX). Presence events mirror to stdout as `[presence] event …` lines.
 fn headless(cfg: sdpd::SdpdConfig) -> Result<()> {
     gui::devices::init();
     runtime()?.block_on(async move {
@@ -561,7 +504,7 @@ mod cli_tests {
     use super::*;
 
     #[test]
-    fn default_command_is_unified_gui() {
+    fn default_command_is_product_entry() {
         let cli = Cli::try_parse_from(["lplus"]).unwrap();
         assert!(cli.cmd.is_none());
         assert!(!cli.headless);

@@ -76,12 +76,10 @@ feature-depth = 1
 # output a note when they are encountered.
 ignore = [
     # Unmaintained advisories on transitively pinned stacks, no safe
-    # upgrade; re-check when gpui-ce / zbus update:
+    # upgrade; re-check when zbus updates:
     #   paste (dtolnay archived; macro-only dep)
-    #   ttf-parser (gpui font stack; alternative skrifa)
     #   zvariant / zvariant_derive / zbus_names (zbus stack behind atspi/oo7)
     { id = "RUSTSEC-2024-0436", reason = "paste archived upstream; macro-only transitive dep" },
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser pinned by gpui font stack; no safe upgrade" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant pinned by zbus stack (atspi/oo7)" },
     { id = "RUSTSEC-2026-0371", reason = "zvariant_derive pinned by zbus stack (atspi/oo7)" },
     { id = "RUSTSEC-2026-0372", reason = "zbus_names pinned by zbus stack (atspi/oo7)" },

@@ -32,13 +32,14 @@ pub mod pb {
     pub use super::pb_mod::{
         Ack, BusEvent, CastPushRequest, CastPushResult, CloudBindResult, ConnectCmd, Device,
         DeviceEvent, Devices, DisconnectCmd, EnsureRunningRequest, EnsureRunningResult, Event,
-        Events, FileInfo, Frame, FrameReply, GetCloudBindRequest, GetHostNameRequest,
+        Events, FileInfo, FrameReply, GetCloudBindRequest, GetHostNameRequest,
         GetLocalDeviceIdRequest, GetPairedDevicesRequest, HostName, InjectFrameRequest,
         KmsBootstrapRequest, ListDevicesRequest, LocalDeviceId, LogEvent, LplusStatus, OdmfInfo,
         OdmfStartRequest, OdmfStartResult, PairEntry, PairedDevices, PingRequest,
         PollEventsRequest, Pong, RemoveDeviceCmd, RemoveDeviceResult, RequestLiveRequest, RtspInfo,
         SERVICE_METHODS, SetHostNameCmd, SetHostNameResult, SidecarLane, SidecarStatusRequest,
-        SinkListRequest, SinkRoster, StatusRequest, TakeFrameRequest, event,
+        SinkListRequest, SinkRoster, StatusRequest, TakeFrameRequest, event, lplusd_client,
+        lplusd_server,
     };
 }
 
@@ -135,7 +136,6 @@ pub fn take_events(since_seq: u64, limit: u32) -> (u64, Vec<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message as _;
 
     #[test]
     fn device_json_keeps_camel_case_and_vendor_typo() {
@@ -168,23 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_envelope_round_trips_and_methods_are_extracted() {
-        let req = pb::Frame {
-            method: "lplus.backend.v1.Lplusd/Connect".into(),
-            error: String::new(),
-            payload: pb::ConnectCmd {
-                ip: "192.0.2.7".into(),
-            }
-            .encode_to_vec(),
-        };
-        let bytes = req.encode_to_vec();
-        let back = pb::Frame::decode(&bytes[..]).expect("decode");
-        assert_eq!(back, req);
-        assert_eq!(
-            pb::ConnectCmd::decode(&back.payload[..]).expect("inner").ip,
-            "192.0.2.7"
-        );
-
+    fn service_methods_are_extracted_from_the_descriptor() {
         assert!(pb::SERVICE_METHODS.contains(&"lplus.backend.v1.Lplusd/Ping"));
         assert!(
             pb::SERVICE_METHODS

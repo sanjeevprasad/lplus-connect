@@ -1,16 +1,14 @@
-// L+ connect backend control-plane contract (contract server on
-// 127.0.0.1:1421).
+// L+ connect backend control-plane contract: gRPC service Lplusd served
+// on 127.0.0.1:1421 (tonic; standard HTTP/2 gRPC, reachable by any
+// gRPC client or grpcurl).
 //
 // The `service` block is the sole API surface: one rpc per backend
 // capability, each with its own request/response message — strictly
-// typed, no JSON carriers anywhere on this wire. The transport is the
-// phone-lane framing — a 4-byte big-endian length and one prost `Frame`
-// per connection; `Frame.method` carries the full rpc name
-// (`lplus.backend.v1.Lplusd/Ping`), `Frame.payload` the request
-// message, and the reply frame's payload the response message (or
-// `Frame.error` for transport-level failures). `build.rs` extracts the
-// rpc list from the descriptor (`pb::SERVICE_METHODS`) so the server's
-// dispatch table is test-enforced complete.
+// typed, no JSON carriers anywhere on this wire. Handler failures
+// surface as gRPC `internal` statuses with the message intact.
+// `build.rs` extracts the rpc list from the descriptor
+// (`pb::SERVICE_METHODS`) so the server's dispatch table is
+// test-enforced complete.
 //
 // Field names mirror the daemon's typed api structs; `protcol_device_id`
 // keeps the vendor typo. The channel dispatcher's internal Value seam
@@ -19,15 +17,6 @@
 syntax = "proto3";
 
 package lplus.backend.v1;
-
-// Transport envelope: one request per connection; the reply echoes
-// nothing but payload/error. Stable forever — new capabilities add
-// rpcs, never envelope fields.
-message Frame {
-  string method = 1;   // full rpc name, gRPC spelling
-  string error = 2;    // transport/dispatch failure (payload empty)
-  bytes payload = 3;   // request or response message bytes
-}
 
 // Handshake/liveness probe.
 message PingRequest {}
@@ -300,10 +289,11 @@ message Ack {
   optional string error = 3;
 }
 
-// The backend API surface. Method names are matched verbatim by the
-// contract server; the dispatch table is test-enforced complete against
+// The backend API surface. The generated tonic router dispatches these
+// rpcs; the contract server's table is test-enforced complete against
 // the descriptor-extracted `pb::SERVICE_METHODS`. There is no JSON
-// anywhere: an unknown rpc answers Frame.error, never a passthrough.
+// anywhere: an unknown rpc answers gRPC `Unimplemented`, never a
+// passthrough.
 service Lplusd {
   rpc Ping(PingRequest) returns (Pong);
   rpc ListDevices(ListDevicesRequest) returns (Devices);

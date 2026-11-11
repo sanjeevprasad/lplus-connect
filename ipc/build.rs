@@ -1,10 +1,10 @@
 //! This crate is partially generated: `protos/lplus.proto` (the backend
-//! control-plane `service Lplusd` + its messages) is compiled to prost
-//! types by prost-build, and the service's rpc list is extracted from the
-//! emitted FileDescriptorSet into `pb::SERVICE_METHODS` (the dispatch
-//! table the contract server must cover completely). The `api` channel
-//! structs are the handwritten shared JSON shapes. Builds therefore need
-//! `protoc` on PATH.
+//! control-plane `service Lplusd` + its messages) is compiled by
+//! tonic-build into prost message types plus the gRPC client/server stubs
+//! (`pb::lplusd_client`, `pb::lplusd_server`), and the service's rpc list
+//! is extracted from the emitted FileDescriptorSet into
+//! `pb::SERVICE_METHODS` (the dispatch table the contract server must
+//! cover completely). Builds therefore need `protoc` on PATH.
 
 use std::fs;
 
@@ -15,10 +15,11 @@ fn main() {
     println!("cargo:rerun-if-changed=protos");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     let descriptor_path = format!("{out_dir}/lplus.bin");
-    prost_build::Config::new()
-        // The contract wire is prost-only; serde rides on `Device`
-        // alone because the daemon persists rows to its state dir as
-        // JSON. The camelCase/default policy applies to the row struct.
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        // serde rides on `Device` alone because the daemon persists it to
+        // its state dir as JSON. The camelCase/default policy applies.
         .type_attribute(
             ".lplus.backend.v1.Device",
             "#[derive(serde::Serialize, serde::Deserialize)]",
@@ -34,7 +35,7 @@ fn main() {
         )
         .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&["protos/lplus.proto"], &["protos"])
-        .expect("protoc + prost-build over protos/");
+        .expect("protoc + tonic-build over protos/");
 
     // The service block is the API surface: extract the fully-qualified
     // rpc names (gRPC spelling) so code and schema cannot silently drift.

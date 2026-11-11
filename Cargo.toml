@@ -10,13 +10,11 @@ publish     = false
 
 # Workspace layout: `ipc/` is the backend contract (the control-plane both the daemon and
 # external clients speak); `lplusd/` serves it (phone stack +
-# loopback backend); `ui/` (parked) once consumed it. This root crate
+# loopback backend). This root crate
 # is only the wiring: the CLI and the product binary that starts the
 # daemon and serves the contract server. `proto/` is the separate phone wire.
 [workspace]
 members = [".", "proto", "ipc", "lplusd"]
-# UI wiring parked: "ui" (GPUI window member) joins the workspace again
-# together with the `gui` feature below.
 
 # Shared versions/features; `lplus` and `protocol` both reference these.
 [workspace.dependencies]
@@ -32,21 +30,25 @@ rtsp-types  = { version = "0.1", default-features = false }
 serde       = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json  = { version = "1", default-features = false, features = ["std"] }
 strum       = { version = "0.28", default-features = false, features = ["std", "derive"] }
+# gRPC transport for the control contract: tonic serves/consumes the
+# prost messages generated from protos/lplus.proto (OSV: no advisories;
+# 0.14 line matches prost 0.14).
+tonic       = { version = "0.14", default-features = false, features = ["transport", "channel", "router", "server", "codegen"] }
+tonic-prost = { version = "0.14", default-features = false }
+tonic-prost-build = { version = "0.14", default-features = false }
+# stream adapter handing the contract lane's pre-bound listener to tonic.
+tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
 whoami      = { version = "2", default-features = false }
 thiserror   = { version = "2", default-features = false, features = ["std"] }
 
 [features]
 default = []
-# GPUI desktop window: links the `lplus-ui` member. Parked with the ui/
-# member until the daemon lane ships.
-# gui = ["dep:lplus-ui"]
 
 [dependencies]
 anyhow             = { workspace = true }
 clap               = { version = "4", default-features = false, features = ["std", "derive", "help", "error-context"] }
 # daemon↔ui contract member (cli_tests drive its queue/dispatcher)
 lplusd             = { path = "lplusd" }
-# lplus-ui         = { path = "ui", optional = true }
 hex                = { version = "0.4", default-features = false, features = ["std"] }
 serde_json         = { workspace = true }
 tokio              = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "sync", "net", "io-util", "macros", "process"] }

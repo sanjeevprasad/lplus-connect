@@ -1,9 +1,9 @@
 //! Backend orchestration of the unified `lplus` binary. The machine-facing
-//! surface is the loopback contract server (`server.rs`): length-prefixed
-//! prost frames (`lplus_ipc::pb::Frame`) on `127.0.0.1:1421` serving
-//! `service Lplusd`, strictly typed. The parked GPUI window (`ui/`)
-//! revives onto that contract, not another in-process seam; the
-//! webview-era GUI bus push lane was cut with it.
+//! surface is the loopback gRPC contract server (`crate::contract`):
+//! `service Lplusd` from `ipc/protos/lplus.proto` over tonic on
+//! `127.0.0.1:1421`, strictly typed. The GPUI window (`ui/`) revives onto
+//! that contract with the generated client, not another in-process seam;
+//! the webview-era GUI bus push lane was cut with it.
 //!
 //! The daemon runs in-process (`crate::sdpd::run` on its own tokio
 //! runtime), and the device model (`devices.rs`) is fed purely by the
@@ -15,7 +15,6 @@ pub mod api;
 pub mod cast;
 pub mod devices;
 pub(crate) mod ipc;
-mod server;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -53,18 +52,18 @@ fn start_backend(cfg: SdpdConfig) {
 /// port.
 pub fn start(cfg: SdpdConfig) -> Result<u16, String> {
     devices::init();
-    let port = server::spawn()?;
+    let port = crate::contract::spawn()?;
     start_backend(cfg);
     Ok(port)
 }
 
 /// `lplus panel` product entry: backend + contract server only (no
 /// window) — attach clients and scripts drive everything through the
-/// length-prefixed prost frame socket. Blocks until the process is killed.
+/// gRPC contract. Blocks until the process is killed.
 pub fn serve(cfg: SdpdConfig) -> Result<(), String> {
     let port = start(cfg)?;
     tracing::info!(
-        "[gui] serving contract server 127.0.0.1:{port} (frames: pb::Frame{{method,error,payload}})"
+        "[gui] serving contract server 127.0.0.1:{port} (grpc: lplus.backend.v1.Lplusd)"
     );
     loop {
         thread::sleep(Duration::from_secs(3600));

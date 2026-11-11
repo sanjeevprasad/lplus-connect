@@ -4,6 +4,10 @@
 //! the event ring, the live frame bus). The `lplus` binary wires it up.
 
 pub mod ble;
+/// Loopback gRPC contract lane (service Lplusd); daemon-level, not
+/// UI-specific — the panel modules under `gui/` are consumers of the
+/// same state, this is the machine-facing contract itself.
+mod contract;
 pub mod d2d;
 pub mod gui;
 pub mod kms;
