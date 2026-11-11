@@ -167,7 +167,7 @@ fn handle_method(
             let bytes = hex::decode(c.hex.trim()).map_err(|e| format!("bad hex: {e}"))?;
             let queued = services.epi.send(crate::svc::epi::Command::SendFrame {
                 key_substr: c.key_substr,
-                hex: hex::encode(bytes),
+                bytes,
             });
             Ok(ack(queued, None, None))
         }

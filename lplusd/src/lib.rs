@@ -5,6 +5,7 @@
 
 /// Backend orchestration: daemon threads, liveness, product entry.
 pub mod backend;
+pub mod config;
 pub mod d2d;
 pub mod odmf_pc;
 pub mod rpc;

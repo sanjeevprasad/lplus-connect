@@ -108,19 +108,17 @@ fn dispatch(tx: &UnboundedSender<PcEvent>, json: &str) {
     }
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
 fn ensure_task() {
     TASK_STARTED.call_once(|| {
         let (tx, rx) = unbounded_channel::<PcEvent>();
         let _ = PC_CTL.set(tx);
-        let rtp_port: u16 = env_or("ODMF_RTP_PORT", "15550").parse().unwrap_or(15550);
+        let rtp_port: u16 = crate::config::str_of("ODMF_RTP_PORT", "15550")
+            .parse()
+            .unwrap_or(15550);
         let pc_ip: IpAddr = crate::svc::sdp::default_vip()
             .parse()
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        let out_path = env_or("ODMF_VIDEO_OUT", "../../capture/video_odmf.h265");
+        let out_path = crate::config::str_of("ODMF_VIDEO_OUT", "../../capture/video_odmf.h265");
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 h.spawn(run(rx, pc_ip, rtp_port, out_path));
@@ -474,7 +472,7 @@ async fn drain(rtc: &mut Rtc, c: &mut DrainCtx<'_>) {
                     }
                 }
                 Event::ChannelData(d) => {
-                    let txt = String::from_utf8_lossy(&d.data).to_string();
+                    let txt = String::from_utf8_lossy(&d.data);
                     tracing::info!("[webrtc] channel rx: {txt}");
                     let command = serde_json::from_str::<ChannelMsg>(&txt)
                         .ok()
@@ -532,9 +530,15 @@ fn consult_gate_open(connected_at: Option<tokio::time::Instant>) -> bool {
 /// until it lands. Returns the number of channels the write succeeded on.
 fn send_consult(rtc: &mut Rtc, chan: &Option<ChannelId>, extra: Option<ChannelId>) -> u32 {
     let (w, h, fps) = (
-        env_or("ODMF_SINK_W", "1272").parse().unwrap_or(1272),
-        env_or("ODMF_SINK_H", "2772").parse().unwrap_or(2772),
-        env_or("ODMF_SINK_FPS", "30").parse().unwrap_or(30),
+        crate::config::str_of("ODMF_SINK_W", "1272")
+            .parse()
+            .unwrap_or(1272),
+        crate::config::str_of("ODMF_SINK_H", "2772")
+            .parse()
+            .unwrap_or(2772),
+        crate::config::str_of("ODMF_SINK_FPS", "30")
+            .parse()
+            .unwrap_or(30),
     );
     let reply = serde_json::to_string(&ConsultReply {
         command: proto::rtsp::RtspMethod::SetParameter.to_string(),
@@ -632,8 +636,10 @@ fn live_pref() -> LivePref {
 
 fn live_pref_from(value: Option<&str>) -> LivePref {
     match value {
-        None | Some("") | Some("0") => LivePref::Off,
-        Some("player") | Some("ffplay") => LivePref::Player,
+        // Window by default: a spawned ffplay is the expected UX; the
+        // file dump is the explicit opt-out (`ODMF_LIVE=0`).
+        None | Some("") | Some("player") | Some("ffplay") => LivePref::Player,
+        Some("0") | Some("off") => LivePref::Off,
         Some(_) => LivePref::Native,
     }
 }
@@ -736,7 +742,7 @@ fn extract_preview_frames(buf: &mut Vec<u8>) -> Vec<image::RgbaImage> {
 }
 
 fn spawn_native() -> Option<FrameSink> {
-    let prog = env_or("ODMF_FFMPEG", "ffmpeg");
+    let prog = crate::config::str_of("ODMF_FFMPEG", "ffmpeg");
     let mut child = match Command::new(&prog)
         .args(native_args())
         .stdin(Stdio::piped())
@@ -801,7 +807,7 @@ fn live_args() -> Vec<&'static str> {
 }
 
 fn spawn_player() -> Option<FrameSink> {
-    let prog = env_or("ODMF_PLAYER", "ffplay");
+    let prog = crate::config::str_of("ODMF_PLAYER", "ffplay");
     let mut child = match Command::new(&prog)
         .args(live_args())
         .stdin(Stdio::piped())
@@ -911,7 +917,7 @@ fn offer_or_resend(
 
 #[cfg(test)]
 mod tests {
-    /// Opt-in live smoke: run with `ODMF_LIVE=1` and a real
+    /// Opt-in live smoke: run with `ODMF_LIVE` unset-or-set and a real
     /// `../../capture/video_odmf.h265` present; asserts the player sink
     /// spawns and accepts access-unit bytes. Skips otherwise.
     #[test]
@@ -977,8 +983,8 @@ mod tests {
 
     #[test]
     fn live_pref_maps_odmf_live() {
-        assert_eq!(live_pref_from(None), LivePref::Off);
-        assert_eq!(live_pref_from(Some("")), LivePref::Off);
+        assert_eq!(live_pref_from(None), LivePref::Player);
+        assert_eq!(live_pref_from(Some("")), LivePref::Player);
         assert_eq!(live_pref_from(Some("0")), LivePref::Off);
         assert_eq!(live_pref_from(Some("player")), LivePref::Player);
         assert_eq!(live_pref_from(Some("ffplay")), LivePref::Player);

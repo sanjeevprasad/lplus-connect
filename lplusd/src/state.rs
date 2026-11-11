@@ -60,11 +60,35 @@ pub fn panel_settings_path() -> PathBuf {
     state_file("settings.json", "panel-settings.json")
 }
 
+/// Parsed `settings.json` (empty object when absent/unreadable).
+pub fn panel_settings() -> serde_json::Value {
+    std::fs::read_to_string(panel_settings_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
 /// Per-peer KSC bonds — our counterpart of the vendor PC store
 /// (`ksc_<HEX(deviceId)>` inside `cpbus_ksc_storage_<alias>`): JSON map
 /// peer key → {deviceId, alias, ksc} hex.
 pub fn ksc_store_path() -> PathBuf {
     state_file("ksc.json", "ksc.json")
+}
+
+/// Monotonic AppCipher counter for the sealed DataBus lane. The phone's
+/// rx cipher keeps `mT` (accepted counters survive our session teardown),
+/// so every counter we ever send must strictly ascend; the file next to
+/// `ksc.json` carries the high-water mark across daemon restarts.
+pub fn dbs_ctr_path() -> PathBuf {
+    state_file("dbs-ctr", "dbs-ctr")
+}
+
+/// Persisted index of the KMS bootstrap port rotation (see
+/// `Sdp::begin_kms_session`): the phone's `CastSocketInputHost` ignores
+/// `start()` when its stale session holds the same port, so each new
+/// bootstrap must present a different `kms_socket_port`.
+pub fn kms_rot_path() -> PathBuf {
+    state_file("kms-rot", "kms-rot")
 }
 
 /// Serializes process-env mutations across ALL test modules (edition-2024
@@ -129,5 +153,23 @@ mod tests {
         unset_env("LPLUS_STATE_DIR");
         unset_env("ODMF_OUT");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// ==== service configuration (env keys read once at startup) ====
+
+/// Dev/trace aids.
+#[derive(Debug, Clone, Default)]
+pub struct DevConfig {
+    /// `LPLUS_LOG`: frame-record dump path (None = off).
+    pub record_path: Option<String>,
+}
+
+// -- DevConfig --
+impl DevConfig {
+    pub fn load() -> Self {
+        Self {
+            record_path: std::env::var("LPLUS_LOG").ok().filter(|s| !s.is_empty()),
+        }
     }
 }

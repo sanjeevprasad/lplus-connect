@@ -290,8 +290,11 @@ impl Ukey2Handshake {
                 if t == ukey2_message::Type::ClientFinish as i32 =>
             {
                 let expected = self.peer_commitment.as_ref().context("no commitment yet")?;
-                let actual = Sha512::digest(msg).to_vec();
-                ensure!(actual == *expected, "commitment mismatch");
+                let actual = Sha512::digest(msg);
+                ensure!(
+                    actual.as_slice() == expected.as_slice(),
+                    "commitment mismatch"
+                );
                 let data = outer.message_data.context("ClientFinish data")?;
                 let cf = Ukey2ClientFinished::decode(data.as_slice())
                     .context("ClientFinished payload")?;

@@ -118,11 +118,6 @@ fn usb_hidden(row: &Device, usb_on: bool) -> bool {
 /// Process-wide registry: the loopback server thread and the GPUI direct
 /// dispatch share one model without plumbing State through both.
 static REGISTRY: LazyLock<Mutex<Inner>> = LazyLock::new(Mutex::default);
-
-fn inner() -> &'static Mutex<Inner> {
-    &REGISTRY
-}
-
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -131,12 +126,6 @@ fn now_secs() -> u64 {
 }
 
 // --------------------------------------------------------------- pairing ---
-
-/// Persistent pairing bond file (`paired.json` in the state dir; see
-/// `state.rs`).
-fn paired_path() -> std::path::PathBuf {
-    crate::state::paired_path()
-}
 
 /// Registry key a persisted row belongs to; `None` for unusable rows.
 fn row_key(row: &Device) -> Option<String> {
@@ -178,7 +167,7 @@ fn sync_paired(i: &mut Inner) {
     if json == i.paired_saved || (rows.is_empty() && i.paired_saved.is_empty()) {
         return;
     }
-    let path = paired_path();
+    let path = crate::state::paired_path();
     match save_paired(&path, &rows) {
         Ok(()) => i.paired_saved = json,
         Err(e) => tracing::warn!("[pair] persist failed ({}): {e}", path.display()),
@@ -189,7 +178,7 @@ fn sync_paired(i: &mut Inner) {
 /// `generic_agent_get_paired_devices` (consumers read `entries[]` /
 /// `pairedDevices`, e.g. gaPairBoundStatus).
 pub fn paired_rows() -> Vec<Device> {
-    let mut i = inner().lock().expect("devices lock poisoned");
+    let mut i = REGISTRY.lock().expect("devices lock poisoned");
     refresh_ephemeral(&mut i);
     sync_paired(&mut i);
     let mut rows: Vec<&Device> = i
@@ -208,7 +197,7 @@ pub fn remove_device(device_id: &str) -> bool {
     if device_id.is_empty() {
         return false;
     }
-    let mut i = inner().lock().expect("devices lock poisoned");
+    let mut i = REGISTRY.lock().expect("devices lock poisoned");
     let removed = forget(&mut i, device_id);
     sync_paired(&mut i);
     sync_unpaired(&mut i);
@@ -232,11 +221,6 @@ fn forget(i: &mut Inner, device_id: &str) -> bool {
     removed
 }
 
-/// Persisted user-removal block list (state dir).
-fn unpaired_path() -> std::path::PathBuf {
-    crate::state::unpaired_path()
-}
-
 fn load_unpaired(path: &std::path::Path) -> HashSet<String> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return HashSet::new();
@@ -251,7 +235,7 @@ fn load_unpaired(path: &std::path::Path) -> HashSet<String> {
 }
 
 fn sync_unpaired(i: &mut Inner) {
-    sync_unpaired_at(i, &unpaired_path());
+    sync_unpaired_at(i, &crate::state::unpaired_path());
 }
 
 fn sync_unpaired_at(i: &mut Inner, path: &std::path::Path) {
@@ -283,9 +267,9 @@ pub fn init(sdp: &std::sync::Arc<crate::svc::sdp::Sdp>) {
 
 fn init_inner(sdp: std::sync::Arc<crate::svc::sdp::Sdp>) {
     {
-        let persisted = load_paired(&paired_path());
-        let blocked = load_unpaired(&unpaired_path());
-        let mut i = inner().lock().expect("devices lock poisoned");
+        let persisted = load_paired(&crate::state::paired_path());
+        let blocked = load_unpaired(&crate::state::unpaired_path());
+        let mut i = REGISTRY.lock().expect("devices lock poisoned");
         for row in persisted {
             if let Some(key) = row_key(&row) {
                 i.rows.entry(key).or_insert(row);
@@ -319,7 +303,7 @@ fn init_inner(sdp: std::sync::Arc<crate::svc::sdp::Sdp>) {
 /// Serializable visible rows (sorted, ephemeral flags refreshed, stale
 /// rows pruned) as typed rows — the API surface.
 pub fn visible_device_rows() -> Vec<Device> {
-    let mut i = inner().lock().expect("devices lock poisoned");
+    let mut i = REGISTRY.lock().expect("devices lock poisoned");
     visible_rows(&mut i)
 }
 
@@ -335,13 +319,7 @@ fn visible_rows_gated(i: &mut Inner, usb_on: bool) -> Vec<Device> {
 }
 
 // ------------------------------------------------------------------ events
-
-/// Mirror one presence event to the log (also used by `--headless`).
-pub fn log_presence(ev: &DeviceEvent) {
-    log_event(ev.kind, &ev.ip, ev.name.as_deref(), ev.connected, ev.ts_ms);
-}
-
-fn log_event(kind: &str, ip: &str, name: Option<&str>, connected: bool, ts_ms: i64) {
+pub(crate) fn log_event(kind: &str, ip: &str, name: Option<&str>, connected: bool, ts_ms: i64) {
     tracing::info!(
         "[presence] event kind={kind} ip={ip} connected={connected} name={:?} ts_ms={ts_ms}",
         name.unwrap_or("-")
@@ -351,7 +329,7 @@ fn log_event(kind: &str, ip: &str, name: Option<&str>, connected: bool, ts_ms: i
 /// Apply one in-process `DeviceEvent` (also the bridge path after JSON
 /// decode). Every event is mirrored to the log for live verification.
 pub fn apply_event(ev: &DeviceEvent) {
-    let mut i = inner().lock().expect("devices lock poisoned");
+    let mut i = REGISTRY.lock().expect("devices lock poisoned");
     log_event(ev.kind, &ev.ip, ev.name.as_deref(), ev.connected, ev.ts_ms);
     ingest_event(&mut i, ev.kind, &ev.ip, ev.name.as_deref(), ev.connected);
     sync_paired(&mut i);
@@ -498,7 +476,8 @@ fn is_model_name(name: &str) -> bool {
 /// are dropped. The unified binary feeds this model from the in-process
 /// broadcast, so its own bridge port is for external consumers, not us.
 fn spawn_bridge_consumers() {
-    let Ok(csv) = std::env::var("OPLUS_EVENTS_PORT") else {
+    let cfg = crate::config::Config::load();
+    let Some(csv) = cfg.events.oplus_subscribers.clone() else {
         return;
     };
     for port in csv.split(',').filter_map(|s| s.trim().parse::<u16>().ok()) {
@@ -519,7 +498,7 @@ fn spawn_bridge_consumers() {
                         }
                         if let Ok(ev) = serde_json::from_str::<WireEvent>(line.trim()) {
                             log_event(&ev.kind, &ev.ip, ev.name.as_deref(), ev.connected, ev.ts_ms);
-                            let mut i = inner().lock().expect("devices lock poisoned");
+                            let mut i = REGISTRY.lock().expect("devices lock poisoned");
                             ingest_event(
                                 &mut i,
                                 &ev.kind,

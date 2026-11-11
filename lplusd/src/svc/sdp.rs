@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use strum::{Display, EnumString};
 use tokio::net::UdpSocket;
 
+use crate::config::{flag, hex_bytes, ipv4, num, ports, setting_str, str_of};
 use crate::svc::{epi, scp_server};
 
 /// Configuration for one responder instance.
@@ -59,15 +60,6 @@ impl Default for SdpdConfig {
     }
 }
 
-/// `ScpSyncData.modelId` as sent on the wire. Their validator
-/// (`appcore/utils/g.java:318`) requires exactly 3 bytes, so the device
-/// name must never be used here. Override with `SCP_MODEL`.
-fn scp_model() -> String {
-    // The phone hex-decodes SyncData.model_id and demands exactly 3 bytes
-    // (discovery.ext.a.b); "000" makes it throw 2506.
-    std::env::var("SCP_MODEL").unwrap_or_else(|_| "2B1488".to_string())
-}
-
 /// Render one sdp/1 message: request/verb line + our identity headers.
 pub fn render(verb_line: &str, cfg: &SdpdConfig, extra: &[(&str, &str)]) -> String {
     let mut msg = format!("{verb_line}\r\nMAN: \"sdp/1\"\r\n");
@@ -86,11 +78,6 @@ pub fn render(verb_line: &str, cfg: &SdpdConfig, extra: &[(&str, &str)]) -> Stri
     msg.push_str(&format!("AD: {}\r\n", cfg.ad));
     msg.push_str(&format!("DT: {}\r\n", cfg.dt));
     msg.push_str(&format!("DN: {}\r\n", cfg.name));
-    // Their cpkit discovery record keeps `modelId` as 3 bytes (TypeTag
-    // `ModelId`, hex); SDP peers may carry it as a header. A/B via env.
-    if let Ok(mh) = std::env::var("SCP_MODEL_HEX") {
-        msg.push_str(&format!("ModelId: {mh}\r\n"));
-    }
     msg.push_str(&format!("VIRTUAL_IP: {}\r\n", cfg.vip));
     for (k, v) in extra {
         msg.push_str(&format!("{k}: {v}\r\n"));
@@ -111,12 +98,15 @@ pub fn default_vip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".into())
 }
 
-/// The machine's own name (cross-platform, via `whoami`).
+/// The machine's own name (cross-platform, via `whoami`). `whoami` needs
+/// its `std` feature for the real `gethostname`; a literal `localhost`
+/// (stub or misconfigured box) is useless as a beacon name, so it falls
+/// through to the caller's default.
 pub fn system_hostname() -> Option<String> {
     whoami::hostname()
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("localhost"))
 }
 
 /// First line of an sdp/1 datagram: e.g. `QUERY * HTTP/1.1`.
@@ -170,11 +160,60 @@ fn ksc_store() -> std::collections::HashMap<String, KscRecord> {
         .unwrap_or_default()
 }
 
-fn ksc_stored(peer_key: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn ksc_stored(peer_key: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     let r = ksc_store().remove(peer_key)?;
     let ksc = hex::decode(&r.ksc).ok()?;
     let alias = hex::decode(&r.alias).ok()?;
     (ksc.len() == 16 && alias.len() == 6).then_some((ksc, alias))
+}
+
+/// The store's only row, when exactly one peer is bonded. A phone's LAN IP
+/// is DHCP-dynamic, so the key written at pairing can go stale; with a
+/// single bond the AUTH exchange itself is the identity gate (a wrong peer
+/// gets `KSC_ERROR`), and `remember_ksc` re-keys the row to the fresh IP on
+/// success. Multi-bond stores deliberately return None — there the IP/
+/// claimed-id keys must match.
+pub(crate) fn single_bond() -> Option<KscRecord> {
+    let mut rows = ksc_store().into_values();
+    let r = rows.next()?;
+    rows.next().is_none().then_some(r)
+}
+
+/// Whether the bond store covers an announcing peer, so a dial is worth
+/// spending. The SDP `PDID` header is the phone's real identity — live
+/// capture 2026-11-11 (PROTOCOL.md §4) shows it queries with its 6-byte
+/// OnetId, equal to the bonded `device_id` row — so match it against the
+/// rows' `device_id`; an exact IP-key row still counts (written at
+/// pairing), and when the announcement carried no PDID the single-bond
+/// fallback applies (AUTH then decides and re-keys). A PDID that matches no
+/// row is a different phone — never dial it.
+pub(crate) fn bond_covers(rows: &[(String, KscRecord)], ip: &str, pdid: Option<&str>) -> bool {
+    if let Some(p) = pdid
+        && rows
+            .iter()
+            .any(|(_, r)| !r.device_id.is_empty() && r.device_id.eq_ignore_ascii_case(p))
+    {
+        return true;
+    }
+    if rows.iter().any(|(k, _)| k == ip) {
+        return true;
+    }
+    pdid.is_none() && rows.len() == 1
+}
+
+/// Store-reading wrapper for `svc::autolink`.
+pub(crate) fn bond_announced(ip: &str, pdid: Option<&str>) -> bool {
+    let rows: Vec<(String, KscRecord)> = ksc_store().into_iter().collect();
+    bond_covers(&rows, ip, pdid)
+}
+
+/// The full stored bond row for `peer_key` (ksc + alias + the device id
+/// the peer claims). The PC-dialed EPI lane needs the recorded device id:
+/// the phone's DataBus broker only routes topic messages whose sender id
+/// matches the peer identity its registry knows.
+pub(crate) fn ksc_bond(peer_key: &str) -> Option<KscRecord> {
+    let r = ksc_store().remove(peer_key)?;
+    (hex::decode(&r.ksc).is_ok() && hex::decode(&r.alias).is_ok()).then_some(r)
 }
 
 fn ksc_store_put(peer_key: &str, device_id: &str, ksc: &[u8], alias: &[u8]) {
@@ -204,24 +243,17 @@ fn ksc_rand(n: usize) -> Vec<u8> {
     v
 }
 
-/// Operator pin: `SCP_KSC` hex forces the key for every peer (pairing
-/// material restored from `settings.json` arrives here via the seed).
-fn ksc_pin() -> Option<Vec<u8>> {
-    std::env::var("SCP_KSC")
-        .ok()
-        .and_then(|h| hex::decode(h.trim().replace(':', "")).ok())
-        .filter(|v| v.len() == 16)
-}
-
+/// Operator pin: `scpKsc` in `settings.json` forces the key for every
+/// peer (pairing material restored from the panel settings).
 /// The key pair to present to (and verify against) `peer_key`. Stored
 /// bond wins so resumption always replays what the phone persisted; a
 /// first pairing mints the random pair and persists it (vendor `b.java`
 /// behavior). `SCP_KSC` pins over everything for restored bonds.
-pub(crate) fn issue_ksc(peer_key: &str, device_id: &str) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn issue_ksc(pin: Option<&[u8]>, peer_key: &str, device_id: &str) -> (Vec<u8>, Vec<u8>) {
     if let Some(pair) = ksc_stored(peer_key) {
         return pair;
     }
-    let ksc = ksc_pin().unwrap_or_else(|| ksc_rand(16));
+    let ksc = pin.map(<[u8]>::to_vec).unwrap_or_else(|| ksc_rand(16));
     let alias = ksc_rand(6);
     ksc_store_put(peer_key, device_id, &ksc, &alias);
     (ksc, alias)
@@ -241,7 +273,7 @@ pub(crate) fn remember_ksc(peer_key: &str, device_id: &str, ksc: &[u8]) {
 /// it claims. AUTH succeeds only against a bond we handed out — an
 /// unpaired peer gets no response and the phone surfaces `KSC_ERROR`,
 /// which is the correct nudge to re-pair.
-pub(crate) fn ksc_candidates(peer_key: &str, dev_key: &str) -> Vec<Vec<u8>> {
+pub(crate) fn ksc_candidates(pin: Option<&[u8]>, peer_key: &str, dev_key: &str) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     for key in [peer_key, dev_key] {
         if let Some((ksc, _)) = ksc_stored(key)
@@ -250,10 +282,10 @@ pub(crate) fn ksc_candidates(peer_key: &str, dev_key: &str) -> Vec<Vec<u8>> {
             out.push(ksc);
         }
     }
-    // The settings-restored pin (main.rs seeds SCP_KSC from settings.json)
-    // must keep verifying until a successful AUTH promotes it into a bond.
-    if let Some(k) = ksc_pin() {
-        out.push(k);
+    // The settings-pinned bond must keep verifying until a successful
+    // AUTH promotes it into a bond.
+    if let Some(k) = pin {
+        out.push(k.to_vec());
     }
     out
 }
@@ -270,11 +302,6 @@ fn ksc_mac8(ksc: &[u8], data: &[u8]) -> [u8; 8] {
     o.copy_from_slice(&r[..8]);
     o
 }
-
-fn be8(v: u64) -> [u8; 8] {
-    v.to_be_bytes()
-}
-
 /// Capability-exchange QUERY: `01 | queryType u8 | checksum u32be (present
 /// iff queryType==3) | recordNum u8 | recordNum x (profileId UTF-8 + 0x3B)`.
 /// Mirrors `wf/i.d(3, 0, list)` + `datatrans/service/f.y()` composer; the
@@ -292,6 +319,16 @@ pub(crate) fn capex_query(profiles: &[&str]) -> Vec<u8> {
 /// Phone (`f.i`) only enforces statusCode == 0.
 pub(crate) fn capex_confirm(accessory_id: u16, status: u8) -> Vec<u8> {
     vec![0x04, (accessory_id >> 8) as u8, accessory_id as u8, status]
+}
+
+/// KMS bootstrap port span: `KMS_PORT` base (default 36863) plus
+/// `KMS_PORT_ROT` candidates (default 4, clamped 1..16). `KMS_PORT_ROT=1`
+/// reproduces the historical fixed-port behavior.
+impl Sdp {
+    /// Listener/rotation span; `max(1)` keeps a mis-set rot usable.
+    pub(crate) fn kms_port_span(&self) -> u16 {
+        self.gcfg.kms.port_rot.max(1)
+    }
 }
 
 /// Rebuild the link-detection reply by mirroring the phone's own probe
@@ -320,7 +357,11 @@ fn link_reply_mirror(
     if fdi + 3 + 6 > r.len() {
         return None;
     }
-    r[fdi + 3..fdi + 3 + 6].copy_from_slice(&mac6.iter().rev().copied().collect::<Vec<_>>());
+    {
+        let mut rev = *mac6;
+        rev.reverse();
+        r[fdi + 3..fdi + 3 + 6].copy_from_slice(&rev);
+    }
     // The `0b 01 fc` entry carries the peer link IPv4 (LE first 4 bytes) —
     // LinkSwitchMgr installs `to <link_ip> dev wlan0 src <vgate>` for it, so
     // publishing our real IP there black-holes every phone->PC TCP lane
@@ -331,7 +372,11 @@ fn link_reply_mirror(
     if fci + 3 + 4 > r.len() {
         return None;
     }
-    r[fci + 3..fci + 3 + 4].copy_from_slice(&route_ip.iter().rev().copied().collect::<Vec<_>>());
+    {
+        let mut rev = *route_ip;
+        rev.reverse();
+        r[fci + 3..fci + 3 + 4].copy_from_slice(&rev);
+    }
     // The trailing `01 fc | gw6` entry is the peer virtual-gateway IP: the
     // phone stores it in peer_devices and dials the active_connection lane
     // to it (ConnectConfig.peerAddress). Left mirrored, the phone would
@@ -340,7 +385,11 @@ fn link_reply_mirror(
     // KSC_ERROR/-2104. Publish our IP there instead.
     let fci2 = r.windows(2).rposition(|w| w == [0x01, 0xfc])?;
     if fci2 >= fci && fci2 + 2 + 4 <= r.len() {
-        r[fci2 + 2..fci2 + 2 + 4].copy_from_slice(&ip4.iter().rev().copied().collect::<Vec<_>>());
+        {
+            let mut rev = *ip4;
+            rev.reverse();
+            r[fci2 + 2..fci2 + 2 + 4].copy_from_slice(&rev);
+        }
     }
     // `known_peer_devices`: trailing `[count u8][len u8 + id]*` block (79B
     // live frame carried count=1 "A1B2C3D4E5F6"). Echo the peer ids the phone
@@ -368,7 +417,7 @@ fn link_reply_mirror(
 /// (`sessionId: 64, fragmentation: 3` from `01 03`) and drop with
 /// `Session Details not present for 64` — sessionId 2 is the capex
 /// listener (`f643a`), so the header must encode sid = 2.
-fn sess_frame(payload: &[u8], session_id: u16) -> Vec<u8> {
+pub(crate) fn sess_frame(payload: &[u8], session_id: u16) -> Vec<u8> {
     let hdr: u16 = session_id << 2;
     let l = (payload.len() + 2) as u16;
     let mut v = Vec::with_capacity(4 + payload.len());
@@ -379,22 +428,12 @@ fn sess_frame(payload: &[u8], session_id: u16) -> Vec<u8> {
 }
 
 /// Capex frames ride the session lane unless `EPI_CAPEX_FRAME=bare`.
-pub(crate) fn capex_frame(payload: &[u8]) -> Vec<u8> {
-    if std::env::var("EPI_CAPEX_FRAME").as_deref() == Ok("bare") {
-        dt_frame(payload)
+pub(crate) fn capex_frame(f: &crate::svc::epi::EpiConfig, payload: &[u8]) -> Vec<u8> {
+    if f.capex_frame == "bare" {
+        dt_frame(f, payload)
     } else {
         sess_frame(payload, 2)
     }
-}
-
-/// SessionDeviceInfoResponse (msgType 101): body is the device name as raw
-/// UTF-8 after the msgType byte (`session/a.java:878` reader takes the
-/// remainder as `deviceName`). Fills the phone's blank PC card name.
-fn session_info_frame(name: &str, session_id: u16) -> Vec<u8> {
-    let mut body = Vec::with_capacity(1 + name.len());
-    body.push(101);
-    body.extend_from_slice(name.as_bytes());
-    sess_frame(&body, session_id)
 }
 
 /// IEEE CRC32 (matches `java.util.zip.CRC32` used by `wf/i.c`).
@@ -467,13 +506,13 @@ pub(crate) fn capex_response(profiles: &[&str]) -> Vec<u8> {
 
 /// Frame one datatrans payload honoring `EPI_FRAMING` (default connector
 /// 2-byte `[00][len]`; `raw3`/`3b` legacy variants).
-fn dt_frame(payload: &[u8]) -> Vec<u8> {
+pub(crate) fn dt_frame(f: &crate::svc::epi::EpiConfig, payload: &[u8]) -> Vec<u8> {
     let l = payload.len() as u16;
-    if std::env::var("EPI_FRAMING").as_deref() == Ok("raw3") {
+    if f.framing == "raw3" {
         let mut v = vec![0x00, (l >> 8) as u8, (l & 0xff) as u8];
         v.extend_from_slice(payload);
         v
-    } else if std::env::var("EPI_FRAMING").as_deref() == Ok("3b") {
+    } else if f.framing == "3b" {
         let mut crc: u16 = 0;
         for &b in payload {
             crc = CRC16_TABLE[((crc as u8) ^ b) as usize] ^ (crc >> 8);
@@ -532,16 +571,36 @@ const fn crc16_table() -> [u16; 256] {
 }
 static CRC16_TABLE: [u16; 256] = crc16_table();
 
-/// Parse the dbr.a DbsMessage out of a DataBus sid-8 payload (after the
-/// `[b0, tid u16be]` prefix: 52 B body, JSON from 55; `kms::dbs_data_frame`
-/// docs). Only broadcast msgTypes 42/82 carry a DbsMessage — the phone's
-/// `DbsDataReceiver` (`bf/c.java` case 0) parses nothing else.
+/// Parse the dbr.a DbsMessage out of a DataBus sid-8 payload. Both prefix
+/// forms are accepted: the legacy `[b0][tid u16be]` (body from 3, JSON from
+/// 55) and the wire DATA form `[0x04][tid u16be][ctr u64be]` that both ends
+/// now write (body from 11). Only broadcast msgTypes 42/82 carry a
+/// DbsMessage — the phone's `DbsDataReceiver` (`bf/c.java` case 0) parses
+/// nothing else.
 fn dbs_payload_json(payload: &[u8]) -> Option<serde_json::Value> {
-    let body = payload.get(3..55)?;
-    if !matches!(body[26], 42 | 82) {
-        return None;
+    // dbr.a (`g5/b.java s()`): 44 B fixed header, destination count (4 B
+    // BE), count x 6 B ids, extra length (4 B BE), extra bytes, JSON.
+    // prefix 11 skips `[04][tid][ctr8]`; prefix 3 keeps the ctr view the
+    // phone's own sealed frames use, so dbr.a rides 8 bytes deeper.
+    for (prefix, dbr) in [(3usize, 8usize), (11, 0)] {
+        let body = payload.get(prefix + dbr..)?;
+        if body.len() < 56 || !matches!(body[26], 42 | 82) {
+            continue;
+        }
+        let count = u32::from_be_bytes(body[44..48].try_into().ok()?) as usize;
+        if count > 255 {
+            continue;
+        }
+        let extra_off = 48 + 6 * count;
+        let extra_len =
+            u32::from_be_bytes(body.get(extra_off..extra_off + 4)?.try_into().ok()?) as usize;
+        if let Some(rest) = body.get(extra_off + 4 + extra_len..)
+            && let Ok(v) = serde_json::from_slice(rest)
+        {
+            return Some(v);
+        }
     }
-    serde_json::from_slice(payload.get(55..)?).ok()
+    None
 }
 
 /// Best-effort system clipboard write: wl-copy (wayland) then xclip (X11).
@@ -595,7 +654,8 @@ pub struct DeviceEvent {
 /// config, the presence broadcast, the last-seen phone peer, and a handle
 /// on the EPI registry the session pump injects through.
 pub struct Sdp {
-    cfg: SdpdConfig,
+    /// Wire/identity knobs for this daemon instance.
+    pub cfg: SdpdConfig,
     /// Cached REGISTER probe reply handed to accepted sessions.
     probe_reg: Vec<u8>,
     /// Last LAN peer that probed the SDP planes (the phone). Used to
@@ -604,11 +664,35 @@ pub struct Sdp {
     /// Presence events for in-process consumers (the product embeds the
     /// daemon; external subscribers use the NDJSON bridge).
     device_tx: tokio::sync::broadcast::Sender<DeviceEvent>,
-    epi: Arc<crate::svc::epi::Epi>,
+    /// Live EPI sink registry + command bus (session pumps inject here).
+    pub epi: Arc<crate::svc::epi::Epi>,
+    /// Index into the KMS bootstrap port span (`KMS_PORT`..+`KMS_PORT_ROT`);
+    /// advanced per bootstrap session so the phone's same-port `start()`
+    /// guard can never strand a stale ClientSocket (PROTOCOL §7.2).
+    kms_rot: std::sync::atomic::AtomicU16,
+    /// LAN peers that recently delivered sdp/1 traffic to us (phone QUERY /
+    /// ANNOUNCE rounds every few seconds) → (last-seen, last SDP `PDID`).
+    /// The address book for boot auto-link: a DHCP-renumbered phone
+    /// re-announces itself, no IP list is persisted anywhere
+    /// (`svc::autolink`).
+    announced: std::sync::Mutex<HashMap<String, (Instant, Option<String>)>>,
+    /// Global daemon configuration (nested sections, `Arc`-shared).
+    pub gcfg: std::sync::Arc<crate::config::Config>,
+    /// Pinned KSC (16 B) from config/settings for the PC-dialed lane.
+    ksc_pin: Option<Vec<u8>>,
 }
 
 impl Sdp {
     pub fn new(cfg: SdpdConfig, epi: Arc<crate::svc::epi::Epi>) -> Arc<Self> {
+        Self::with_config(cfg, epi, std::sync::Arc::new(crate::config::Config::load()))
+    }
+
+    /// Build with an explicit global config (tests / embedders).
+    pub fn with_config(
+        cfg: SdpdConfig,
+        epi: Arc<crate::svc::epi::Epi>,
+        gcfg: std::sync::Arc<crate::config::Config>,
+    ) -> Arc<Self> {
         let mut cfg = cfg;
         if cfg.vip.trim().is_empty() {
             cfg.vip = default_vip();
@@ -616,25 +700,27 @@ impl Sdp {
         }
         let (device_tx, _) = tokio::sync::broadcast::channel(64);
         let probe_reg = render("REGISTER * HTTP/1.1", &cfg, &[]).into_bytes();
+        // Stored index is the last port handed to the phone; `begin_kms_session`
+        // advances from it, so the first bootstrap never repeats that port
+        // (a fresh daemon defaults to base, matching the pre-rotation history).
+        let kms_rot = std::sync::atomic::AtomicU16::new(
+            std::fs::read_to_string(crate::state::kms_rot_path())
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok())
+                .unwrap_or(0),
+        );
+        let ksc_pin = gcfg.pairing.ksc_pin.clone();
         Arc::new(Self {
             cfg,
+            gcfg,
+            ksc_pin,
             probe_reg,
             phone_ip: std::sync::Mutex::default(),
             device_tx,
             epi,
+            kms_rot,
+            announced: std::sync::Mutex::new(HashMap::new()),
         })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.cfg.name
-    }
-
-    pub fn cfg(&self) -> &SdpdConfig {
-        &self.cfg
-    }
-
-    pub fn epi(&self) -> &Arc<crate::svc::epi::Epi> {
-        &self.epi
     }
 
     /// Subscribe to the presence event stream.
@@ -646,6 +732,45 @@ impl Sdp {
         if let Ok(mut g) = self.phone_ip.lock() {
             *g = Some(ip.to_string());
         }
+    }
+
+    /// Record sdp/1 traffic from `ip` (called for every inbound SDP/UNI
+    /// datagram; the phone re-sends QUERY/ANNOUNCE rounds every few
+    /// seconds, so freshness doubles as liveness). `pdid` is the SDP header
+    /// identity when the datagram carried one.
+    pub(crate) fn note_announced(&self, ip: &str, pdid: Option<String>) {
+        if let Ok(mut m) = self.announced.lock() {
+            let now = Instant::now();
+            match m.get_mut(ip) {
+                Some(e) => {
+                    e.0 = now;
+                    if pdid.is_some() {
+                        e.1 = pdid;
+                    }
+                }
+                None => {
+                    m.insert(ip.to_string(), (now, pdid));
+                }
+            }
+        }
+    }
+
+    /// Peers seen on the SDP planes within `max_age`, oldest first, with
+    /// their last SDP `PDID` if ever observed.
+    pub(crate) fn announced_peers(&self, max_age: Duration) -> Vec<(String, Option<String>)> {
+        let mut v: Vec<(Instant, String, Option<String>)> = self
+            .announced
+            .lock()
+            .ok()
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, (t, _))| t.elapsed() < max_age)
+                    .map(|(ip, (t, p))| (*t, ip.clone(), p.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v.into_iter().map(|(_, ip, p)| (ip, p)).collect()
     }
 
     /// Resolve the `"phone"` shorthand device-action target to the last
@@ -666,12 +791,78 @@ impl Sdp {
 
     /// KMS bootstrap frame for the configured KMS port/password and VIP.
     pub(crate) fn kms_bootstrap_frame(&self, from_hex: &str, to_hex: &str) -> Result<Vec<u8>> {
-        let kms_port = std::env::var("KMS_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(36863u16);
-        let pwd = std::env::var("KMS_PWD").unwrap_or_else(|_| "lplus-kms-pw".into());
-        kms_bootstrap_frame(kms_port, &pwd, &self.cfg.vip, from_hex, to_hex)
+        let (kms_port, pwd, vip) = self.kms_bootstrap_env();
+        kms_bootstrap_frame(kms_port, &pwd, &vip, from_hex, to_hex)
+    }
+
+    /// msg-61 sealed under AppCipher ([`crate::svc::kms::dbs_seal`]) — the
+    /// only sid-8 body form the phone's receiver decrypts and routes to
+    /// `CastDbsReceiver` (PROTOCOL.md §7.11).
+    pub(crate) fn kms_bootstrap_sealed_frame(
+        &self,
+        ksc: &[u8],
+        qcqs: &[u8],
+        ctr: u64,
+        from_hex: &str,
+        to_hex: &str,
+        tid: u16,
+    ) -> Result<Vec<u8>> {
+        let (kms_port, pwd, vip) = self.kms_bootstrap_env();
+        let (json, seq) = kms_bootstrap_json(kms_port, &pwd, &vip, from_hex, to_hex)?;
+        let from6: [u8; 6] = hex::decode(from_hex)?.as_slice().try_into()?;
+        let to6: [u8; 6] = hex::decode(to_hex)?.as_slice().try_into()?;
+        crate::svc::kms::dbs_data_frame_sealed(
+            &crate::svc::kms::DbsSealCtx { ksc, qcqs },
+            ctr,
+            &from6,
+            &to6,
+            seq,
+            tid,
+            json.as_bytes(),
+        )
+    }
+
+    /// msg-61 sealed with the DbsMessage JSON as the raw GCM plaintext
+    /// (no dbr.a 52 B header) — A/B against the header-bearing form.
+    pub(crate) fn kms_bootstrap_sealed_json_only(
+        &self,
+        ksc: &[u8],
+        qcqs: &[u8],
+        ctr: u64,
+        from_hex: &str,
+        to_hex: &str,
+        tid: u16,
+    ) -> Result<Vec<u8>> {
+        let (kms_port, pwd, vip) = self.kms_bootstrap_env();
+        let (json, _seq) = kms_bootstrap_json(kms_port, &pwd, &vip, from_hex, to_hex)?;
+        let ct = crate::svc::kms::dbs_seal(ksc, qcqs, ctr, json.as_bytes())?;
+        let mut payload = vec![0x04u8, (tid >> 8) as u8, tid as u8];
+        payload.extend_from_slice(&ctr.to_be_bytes());
+        payload.extend_from_slice(&ct);
+        Ok(crate::svc::kms::dbs_wrap(payload))
+    }
+
+    /// Arm a new KMS bootstrap session: advance the persisted port
+    /// rotation so the msg-61 `kms_socket_port` differs from the previous
+    /// one. The phone's `CastSocketInputHost.start()` returns without
+    /// reconnecting when `mStarted` is stale-true and the port matches
+    /// (live 2026-11-11: "already started with same port=36863, return"),
+    /// so every fresh Connect must present a new port to force
+    /// `stopInternal()` + redial. All span ports carry a `Kms` listener
+    /// (`svc::run`).
+    pub(crate) fn begin_kms_session(&self) {
+        let span = self.kms_port_span();
+        let next = (self.kms_rot.load(std::sync::atomic::Ordering::Relaxed) + 1) % span;
+        self.kms_rot
+            .store(next, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::write(crate::state::kms_rot_path(), next.to_string());
+    }
+
+    fn kms_bootstrap_env(&self) -> (u16, String, String) {
+        let kms_port = self.gcfg.kms.port_base
+            + self.kms_rot.load(std::sync::atomic::Ordering::Relaxed) % self.kms_port_span();
+        let pwd = self.gcfg.kms.pwd.clone();
+        (kms_port, pwd, self.cfg.vip.clone())
     }
 
     pub(crate) fn emit_device(
@@ -696,15 +887,17 @@ impl Sdp {
     }
 }
 
-/// CastMessage msg_type=61 wrapped in the proven DbsMessage/DataBus frame
-/// (PROTOCOL.md §7.2). `from` is our peer id, `to` the phone PDID.
-pub(crate) fn kms_bootstrap_frame(
+/// CastMessage msg_type=61 DbsMessage JSON (PROTOCOL.md §7.2): the value
+/// `msg_body` carries `kms_socket_port`/`local_ip`/`randomPwd`/`testData`,
+/// which the phone's `InputServiceManager.execute(61, …)` consumes before
+/// dialing our KMS. Returns `(json, seq)` so the caller can also seal it.
+pub(crate) fn kms_bootstrap_json(
     kms_port: u16,
     pwd: &str,
     local_ip: &str,
     from_hex: &str,
     to_hex: &str,
-) -> Result<Vec<u8>> {
+) -> Result<(String, u64)> {
     let td = crate::svc::kms::make_test_data(pwd)?;
     let body = format!(
         "{{\"kms_socket_port\":{kms_port},\"local_ip\":\"{local_ip}\",\"display_id\":0,\
@@ -726,6 +919,18 @@ pub(crate) fn kms_bootstrap_frame(
         &cast,
         seq,
     );
+    Ok((json, seq))
+}
+
+/// The msg-61 JSON wrapped in the proven plaintext DataBus frame (§7.2).
+pub(crate) fn kms_bootstrap_frame(
+    kms_port: u16,
+    pwd: &str,
+    local_ip: &str,
+    from_hex: &str,
+    to_hex: &str,
+) -> Result<Vec<u8>> {
+    let (json, seq) = kms_bootstrap_json(kms_port, pwd, local_ip, from_hex, to_hex)?;
     let from6: [u8; 6] = hex::decode(from_hex)?.as_slice().try_into()?;
     let to6: [u8; 6] = hex::decode(to_hex)?.as_slice().try_into()?;
     Ok(crate::svc::kms::dbs_data_frame(
@@ -756,6 +961,7 @@ enum AckMode {
 impl Sdp {
     /// Run the responder until the process is killed.
     pub async fn run(self: &Arc<Self>) -> Result<()> {
+        let gcfg = self.gcfg.clone();
         let cfg = self.cfg.clone();
         let mcast = UdpSocket::bind(("0.0.0.0", cfg.sdp_port))
             .await
@@ -784,12 +990,7 @@ impl Sdp {
         }
         let log_path = cfg.log_path.clone();
         scp_server::bind_sessions(self, &scp_ports).await?;
-        epi::Epi::bind_sessions(
-            self,
-            &[46888u16, 47888, 48888],
-            std::env::var("EPI").is_ok(),
-        )
-        .await?;
+        epi::Epi::bind_sessions(self, &[46888u16, 47888, 48888], true).await?;
         tracing::info!(
             "sdp up: :{} (mcast {}) :{} (uni) tcp{:?} epi[46888,47888,48888]",
             cfg.sdp_port,
@@ -841,18 +1042,15 @@ impl Sdp {
         // datagram as `Received response:`).
         // SERVICE-PUBLISH of the LinkSwitch LinkInfoPayload (TLV+bincode bytes,
         // base64 in NSData), sent fast so a mid-session window can't miss it.
-        let link_pub_bytes: Option<Vec<u8>> = std::env::var("LINKPUB")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| hex::decode(&s).unwrap_or_else(|_| s.as_bytes().to_vec()))
-            .or_else(|| {
-                Some(link_info_payload(
-                    &link_mac_spec(),
-                    &cfg.vip,
-                    &gateway_of(&cfg.vip),
-                ))
-            });
-        if let Ok(spec) = std::env::var("LINK_PORTS") {
+        let link_pub_bytes: Option<Vec<u8>> = gcfg.link.pub_hex.clone().or_else(|| {
+            Some(link_info_payload(
+                &link_mac_spec(),
+                &cfg.vip,
+                &gateway_of(&cfg.vip),
+            ))
+        });
+        let link_probe_ports: Vec<u16> = gcfg.link.ports.clone();
+        if !link_probe_ports.is_empty() {
             // Reply template: mirror the phone's own 66B link-detection frame
             // (captured live): `[00 40][0c][PDID ascii 12][01 38 02 01 00]
             //  entry{0b 01 fd | mac6 LE | 0*8} entry{0b 01 fc | ip4 LE 0*2 0*6}
@@ -897,7 +1095,7 @@ impl Sdp {
             tracing::info!("[link-det] reply {}B prepared", link_reply.len());
             // Mirror-reply identity (phone's bincode decoder only accepts its
             // own self-consistent payload shape; see link_reply_mirror).
-            let mirror_on = std::env::var("LINK_REPLY_MIRROR").as_deref() != Ok("0");
+            let mirror_on = true;
             let mut pdid12 = [b'0'; 12];
             let pdid_s = format!("{:0<12}", cfg.pdid).to_uppercase();
             pdid12.copy_from_slice(&pdid_s.as_bytes()[..12]);
@@ -915,45 +1113,17 @@ impl Sdp {
             if oct.len() == 4 {
                 ip4o.copy_from_slice(&oct);
             }
-            // Peer link_ip published for LinkSwitchMgr's route install; the phone
-            // has no vgate return path for our LAN IP, so route-poison with an
-            // unreachable address unless LINK_POISON_IP=off.
-            let poison: Option<[u8; 4]> = match std::env::var("LINK_POISON_IP").as_deref() {
-                Ok("off") => None,
-                _ => {
-                    let spec =
-                        std::env::var("LINK_POISON_IP").unwrap_or_else(|_| "192.0.2.16".into());
-                    let o: Vec<u8> = spec.split('.').map(|s| s.parse().unwrap_or(0u8)).collect();
-                    if o.len() == 4 {
-                        Some([o[0], o[1], o[2], o[3]])
-                    } else {
-                        Some([192, 0, 2, 16])
-                    }
-                }
-            };
-            let ack_mode = std::env::var("LINK_ACK").unwrap_or_default();
-            let link_hex: Option<Vec<u8>> = std::env::var("LINK_REPLY_HEX")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .and_then(|s| hex::decode(s.replace(':', "")).ok());
-            let link_type: Option<u8> = std::env::var("LINK_REPLY_TYPE")
-                .ok()
-                .and_then(|s| s.parse().ok());
-            // Hot-swappable reply override: file path re-read on every probe so a sweep
-            // can change the reply without restarting the daemon.
-            let link_hex_file: Option<String> = std::env::var("LINK_REPLY_HEX_FILE")
-                .ok()
-                .filter(|s| !s.is_empty());
+            // Peer link_ip published for LinkSwitchMgr's route install; the
+            // phone has no vgate return path for our LAN IP, so route-poison
+            // with an unreachable TEST-NET address.
+            let poison: Option<[u8; 4]> = gcfg.link.poison;
+            let ack_mode = gcfg.link.ack.clone();
+            let link_hex: Option<Vec<u8>> = gcfg.link.reply_hex.clone();
+            let link_type: Option<u8> = None;
+            let link_hex_file: Option<String> = gcfg.link.reply_hex_file.clone();
             // known_peer_devices ids for the mirror reply (comma-separated).
-            let kpd: Vec<Vec<u8>> = std::env::var("LINK_KPD")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.split(',').map(|x| x.trim().as_bytes().to_vec()).collect())
-                .unwrap_or_default();
-            for ps in spec.split(',').map(|s| s.trim()) {
-                let Ok(p): Result<u16, _> = ps.parse() else {
-                    continue;
-                };
+            let kpd: Vec<Vec<u8>> = gcfg.link.kpd.clone();
+            for &p in &link_probe_ports {
                 let log_path = log_path.clone();
                 let reply_src = link_reply.clone();
                 let ack_mode = ack_mode.clone();
@@ -971,7 +1141,7 @@ impl Sdp {
                     let mut buf = vec![0u8; 2048];
                     loop {
                         if let Ok((n, from)) = sock.recv_from(&mut buf).await {
-                            if n == 0 || from.ip().to_string().starts_with("127.") {
+                            if n == 0 || from.ip().is_loopback() {
                                 continue;
                             }
                             tracing::info!(
@@ -1036,7 +1206,7 @@ impl Sdp {
                 });
             }
         }
-        let linkns = std::env::var("LINKNS").unwrap_or_else(|_| "LinkSwitchMgr".into());
+        let linkns = gcfg.link.ns.clone();
         let link_b64 = link_pub_bytes.as_ref().map(|raw| {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode(raw)
@@ -1168,9 +1338,15 @@ impl Sdp {
         let reg59399 = self.probe_reg.clone();
         let epi_svc = self.epi.clone();
         let sdp = self.clone();
+        let epic = self.gcfg.epi.clone();
+        let scp = self.gcfg.scp.clone();
+        let gcfg = self.gcfg.clone();
         let task = tokio::spawn({
             let sdp = sdp.clone();
             let epi_svc = epi_svc.clone();
+            let epic = epic.clone();
+            let scp = scp.clone();
+            let gcfg = gcfg.clone();
             async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 if epi {
@@ -1178,16 +1354,9 @@ impl Sdp {
                     // ProtocolVersion<=10 so the 39B account block is skipped):
                     // [0]msgType [1..3)proto u16be [3..39)PeerId 36B [39]SapModes
                     // [40]featureCount=0.
-                    let mtype: u8 = std::env::var("EPI_TYPE")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(1);
-                    let proto: u16 = std::env::var("EPI_PROTO")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(10);
-                    let peer_id: String =
-                        std::env::var("EPI_PEERID").unwrap_or_else(|_| "A1B2C3D4E5F6".repeat(3));
+                    let mtype: u8 = epic.offer_type;
+                    let proto: u16 = epic.offer_proto;
+                    let peer_id: String = epic.peer_id.clone();
                     let mut peer_id = peer_id.clone();
                     if peer_id.len() < 36 {
                         while peer_id.len() < 36 {
@@ -1195,7 +1364,7 @@ impl Sdp {
                         }
                     }
                     peer_id.truncate(36);
-                    let mut frame: Vec<u8> = if let Ok(h) = std::env::var("EPI_MSG") {
+                    let mut frame: Vec<u8> = if let Some(h) = epic.msg_override.as_deref() {
                         hex::decode(h).unwrap_or_default()
                     } else {
                         let mut v = vec![mtype, (proto >> 8) as u8, (proto & 0xff) as u8];
@@ -1211,14 +1380,13 @@ impl Sdp {
                         // EPI_FRAMING=3b selects the legacy classes3 form:
                         // [b0][len_hi][len_lo][00 00 00 len-crc][payload][crc16 2B][0].
                         let len = frame.len() as u16;
-                        let out: Vec<u8> = if std::env::var("EPI_FRAMING").as_deref() == Ok("raw3")
-                        {
+                        let out: Vec<u8> = if epic.framing == "raw3" {
                             // Live client-socket reader form (setCrcEnabled=false):
                             // 3-byte length field only, no crc fields.
                             let mut v = vec![0x00, (len >> 8) as u8, (len & 0xff) as u8];
                             v.append(&mut frame);
                             v
-                        } else if std::env::var("EPI_FRAMING").as_deref() == Ok("3b") {
+                        } else if epic.framing == "3b" {
                             let mut crc: u16 = 0;
                             for &b in &frame {
                                 crc = CRC16_TABLE[((crc as u8) ^ b) as usize] ^ (crc >> 8);
@@ -1251,6 +1419,8 @@ impl Sdp {
                     let epi_session = tokio::spawn({
                         let epi_svc = epi_svc.clone();
                         let sdp = sdp.clone();
+                        let epic = sdp.gcfg.epi.clone();
+                        let cfgs = sdp.gcfg.clone();
                         async move {
                             let mut acc: Vec<u8> = Vec::new();
                             let mut tmp = [0u8; 4096];
@@ -1279,50 +1449,24 @@ impl Sdp {
                             let mut expect_rc2: Option<[u8; 8]> = None;
                             // FrameType byte for our AUTH_RESPONSE; phone dispatches on
                             // {16,17,18,19,20}; server proof frame is 18 (0x12).
-                            let resp_type: u8 = std::env::var("EPI_AUTH_RESP")
-                                .ok()
-                                .and_then(|s| u8::from_str_radix(s.trim(), 16).ok())
-                                .unwrap_or(0x11);
+                            let resp_type: u8 = epic.auth_resp;
                             // Server-side confirm echo sent after rc_2 verifies; 0 = off.
-                            let auth_ack: u8 = std::env::var("EPI_AUTH_ACK")
-                                .ok()
-                                .and_then(|s| u8::from_str_radix(s.trim(), 16).ok())
-                                .unwrap_or(0x12);
+                            let auth_ack: u8 = epic.auth_ack;
                             // Capability exchange (datatrans/service/f): after auth+PD the
                             // phone enters QUERYING and dies after 10 s (errorCode 258,
                             // "Capex waiting for query timed out") unless the server sends
                             // a capex QUERY; we then must answer its RESPONSE with a
                             // CONFIRM (statusCode 0) to reach AVAILABLE/ATTACHED.
-                            let capex_on = std::env::var("EPI_CAPEX").as_deref() != Ok("0");
+                            let capex_on = epic.capex;
                             // Clipboard lane (opt-in CLIPBOARD=1): subscribe our side to
                             // `Oplus_PcConnect` via `msg_topic_sync` once the DataBus
                             // session is live, then apply published ClipboardBean text to
                             // the system clipboard.
-                            let clipboard_on = std::env::var("CLIPBOARD").is_ok();
+                            let clipboard_on = cfgs.databus.clipboard;
                             let mut clip_subscribed = false;
-                            let capex_profiles: Vec<String> = std::env::var("EPI_CAPEX_PROFILES")
-                                .ok()
-                                .map(|s| {
-                                    s.split(',')
-                                        .map(|p| p.trim().to_string())
-                                        .filter(|p| !p.is_empty())
-                                        .collect()
-                                })
-                                .unwrap_or_else(|| {
-                                    [
-                                        "com.oplus.pantaconnect.globaldevice.discovery",
-                                        "uuid.icdf.service1",
-                                        "app:oplus.pantaconnect.app_service",
-                                        "vdc.service.sync",
-                                        "oaf.service.iphone.call",
-                                        "icdf.videocall.service",
-                                    ]
-                                    .iter()
-                                    .map(|p| p.to_string())
-                                    .collect()
-                                });
+                            let capex_profiles_owned = epic.capex_profiles.clone();
                             let capex_profiles: Vec<&str> =
-                                capex_profiles.iter().map(String::as_str).collect();
+                                capex_profiles_owned.iter().map(String::as_str).collect();
                             // 0 = idle, 1 = QUERY sent (await RESPONSE), 2 = CONFIRM sent.
                             let mut capex: u8 = 0;
                             let mut capex_attempts: u8 = 0;
@@ -1337,7 +1481,8 @@ impl Sdp {
                                         Ok(r) => r,
                                         Err(_) => {
                                             capex_attempts += 1;
-                                            let qf = capex_frame(&capex_query(&capex_profiles));
+                                            let qf =
+                                                capex_frame(&epic, &capex_query(&capex_profiles));
                                             let _ = sock.write_all(&qf).await;
                                             tracing::info!(
                                                 "[epi] :{epi_port} -> CAPEX QUERY resend #{capex_attempts} ({} profiles)",
@@ -1417,10 +1562,11 @@ impl Sdp {
                                     let (hlen, plen) = if acc.len() >= 4
                                         && acc[2] == 0x00
                                         && (acc[3] == 0x08 || acc[3] == 0x20)
-                                        && u16::from_be_bytes([acc[0], acc[1]]) as usize >= 6
+                                        && u16::from_be_bytes([acc[0], acc[1]]) as usize >= 5
                                     {
                                         // Session lane (capex): [len u16BE][hdr 0x0008][payload];
-                                        // 0x0020 = DataBus session (sid 8).
+                                        // 0x0020 = DataBus session (sid 8). Minimum 5 =
+                                        // the 3-byte DataBus ACK frame (hdr 0x0020).
                                         (4usize, u16::from_be_bytes([acc[0], acc[1]]) as usize - 2)
                                     } else if acc[0] == 0 && acc[1] == 0 && acc[2] > 0 {
                                         (3usize, acc[2] as usize)
@@ -1489,11 +1635,7 @@ impl Sdp {
                                                 {
                                                     "msg_topic_sync" => tracing::info!(
                                                         "[clip] :{epi_port} peer topic sync: {}",
-                                                        String::from_utf8_lossy(
-                                                            payload
-                                                                .get(55..payload.len().min(215))
-                                                                .unwrap_or(&[])
-                                                        )
+                                                        v["dbs_msg_payload"]
                                                     ),
                                                     "msg_normal_topic_data" => {
                                                         let topic = v
@@ -1502,9 +1644,22 @@ impl Sdp {
                                                             )
                                                             .and_then(|x| x.as_str())
                                                             .unwrap_or("");
+                                                        // The phone's DbsMessage.payload is
+                                                        // a String field: the wire form is a
+                                                        // quoted JSON string, but tolerate
+                                                        // the bare-object shape too.
+                                                        let payload = v
+                                                            .get("dbs_msg_payload")
+                                                            .and_then(|p| match p {
+                                                                serde_json::Value::String(s) => {
+                                                                    serde_json::from_str(s).ok()
+                                                                }
+                                                                _ => Some(p.clone()),
+                                                            });
                                                         if topic == "Oplus_PcConnect"
-                                                            && let Some(s) = v
-                                                                .pointer("/dbs_msg_payload/value")
+                                                            && let Some(s) = payload
+                                                                .as_ref()
+                                                                .and_then(|p| p.pointer("/value"))
                                                                 .and_then(|x| x.as_str())
                                                             && let Some(text) =
                                                                 proto::odmf::clipboard_text(s)
@@ -1616,17 +1771,13 @@ impl Sdp {
                                             an.extend_from_slice(peer_id2.as_bytes());
                                             an.push(0x20);
                                             an.push(0x00);
-                                            let outa = if std::env::var("EPI_FRAMING").as_deref()
-                                                == Ok("raw3")
-                                            {
+                                            let outa = if epic.framing == "raw3" {
                                                 let l = an.len() as u16;
                                                 let mut v =
                                                     vec![0x00, (l >> 8) as u8, (l & 0xff) as u8];
                                                 v.append(&mut an);
                                                 v
-                                            } else if std::env::var("EPI_FRAMING").as_deref()
-                                                == Ok("3b")
-                                            {
+                                            } else if epic.framing == "3b" {
                                                 let mut crc: u16 = 0;
                                                 for &b in &an {
                                                     crc = CRC16_TABLE[((crc as u8) ^ b) as usize]
@@ -1703,10 +1854,13 @@ impl Sdp {
                                             // the session key for the s/t proofs.
                                             let peer_ip = peer.ip().to_string();
                                             let mac8 = <[u8; 8]>::try_from(mac).unwrap_or([0; 8]);
-                                            let accepted =
-                                                ksc_candidates(&peer_ip, &hex::encode(dev))
-                                                    .into_iter()
-                                                    .find(|c| ksc_s(c, qc, ts) == mac8);
+                                            let accepted = ksc_candidates(
+                                                sdp.ksc_pin.as_deref(),
+                                                &peer_ip,
+                                                &hex::encode(dev),
+                                            )
+                                            .into_iter()
+                                            .find(|c| ksc_s(c, qc, ts) == mac8);
                                             if let Some(k) = accepted {
                                                 ksc = Some(k.clone());
                                                 remember_ksc(&peer_ip, &hex::encode(dev), &k);
@@ -1742,9 +1896,9 @@ impl Sdp {
                                             expect_rc2 = Some(ksc_s(&ksc, &qs, ts));
                                             let mut resp: Vec<u8> = vec![resp_type, ver, 0x00];
                                             resp.extend_from_slice(&qs);
-                                            resp.extend_from_slice(&be8(ts2));
+                                            resp.extend_from_slice(&ts2.to_be_bytes());
                                             resp.extend_from_slice(&rs);
-                                            let out = dt_frame(&resp);
+                                            let out = dt_frame(&epic, &resp);
                                             let _ = sock.write_all(&out).await;
                                             tracing::info!(
                                                 "[epi] :{epi_port} -> AUTH_RESPONSE {resp_type:#04x} ver={ver} qs={} ts={ts2} rs={} (sessionKey {}+zeros)",
@@ -1790,7 +1944,7 @@ impl Sdp {
                                                 let mut ack: Vec<u8> =
                                                     vec![auth_ack, payload[1], 0x00];
                                                 ack.extend_from_slice(rc2);
-                                                let out = dt_frame(&ack);
+                                                let out = dt_frame(&epic, &ack);
                                                 let _ = sock.write_all(&out).await;
                                                 tracing::info!(
                                                     "[epi] :{epi_port} -> AUTH ack {auth_ack:#04x} rc_2={}",
@@ -1808,7 +1962,7 @@ impl Sdp {
                                                 // client answers it with CONFIRM(4).
                                                 let mut cf = vec![3u8, 0, 10];
                                                 cf.extend_from_slice(&probe_peer);
-                                                let outc = dt_frame(&cf);
+                                                let outc = dt_frame(&epic, &cf);
                                                 let _ = sock.write_all(&outc).await;
                                                 tracing::info!(
                                                     "[epi] :{epi_port} -> PROBE sent (post-auth)"
@@ -1821,8 +1975,10 @@ impl Sdp {
                                                 probe_pending = false;
                                                 confirmed = true;
                                                 if capex_on {
-                                                    let qf =
-                                                        capex_frame(&capex_query(&capex_profiles));
+                                                    let qf = capex_frame(
+                                                        &epic,
+                                                        &capex_query(&capex_profiles),
+                                                    );
                                                     let _ = sock.write_all(&qf).await;
                                                     tracing::info!(
                                                         "[epi] :{epi_port} -> CAPEX QUERY ({} profiles)",
@@ -1875,7 +2031,7 @@ impl Sdp {
                                             if mine.is_empty() {
                                                 mine = capex_profiles.clone();
                                             }
-                                            let rf = capex_frame(&capex_response(&mine));
+                                            let rf = capex_frame(&epic, &capex_response(&mine));
                                             let _ = sock.write_all(&rf).await;
                                             tracing::info!(
                                                 "[epi] :{epi_port} -> CAPEX RESPONSE ({} profiles, ck={})",
@@ -1887,7 +2043,7 @@ impl Sdp {
                                                 &format!("epicapexprspo{epi_port} {peer}"),
                                                 &rf,
                                             );
-                                            let cf = capex_frame(&capex_confirm(0, 0));
+                                            let cf = capex_frame(&epic, &capex_confirm(0, 0));
                                             let _ = sock.write_all(&cf).await;
                                             tracing::info!(
                                                 "[epi] :{epi_port} -> CAPEX CONFIRM (post-response)"
@@ -1914,7 +2070,7 @@ impl Sdp {
                                                 &format!("epicapexprsp{epi_port} {peer}"),
                                                 &payload,
                                             );
-                                            let cf = capex_frame(&capex_confirm(0, 0));
+                                            let cf = capex_frame(&epic, &capex_confirm(0, 0));
                                             let _ = sock.write_all(&cf).await;
                                             tracing::info!(
                                                 "[epi] :{epi_port} -> CAPEX CONFIRM (status 0)"
@@ -1966,6 +2122,7 @@ impl Sdp {
                 let mut hello_at: Option<std::time::Instant> = None;
                 let mut sync_sent = false;
                 let mut sync_pending = false;
+                let mut mt4_sent = false;
                 let mut ss_send: Option<Vec<u8>> = None;
                 let mut ss_ctx: Option<crate::d2d::D2dConnectionContextV1> = None;
                 let mut ss_iv: Option<Vec<u8>> = None;
@@ -1977,13 +2134,53 @@ impl Sdp {
                     };
                 }
                 loop {
-                    match sock.read(&mut buf).await {
+                    // One-shot SYNC re-send (phone's late receiveSync attach):
+                    // only while the peer has not advanced past SYNC (no ukey2
+                    // frame seen). A short window lets the peer's in-flight
+                    // burst land first, so the re-send never races its
+                    // receiveKeyAgreement (fatal 2510, live 2026-11-11).
+                    let mut pre_read: Option<std::io::Result<usize>> = None;
+                    if sync_sent && sync_pending && ukey.is_none() {
+                        tokio::select! {
+                            biased;
+                            r = sock.read(&mut buf) => pre_read = Some(r),
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(80)) => {
+                                sync_pending = false;
+                                let hseq = hbase.unwrap_or_else(crate::scp::now_base);
+                                let keytype: i32 = scp.keytype;
+                                let sync = crate::scp::sync_frame_ex(
+                                    hseq + 1,
+                                    "active_connection",
+                                    "com.heytap.accessory",
+                                    &dev_name,
+                                    &scp.model,
+                                    true,
+                                    keytype,
+                                );
+                                record(&path, &format!("sent {peer} sync-resend seq{}", hseq + 1), &sync);
+                                let _ = sock.write_all(&sync).await;
+                                let _ = sock.flush().await;
+                                tracing::info!(
+                                    "[tcp] {peer} scp sync seq{} (timed resend) t={} | {}",
+                                    hseq + 1,
+                                    tclock!(),
+                                    hex::encode(&sync)
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let rd = match pre_read {
+                        Some(r) => r,
+                        None => sock.read(&mut buf).await,
+                    };
+                    match rd {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             tracing::info!(
                                 "[tcp] {peer} {n}B t={} | {}",
                                 tclock!(),
-                                hex::encode(&buf[..n.min(48)])
+                                hex::encode(&buf[..n.min(220)])
                             );
                             record(&path, &format!("tcp {peer}"), &buf[..n]);
                             let frames = crate::scp::split_frames(&buf[..n]);
@@ -2064,8 +2261,7 @@ impl Sdp {
                                     // rejected. Reply in kind (SCP_INTERACT=accept
                                     // replies `accept` instead, for A/B).
                                     if opened.as_deref() == Some(b"interact hello".as_slice()) {
-                                        let mode = std::env::var("SCP_INTERACT")
-                                            .unwrap_or_else(|_| "echo".into());
+                                        let mode = scp.interact.clone();
                                         let bodies: Vec<&[u8]> = match InteractMode::from_str(&mode)
                                         {
                                             Ok(InteractMode::Accept) => vec![b"accept"],
@@ -2148,7 +2344,7 @@ impl Sdp {
                                     // phone sends carry isServer=0; respond in-sequence
                                     // (l.java server branch): ukey2 3->send3->4->send4,
                                     // then echo SYNC_SECURE's ksc/kscAlias.
-                                    if std::env::var("SCP_SERVER").is_ok() && sub[1] == 0x30 {
+                                    if scp.server && sub[1] == 0x30 {
                                         let mt = m.msg_type.unwrap_or(0);
                                         match mt {
                                             1 => {
@@ -2171,301 +2367,254 @@ impl Sdp {
                                                         Some(nm),
                                                         true,
                                                     );
-                                                    if std::env::var("SCP_SEND_DEVICE_INFO").is_ok()
-                                                    {
-                                                        let sid =
-                                                            u16::from_be_bytes([sub[4], sub[5]])
-                                                                >> 2;
-                                                        let f = session_info_frame(&dev_name, sid);
-                                                        record(&path, "scp-send-101", &f);
-                                                        let _ = sock.write_all(&f).await;
-                                                        tracing::info!(
-                                                            "[scp] {peer} -> 101 deviceName={}",
-                                                            dev_name
-                                                        );
-                                                    }
                                                 }
                                             }
                                             3 | 4 => {
-                                                // Phone CLIENT drives ukey2: it sends
-                                                // msgType3 CLIENT_INIT, we answer msgType3
-                                                // SERVER_INIT; it sends msgType4
-                                                // CLIENT_FINISH (commitment =
-                                                // SHA-512(envelope)), we ack msgType4 with
-                                                // ZERO bytes (`l.java:108`
-                                                // k(f, new byte[0])`).
+                                                // Phone CLIENT drives ukey2 (l.java
+                                                // waitForShareSecret, client arm): it
+                                                // sends msgType3 CLIENT_INIT, we answer
+                                                // msgType3 SERVER_INIT; it sends
+                                                // CLIENT_FINISH as a second msgType3
+                                                // (`k(f2924e, b2)` — not msgType4), then
+                                                // waits in g(f2925f) for our msgType4
+                                                // UKEY2_FINISHED; it closes with an empty
+                                                // msgType4 (`l.java:108` k(f, new
+                                                // byte[0])`), which we ack empty as well.
                                                 let h = ukey.get_or_insert_with(|| {
                                                     crate::ukey2::Ukey2Handshake::new(
                                                         crate::ukey2::Role::Responder,
                                                     )
                                                 });
-                                                match h.parse(&m.data) {
-                                                    Ok(true) => {
-                                                        // Stop any armed SYNC re-send: the
-                                                        // peer has left receiveSync behind and
-                                                        // now expects UKEY2_FINISHED; a late
-                                                        // msgType-1 frame is a fatal 2510 there.
-                                                        sync_pending = false;
-                                                        let reply = if mt == 4 {
-                                                            if std::env::var("SCP_NO_MT4").is_ok() {
-                                                                None
-                                                            } else {
-                                                                Some(Vec::new())
-                                                            }
+                                                let parsed = h.parse(&m.data);
+                                                if matches!(parsed, Ok(true))
+                                                    || (matches!(parsed, Ok(false))
+                                                        && h.is_complete())
+                                                {
+                                                    // Stop any armed SYNC re-send: the
+                                                    // peer has left receiveSync behind and
+                                                    // now expects UKEY2_FINISHED; a late
+                                                    // msgType-1 frame is a fatal 2510 there.
+                                                    sync_pending = false;
+                                                    let (out_mt, reply) = if h.is_complete() {
+                                                        // CLIENT_FINISH parsed:
+                                                        // answer the peer's
+                                                        // g(UKEY2_FINISHED) with
+                                                        // exactly one msgType4
+                                                        // (vendor server sends
+                                                        // k(f2925f, finish)); a
+                                                        // later empty mt4 from
+                                                        // the client gets none.
+                                                        if mt4_sent {
+                                                            (4, None)
                                                         } else {
-                                                            h.next_message()
-                                                        };
-                                                        if let Some(next) = reply {
-                                                            let f = crate::scp::msg_frame(
-                                                                mt,
-                                                                next.clone(),
-                                                            );
-                                                            tracing::info!(
-                                                                "[scp] {peer} ukey2 reply mt{mt} data={}B",
-                                                                next.len()
-                                                            );
-                                                            record(
-                                                                &path,
-                                                                &format!(
-                                                                    "sent {peer} ukey2 mt{mt}"
-                                                                ),
-                                                                &f,
-                                                            );
-                                                            let _ = sock.write_all(&f).await;
-                                                            let _ = sock.flush().await;
-                                                            if mt == 4
-                                                                && std::env::var("SCP_SS_NOW")
-                                                                    .is_ok()
-                                                            {
-                                                                // Diagnostic: no re-sends so the
-                                                                // peer's sync-secure waiter sees
-                                                                // exactly one frame after FINISHED.
-                                                            } else if mt == 4 {
-                                                                for delay in [300u64, 900] {
-                                                                    tokio::time::sleep(
+                                                            mt4_sent = true;
+                                                            (4, Some(Vec::new()))
+                                                        }
+                                                    } else {
+                                                        (3, h.next_message())
+                                                    };
+                                                    if let Some(next) = reply {
+                                                        let f = crate::scp::msg_frame(
+                                                            out_mt,
+                                                            next.clone(),
+                                                        );
+                                                        tracing::info!(
+                                                            "[scp] {peer} ukey2 reply mt{mt} data={}B",
+                                                            next.len()
+                                                        );
+                                                        record(
+                                                            &path,
+                                                            &format!("sent {peer} ukey2 mt{mt}"),
+                                                            &f,
+                                                        );
+                                                        let _ = sock.write_all(&f).await;
+                                                        let _ = sock.flush().await;
+                                                        if mt == 4 && scp.ss_now {
+                                                            // Diagnostic: no re-sends so the
+                                                            // peer's sync-secure waiter sees
+                                                            // exactly one frame after FINISHED.
+                                                        } else if mt == 4 {
+                                                            for delay in [300u64, 900] {
+                                                                tokio::time::sleep(
                                                                 std::time::Duration::from_millis(
                                                                     delay,
                                                                 ),
                                                             )
                                                             .await;
-                                                                    let _ =
-                                                                        sock.write_all(&f).await;
-                                                                    let _ = sock.flush().await;
-                                                                }
+                                                                let _ = sock.write_all(&f).await;
+                                                                let _ = sock.flush().await;
                                                             }
                                                         }
-                                                        if h.is_complete() {
-                                                            tracing::info!(
-                                                                "[scp] {peer} ukey2 handshake complete"
-                                                            );
-                                                            // Their client waits (5 s) for our
-                                                            // SYNC_SECURE after ukey2; it carries
-                                                            // our per-peer bond (`issue_ksc`), not
-                                                            // session key material.
-                                                            if std::env::var("SCP_SS_SEND").is_ok()
-                                                                && mt == 4
-                                                                && ss_send.is_none()
+                                                    }
+                                                    if h.is_complete() {
+                                                        tracing::info!(
+                                                            "[scp] {peer} ukey2 handshake complete"
+                                                        );
+                                                        // Their client waits (5 s) for our
+                                                        // SYNC_SECURE after ukey2; it carries
+                                                        // our per-peer bond (`issue_ksc`), not
+                                                        // session key material.
+                                                        if scp.ss_send
+                                                            && ss_send.is_none()
+                                                            && h.is_complete()
+                                                        {
+                                                            let _ = h.auth_string();
+                                                            if let Ok(ctx) =
+                                                                h.to_connection_context()
                                                             {
-                                                                let _ = h.auth_string();
-                                                                if let Ok(ctx) =
-                                                                    h.to_connection_context()
-                                                                {
-                                                                    if std::env::var("SCP_KS_DUMP")
-                                                                        .is_ok()
-                                                                    {
-                                                                        tracing::info!(
-                                                                            "[ks] {peer} {} iv={}",
-                                                                            h.ks_dump(),
-                                                                            ss_iv
-                                                                                .as_deref()
-                                                                                .map(hex::encode)
-                                                                                .unwrap_or_default(
-                                                                                ),
-                                                                        );
-                                                                    }
-                                                                    ss_ctx = Some(
+                                                                if scp.ks_dump {
+                                                                    tracing::info!(
+                                                                        "[ks] {peer} {} iv={}",
+                                                                        h.ks_dump(),
+                                                                        ss_iv
+                                                                            .as_deref()
+                                                                            .map(hex::encode)
+                                                                            .unwrap_or_default(),
+                                                                    );
+                                                                }
+                                                                ss_ctx = Some(
                                                                 crate::d2d::D2dConnectionContextV1::new(
                                                                     ctx.encode_key().to_vec(),
                                                                     ctx.decode_key().to_vec(),
                                                                 ),
                                                             );
-                                                                    ss_iv = h
-                                                                        .peer_iv()
-                                                                        .map(|v| v.to_vec());
-                                                                    let pdid =
-                                                                        std::env::var("SCP_PDID")
-                                                                            .unwrap_or_else(|_| {
-                                                                                "A1B2C3D4E5F6"
-                                                                                    .into()
-                                                                            });
-                                                                    // Present our BOND for this
-                                                                    // peer, never a fresh key: the
-                                                                    // phone persists ksc only in a
-                                                                    // user-confirmed pairing and
-                                                                    // AUTH-keys on the stored row
-                                                                    // (KscRepositoryImpl.loadKsc,
-                                                                    // "SELECT * FROM ksc_info WHERE
-                                                                    // deviceId = ? AND alias = ?").
-                                                                    let peer_ip =
-                                                                        peer.ip().to_string();
-                                                                    let (ksc, alias) =
-                                                                        issue_ksc(&peer_ip, &pdid);
-                                                                    ss_send = Some(ksc.clone());
-                                                                    let ss =
-                                                                        crate::scp::SyncSecure {
-                                                                            device_id: Some(
-                                                                                pdid.clone(),
-                                                                            ),
-                                                                            ksc: Some(ksc.clone()),
-                                                                            ksc_alias: Some(alias),
-                                                                        };
-                                                                    let f = if std::env::var(
-                                                                        "SCP_SS_ENC",
-                                                                    )
-                                                                    .is_ok()
-                                                                    {
-                                                                        let wrap = {
-                                                                            let sm = crate::scp::ScpMessage {
+                                                                ss_iv =
+                                                                    h.peer_iv().map(|v| v.to_vec());
+                                                                let pdid = scp.pdid.clone();
+                                                                // Present our BOND for this
+                                                                // peer, never a fresh key: the
+                                                                // phone persists ksc only in a
+                                                                // user-confirmed pairing and
+                                                                // AUTH-keys on the stored row
+                                                                // (KscRepositoryImpl.loadKsc,
+                                                                // "SELECT * FROM ksc_info WHERE
+                                                                // deviceId = ? AND alias = ?").
+                                                                let peer_ip = peer.ip().to_string();
+                                                                let (ksc, alias) = issue_ksc(
+                                                                    sdp.ksc_pin.as_deref(),
+                                                                    &peer_ip,
+                                                                    &pdid,
+                                                                );
+                                                                ss_send = Some(ksc.clone());
+                                                                let ss = crate::scp::SyncSecure {
+                                                                    device_id: Some(pdid.clone()),
+                                                                    ksc: Some(ksc.clone()),
+                                                                    ksc_alias: Some(alias),
+                                                                };
+                                                                let f = if scp.ss_enc {
+                                                                    let wrap = {
+                                                                        let sm = crate::scp::ScpMessage {
                                                                         msg_type: Some(2),
                                                                         data: <crate::scp::SyncSecure as prost::Message>::encode_to_vec(&ss),
                                                                     };
-                                                                            <crate::scp::ScpMessage as prost::Message>::encode_to_vec(&sm)
+                                                                        <crate::scp::ScpMessage as prost::Message>::encode_to_vec(&sm)
+                                                                    };
+                                                                    let key: &[u8] =
+                                                                        if scp.ss_key == "ek" {
+                                                                            ctx.encode_key()
+                                                                        } else {
+                                                                            ctx.decode_key()
                                                                         };
-                                                                        let key: &[u8] =
-                                                                            if std::env::var(
-                                                                                "SCP_SS_KEY",
-                                                                            )
-                                                                            .as_deref()
-                                                                                == Ok("ek")
-                                                                            {
-                                                                                ctx.encode_key()
-                                                                            } else {
-                                                                                ctx.decode_key()
-                                                                            };
-                                                                        let mut iv = [0u8; 16];
-                                                                        if std::env::var(
-                                                                            "SCP_SS_IV",
-                                                                        )
-                                                                        .as_deref()
-                                                                            != Ok("zero")
-                                                                            && let Some(pi) =
-                                                                                ss_iv.as_deref()
+                                                                    let mut iv = [0u8; 16];
+                                                                    if scp.ss_iv != "zero"
+                                                                        && let Some(pi) =
+                                                                            ss_iv.as_deref()
+                                                                    {
+                                                                        iv[..16].copy_from_slice(
+                                                                            &pi[..16.min(pi.len())],
+                                                                        );
+                                                                    }
+                                                                    let mut nonce = [0u8; 8];
+                                                                    if !scp.ss_nonce_zero {
+                                                                        use rand::Rng;
+                                                                        rand::rng()
+                                                                            .fill_bytes(&mut nonce);
+                                                                    }
+                                                                    let sealed_iv: Option<Vec<u8>> = {
+                                                                        let mut ivv: Vec<Vec<u8>> =
+                                                                            Vec::new();
+                                                                        if let Some(pi) =
+                                                                            ss_iv.as_deref()
                                                                         {
-                                                                            iv[..16]
-                                                                                .copy_from_slice(
-                                                                                    &pi[..16.min(
-                                                                                        pi.len(),
-                                                                                    )],
+                                                                            if pi.len() == 12 {
+                                                                                ivv.push(
+                                                                                    pi.to_vec(),
                                                                                 );
-                                                                        }
-                                                                        let mut nonce = [0u8; 8];
-                                                                        if std::env::var(
-                                                                            "SCP_SS_NONCE_ZERO",
-                                                                        )
-                                                                        .is_err()
-                                                                        {
-                                                                            use rand::Rng;
-                                                                            rand::rng().fill_bytes(
-                                                                                &mut nonce,
-                                                                            );
-                                                                        }
-                                                                        let sealed_iv: Option<
-                                                                            Vec<u8>,
-                                                                        > = {
-                                                                            let mut ivv: Vec<
-                                                                                Vec<u8>,
-                                                                            > = Vec::new();
-                                                                            if let Some(pi) =
-                                                                                ss_iv.as_deref()
-                                                                            {
-                                                                                if pi.len() == 12 {
-                                                                                    ivv.push(
-                                                                                        pi.to_vec(),
-                                                                                    );
-                                                                                }
-                                                                                if pi.len() == 16 {
-                                                                                    ivv.push(
-                                                                                        pi[..12]
-                                                                                            .to_vec(
-                                                                                            ),
-                                                                                    );
-                                                                                }
                                                                             }
-                                                                            ivv.push(vec![
-                                                                                0, 1, 2, 3, 4, 5,
-                                                                                6, 7, 8, 9, 10, 11,
-                                                                            ]);
-                                                                            ivv.into_iter().find_map(|iv| {
+                                                                            if pi.len() == 16 {
+                                                                                ivv.push(
+                                                                                    pi[..12]
+                                                                                        .to_vec(),
+                                                                                );
+                                                                            }
+                                                                        }
+                                                                        ivv.push(vec![
+                                                                            0, 1, 2, 3, 4, 5, 6, 7,
+                                                                            8, 9, 10, 11,
+                                                                        ]);
+                                                                        ivv.into_iter().find_map(|iv| {
                                                                         crate::d2d::cryptor_seal_iv(
                                                                             key, &iv, &wrap,
                                                                         )
                                                                         .ok()
                                                                     })
-                                                                        };
-                                                                        let ct = match sealed_iv {
-                                                                            Some(ct) => ct,
-                                                                            None => {
-                                                                                tracing::info!(
-                                                                                    "[scp] {peer} SS seal failed"
-                                                                                );
-                                                                                crate::scp::msg_frame(
+                                                                    };
+                                                                    let ct = match sealed_iv {
+                                                                        Some(ct) => ct,
+                                                                        None => {
+                                                                            tracing::info!(
+                                                                                "[scp] {peer} SS seal failed"
+                                                                            );
+                                                                            crate::scp::msg_frame(
                                                                             2,
                                                                             <crate::scp::SyncSecure as prost::Message>::encode_to_vec(
                                                                                 &ss,
                                                                             ),
                                                                         )
-                                                                            }
-                                                                        };
-                                                                        let _ = nonce;
-                                                                        crate::scp::msg_frame_sealed(
-                                                                            ct,
-                                                                        )
-                                                                    } else {
-                                                                        crate::scp::msg_frame(2, <crate::scp::SyncSecure as prost::Message>::encode_to_vec(&ss))
+                                                                        }
                                                                     };
-                                                                    tracing::info!(
-                                                                        "[scp] {peer} SYNC_SECURE send (pdid {pdid}, ksc {}B, enc={}/{}/{})",
-                                                                        ss.ksc
-                                                                            .as_ref()
-                                                                            .map_or(0, |v| v.len()),
-                                                                        std::env::var("SCP_SS_ENC")
-                                                                            .is_ok(),
-                                                                        std::env::var("SCP_SS_KEY")
-                                                                            .unwrap_or_else(|_| {
-                                                                                "dk".into()
-                                                                            }),
-                                                                        std::env::var("SCP_SS_IV")
-                                                                            .unwrap_or_else(|_| {
-                                                                                "range".into()
-                                                                            }),
-                                                                    );
-                                                                    record(
-                                                                        &path,
-                                                                        &format!(
-                                                                            "sent {peer} sync-secure-send"
-                                                                        ),
-                                                                        &f,
-                                                                    );
-                                                                    let _ =
-                                                                        sock.write_all(&f).await;
-                                                                    let _ = sock.flush().await;
-                                                                }
+                                                                    let _ = nonce;
+                                                                    crate::scp::msg_frame_sealed(ct)
+                                                                } else {
+                                                                    crate::scp::msg_frame(2, <crate::scp::SyncSecure as prost::Message>::encode_to_vec(&ss))
+                                                                };
+                                                                tracing::info!(
+                                                                    "[scp] {peer} SYNC_SECURE send (pdid {pdid}, ksc {}B, enc={}/{}/{})",
+                                                                    ss.ksc
+                                                                        .as_ref()
+                                                                        .map_or(0, |v| v.len()),
+                                                                    scp.ss_enc,
+                                                                    scp.ss_key.clone(),
+                                                                    scp.ss_iv.clone(),
+                                                                );
+                                                                record(
+                                                                    &path,
+                                                                    &format!(
+                                                                        "sent {peer} sync-secure-send"
+                                                                    ),
+                                                                    &f,
+                                                                );
+                                                                let _ = sock.write_all(&f).await;
+                                                                let _ = sock.flush().await;
                                                             }
                                                         }
                                                     }
-                                                    Ok(false) => tracing::info!(
-                                                        "[scp] {peer} ukey2 mt{mt} ignored (state)"
-                                                    ),
-                                                    Err(e) => tracing::info!(
-                                                        "[scp] {peer} ukey2 parse mt{mt} failed: {e}"
-                                                    ),
+                                                } else {
+                                                    match parsed {
+                                                        Ok(false) => tracing::info!(
+                                                            "[scp] {peer} ukey2 mt{mt} ignored (state)"
+                                                        ),
+                                                        Err(e) => tracing::info!(
+                                                            "[scp] {peer} ukey2 parse mt{mt} failed: {e}"
+                                                        ),
+                                                        _ => {}
+                                                    }
                                                 }
                                             }
                                             2 => {
                                                 if !ss_echoed {
                                                     ss_echoed = true;
-                                                    let pdid = std::env::var("SCP_PDID")
-                                                        .unwrap_or_else(|_| "A1B2C3D4E5F6".into());
+                                                    let pdid = scp.pdid.clone();
                                                     match crate::scp::sync_secure_echo(
                                                         &m.data, &pdid,
                                                     ) {
@@ -2492,9 +2641,12 @@ impl Sdp {
                                                 }
                                             }
                                             other => tracing::info!(
-                                                "[scp] {peer} unexpected inbound msgType {other:?} ({}B data) | {}",
+                                                "[scp] {peer} unexpected inbound msgType {other:?} ({}B data) | {} | {:?}",
                                                 m.data.len(),
-                                                hex::encode(&m.data[..m.data.len().min(32)])
+                                                hex::encode(&m.data[..m.data.len().min(220)]),
+                                                String::from_utf8_lossy(
+                                                    &m.data[..m.data.len().min(220)]
+                                                )
                                             ),
                                         }
                                     }
@@ -2506,46 +2658,24 @@ impl Sdp {
                                 // bursts race: an early frame gets consumed by the wrong
                                 // waiter (observed: its receiveSync aborted on our HELLO,
                                 // `syn ack null`).
-                                if std::env::var("CLIENTSCP").is_ok()
+                                if scp.clientscp
                                     && sub.len() >= 2
                                     && sub[0] == 0x40
                                     && sub[1] == 0x30
                                     && let Some(m) = crate::scp::decode_payload(&sub[8..])
                                 {
                                     let mt = m.msg_type.unwrap_or(0);
-                                    // Re-send armed by an earlier event lands here,
-                                    // one RTT after the original.
-                                    if sync_sent
-                                        && sync_pending
-                                        && std::env::var("SCP_SYNC_RESEND").is_ok()
-                                    {
+                                    // A peer frame past HELLO/SYNC proves its
+                                    // receiveSync completed: drop the armed
+                                    // one-shot re-send. A msgType-1 landing in
+                                    // the phone's receiveKeyAgreement is a fatal
+                                    // 2510 (`msgType not matched: SYNC vs
+                                    // UKEY2_INIT`, live 2026-11-11 — the phone
+                                    // sends SYNC and UKEY2_INIT in one burst).
+                                    if sync_sent && sync_pending && mt > 1 {
                                         sync_pending = false;
-                                        let hseq = hbase.unwrap_or_else(crate::scp::now_base);
-                                        let keytype: i32 = std::env::var("SCP_KEYTYPE")
-                                            .ok()
-                                            .and_then(|v| v.parse().ok())
-                                            .unwrap_or(3);
-                                        let sync = crate::scp::sync_frame_ex(
-                                            hseq + 1,
-                                            "active_connection",
-                                            "com.heytap.accessory",
-                                            &dev_name,
-                                            &scp_model(),
-                                            true,
-                                            keytype,
-                                        );
-                                        record(
-                                            &path,
-                                            &format!("sent {peer} sync-resend seq{}", hseq + 1),
-                                            &sync,
-                                        );
-                                        let _ = sock.write_all(&sync).await;
-                                        let _ = sock.flush().await;
                                         tracing::info!(
-                                            "[tcp] {peer} scp sync seq{} (resend on mt{mt}) t={} | {}",
-                                            hseq + 1,
-                                            tclock!(),
-                                            hex::encode(&sync)
+                                            "[tcp] {peer} sync-resend disarmed: peer advanced to mt{mt}"
                                         );
                                     }
                                     if mt != 1 && !hello_sent {
@@ -2556,18 +2686,11 @@ impl Sdp {
                                         // the shared replay-1 channel and is later eaten
                                         // by the SYNC_SECURE waiter as msgType[0]
                                         // (2564), so keep it back when probing.
-                                        if std::env::var("SCP_NO_HELLO").is_ok() {
-                                            continue;
-                                        }
                                         let base = crate::scp::q_from_payload(&sub[8..])
                                             .map(|q| q.sequence_no)
                                             .unwrap_or_else(crate::scp::now_base);
                                         hbase = Some(base);
-                                        let delta: u32 = std::env::var("SCP_SEQ_DELTA")
-                                            .ok()
-                                            .and_then(|s| s.parse().ok())
-                                            .unwrap_or(1);
-                                        let hseq = base + delta;
+                                        let hseq = base + 1;
                                         let hello = crate::scp::hello_frame_ex(
                                             hseq,
                                             "active_connection",
@@ -2587,7 +2710,55 @@ impl Sdp {
                                             tclock!(),
                                             hex::encode(&hello)
                                         );
-                                    } else if mt == 1 && std::env::var("SCP_NO_SYNC").is_err() {
+                                        // The phone builds its paired-device
+                                        // record's display name from the
+                                        // peer's ScpSyncData it cached before
+                                        // SYNC_SECURE (`a0.onSyncSecureReceived`
+                                        // → `f7835h`); the SCP_SERVER lane
+                                        // otherwise never answers with a SYNC
+                                        // and the tile renders blank. HELLO
+                                        // must precede it (waiting4Hello then
+                                        // receiveSync), hence sending ours
+                                        // immediately after with the wave gap.
+                                        if !sync_sent {
+                                            sync_sent = true;
+                                            sync_pending = true;
+                                            if let Some(t) = hello_at {
+                                                let ms = t.elapsed().as_millis();
+                                                if ms < 250 {
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_millis(
+                                                            250 - ms as u64,
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            let keytype: i32 = scp.keytype;
+                                            let sync = crate::scp::sync_frame_ex(
+                                                hseq + 1,
+                                                "active_connection",
+                                                "com.heytap.accessory",
+                                                &dev_name,
+                                                &scp.model,
+                                                true,
+                                                keytype,
+                                            );
+                                            record(
+                                                &path,
+                                                &format!("sent {peer} sync seq{}", hseq + 1),
+                                                &sync,
+                                            );
+                                            let _ = sock.write_all(&sync).await;
+                                            let _ = sock.flush().await;
+                                            tracing::info!(
+                                                "[tcp] {peer} scp sync seq{} (after hello) t={} | {}",
+                                                hseq + 1,
+                                                tclock!(),
+                                                hex::encode(&sync)
+                                            );
+                                        }
+                                    } else if mt == 1 {
                                         // Peer's SYNC: answer immediately. Its
                                         // `receiveSync` consumer attaches only after
                                         // it transmits this SYNC, so the immediate
@@ -2614,16 +2785,13 @@ impl Sdp {
                                                 }
                                             }
                                             let hseq = hbase.unwrap_or_else(crate::scp::now_base);
-                                            let keytype: i32 = std::env::var("SCP_KEYTYPE")
-                                                .ok()
-                                                .and_then(|v| v.parse().ok())
-                                                .unwrap_or(3);
+                                            let keytype: i32 = scp.keytype;
                                             let sync = crate::scp::sync_frame_ex(
                                                 hseq + 1,
                                                 "active_connection",
                                                 "com.heytap.accessory",
                                                 &dev_name,
-                                                &scp_model(),
+                                                &scp.model,
                                                 true,
                                                 keytype,
                                             );
@@ -2653,8 +2821,7 @@ impl Sdp {
                                     && sub[4..6] == [0x00, 0x02]
                                 {
                                     let payload = &sub[8..];
-                                    let variant_str =
-                                        std::env::var("RESP").unwrap_or_else(|_| "echo".into());
+                                    let variant_str = scp.resp.clone();
                                     let variant = RespVariant::from_str(&variant_str)
                                         .unwrap_or(RespVariant::Echo);
                                     let is_active =
@@ -2725,34 +2892,16 @@ impl Sdp {
                                     // now; SYNC goes out reactively after the phone's
                                     // own HELLO (their waiting4Sync ignores pre-hello
                                     // frames — see inbound decode branch).
-                                    if is_active && std::env::var("CLIENTSCP_REACTIVE_OFF").is_ok()
-                                    {
-                                        // (legacy preemptive path, disabled)
-                                    }
                                     // EstablishLink: the phone's AndroidMultiLanServer
                                     // waits to accept our callback connection.
                                     if is_active && !dialed {
                                         dialed = true;
-                                        for p in std::env::var("SCP_DIAL_PORTS")
-                                            .ok()
-                                            .map(|s| {
-                                                s.split(',')
-                                                    .filter_map(|x| x.trim().parse::<u16>().ok())
-                                                    .collect::<Vec<u16>>()
-                                            })
-                                            .unwrap_or_else(|| {
-                                                vec![10153u16, 10162, 10151, 10152, 10150, 59399]
-                                            })
-                                        {
-                                            if p == 10152 && std::env::var("SCP_NO_OPENOUT").is_ok()
-                                            {
+                                        for &p in &scp.dial_ports {
+                                            if p == 10152 {
                                                 continue;
                                             }
                                             let addr = (peer.ip(), p);
-                                            let capex_dial = std::env::var("EPI_CAPEX_DIAL")
-                                                .ok()
-                                                .and_then(|s| s.parse::<u16>().ok())
-                                                == Some(p);
+                                            let capex_dial = gcfg.epi.capex_dial == Some(p);
                                             match tokio::time::timeout(
                                                 std::time::Duration::from_millis(800),
                                                 tokio::net::TcpStream::connect(addr),
@@ -2781,7 +2930,7 @@ impl Sdp {
                                                             q.extend_from_slice(pr.as_bytes());
                                                             q.push(0x3b);
                                                         }
-                                                        let qf = dt_frame(&q);
+                                                        let qf = dt_frame(&epic, &q);
                                                         let _ = stream.write_all(&qf).await;
                                                         tracing::info!(
                                                             "[tcp] :{p} -> CAPEX QUERY dialed {}B",
@@ -2794,7 +2943,9 @@ impl Sdp {
                                                         );
                                                         let (mut r0, mut w0) = stream.into_split();
                                                         let path0 = path.clone();
+                                                        let epic_c = epic.clone();
                                                         tokio::spawn(async move {
+                                                            let epic = epic_c;
                                                             let mut b = [0u8; 4096];
                                                             let mut buf: Vec<u8> = Vec::new();
                                                             let mut conf_sent = false;
@@ -2853,6 +3004,7 @@ impl Sdp {
                                                                             if mt == 2 && !conf_sent
                                                                             {
                                                                                 let cf = dt_frame(
+                                                                                    &epic,
                                                                                     &capex_confirm(
                                                                                         0, 0,
                                                                                     ),
@@ -2980,8 +3132,8 @@ impl Sdp {
                                                         );
                                                         let _ = w.write_all(&frame).await;
                                                         let _ = w.flush().await;
-                                                        if let Ok(extra) =
-                                                            std::env::var("OPENOUT_SYNC")
+                                                        if let Some(extra) =
+                                                            scp.openout_sync.as_deref()
                                                         {
                                                             for part in extra.split(';') {
                                                                 if let Ok(bytes) =
@@ -3003,13 +3155,15 @@ impl Sdp {
                                                                 }
                                                             }
                                                         }
-                                                        if std::env::var("CLIENTSCP").is_ok() {
+                                                        if scp.clientscp {
                                                             // Reactive hello+sync is sent from
                                                             // the reader once the ack arrives
                                                             // (echoing its q); no eager hello.
                                                         }
                                                         let dev_name2 = dev_name.clone();
+                                                        let scp_c = scp.clone();
                                                         tokio::spawn(async move {
+                                                            let scp = scp_c;
                                                             let mut b = [0u8; 2048];
                                                             let mut sync_sent2 = false;
                                                             loop {
@@ -3058,10 +3212,7 @@ impl Sdp {
                                                                     // timeout fires.
                                                                     if n >= 6
                                                                         && b[4..6] == [0x00, 0x02]
-                                                                        && std::env::var(
-                                                                            "OPENOUT_ACK",
-                                                                        )
-                                                                        .is_ok()
+                                                                        && scp.openout_ack
                                                                     {
                                                                         let ack: [u8; 16] = [
                                                                             0x40, 0x34, 0x00, 0x04,
@@ -3083,10 +3234,7 @@ impl Sdp {
                                                                     }
                                                                     if m.msg_type != Some(1)
                                                                         && !sync_sent2
-                                                                        && std::env::var(
-                                                                            "SCP_OPENOUT_SCP",
-                                                                        )
-                                                                        .is_ok()
+                                                                        && scp.openout_scp
                                                                     {
                                                                         sync_sent2 = true;
                                                                         let base = crate::scp::q_from_payload(&b[8..n])
@@ -3099,7 +3247,7 @@ impl Sdp {
                                                                         // OPEN (msgType omitted → 0) is consumed
                                                                         // as their hello (their HELLO response proves it), so the ONLY frame
                                                                         // to send now is SYNC, one wave later.
-                                                                        let sync = crate::scp::sync_frame_ex(base + 1, "active_connection", "com.heytap.accessory", &dev_name2, &scp_model(), false, 3);
+                                                                        let sync = crate::scp::sync_frame_ex(base + 1, "active_connection", "com.heytap.accessory", &dev_name2, &scp.model, false, 3);
                                                                         record(
                                                                             &path2,
                                                                             &format!(
@@ -3125,13 +3273,13 @@ impl Sdp {
                                                     } else if p == 10162 || p == 10150 {
                                                         // Candidate SCP listener slots: greet
                                                         // with the same HELLO/SYNC set.
-                                                        if std::env::var("SCP_GREET").is_ok() {
+                                                        if scp.greet {
                                                             let (hb, _sb) =
                                                                 crate::scp::hello_sync_bytes(
                                                                     "active_connection",
                                                                     "com.heytap.accessory",
                                                                     &dev_name,
-                                                                    &scp_model(),
+                                                                    &scp.model,
                                                                 );
                                                             for ft in [1u16, 2, 0] {
                                                                 let hello =
@@ -3151,7 +3299,7 @@ impl Sdp {
                                                                     "active_connection",
                                                                     "com.heytap.accessory",
                                                                     &dev_name,
-                                                                    &scp_model(),
+                                                                    &scp.model,
                                                                 );
                                                             for ft in [1u16, 2, 0] {
                                                                 let sync =
@@ -3259,7 +3407,7 @@ async fn handle(
     from: SocketAddr,
     data: &[u8],
 ) {
-    if from.ip().to_string().starts_with("127.") {
+    if from.ip().is_loopback() {
         return;
     }
     let line = first_line(data);
@@ -3271,6 +3419,18 @@ async fn handle(
     );
     *last_phone = Some(from);
     sdp.set_phone_ip(&from.ip().to_string());
+    let pdid = String::from_utf8_lossy(data).lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix("PDID:").map(|v| v.trim().to_string())
+    });
+    // Our own broadcast QUERY/ANNOUNCE echoes back to us on the LAN; it
+    // must not enter the auto-link address book (self-dial).
+    let self_echo = pdid
+        .as_deref()
+        .is_some_and(|p| p.eq_ignore_ascii_case(cfg.pdid.trim()));
+    if !self_echo {
+        sdp.note_announced(&from.ip().to_string(), pdid);
+    }
     let verb = line.split(' ').next().unwrap_or("").to_string();
     if verb != "QUERY" && !line.starts_with("SENSELESS ") {
         return;
@@ -3383,6 +3543,205 @@ fn link_info_payload(mac: &str, ip: &str, gw: &str) -> Vec<u8> {
     out
 }
 
+// ==== service configuration (env keys read once at startup) ====
+
+/// SCP/pantaconnect session lane (`SCP_*`, `CLIENTSCP`, `RESP`).
+#[derive(Debug, Clone)]
+pub struct ScpConfig {
+    /// `SCP_SERVER`: answer phone-initiated sessions as SCP server.
+    pub server: bool,
+    /// `CLIENTSCP`: client-scp responders on active_connection.
+    pub clientscp: bool,
+    /// `SCP_KEYTYPE`: ScpSyncData.keyType we present (1 = vendor PC).
+    pub keytype: i32,
+    /// `SCP_PDID`: our 12-hex protocol device id.
+    pub pdid: String,
+    /// `SCP_MODEL`: ScpSyncData.modelId, 3 bytes hex (a real PC model).
+    pub model: String,
+    /// `SCP_INTERACT`: interact-handshake flavour (`accept`|`echo`).
+    pub interact: String,
+    /// `RESP`: channel-open reply flavour (`off`|`accept`|`echo`|…).
+    pub resp: String,
+    /// `SCP_SS_SEND`: send SYNC_SECURE unsolicited on the dial lane.
+    pub ss_send: bool,
+    /// `SCP_SS_ENC`: seal SYNC_SECURE rather than plaintext.
+    pub ss_enc: bool,
+    /// `SCP_SS_KEY`: seal key selection (`dk`|`ek`).
+    pub ss_key: String,
+    /// `SCP_SS_IV`: IV policy label (`range`|`zero`).
+    pub ss_iv: String,
+    /// `SCP_SS_NOW`: skip post-FINISHED SYNC re-sends.
+    pub ss_now: bool,
+    /// `SCP_KS_DUMP`: log negotiated key material (local logs only).
+    pub ks_dump: bool,
+    /// `SCP_NO_OPENOUT`: suppress the :10152 open-out callback dial.
+    pub no_openout: bool,
+    /// `SCP_DIAL_PORTS`: EstablishLink callback ports we dial back.
+    pub dial_ports: Vec<u16>,
+    /// `SCP_SS_NONCE_ZERO`: force-zero the sync-secure GCM nonce.
+    pub ss_nonce_zero: bool,
+    /// `OPENOUT_SYNC` / `OPENOUT_ACK` / `SCP_OPENOUT_SCP` / `SCP_GREET`:
+    /// open-out diagnostics experiments (env presence enables).
+    pub openout_sync: Option<String>,
+    pub openout_ack: bool,
+    pub openout_scp: bool,
+    pub greet: bool,
+}
+
+impl Default for ScpConfig {
+    fn default() -> Self {
+        Self {
+            server: true,
+            clientscp: true,
+            keytype: 1,
+            pdid: "A1B2C3D4E5F6".into(),
+            model: "2B1488".into(),
+            interact: "accept".into(),
+            resp: "off".into(),
+            ss_send: true,
+            ss_enc: true,
+            ss_key: "dk".into(),
+            ss_iv: "range".into(),
+            ss_now: true,
+            ks_dump: true,
+            no_openout: true,
+            dial_ports: vec![10153, 10162, 10151, 10152, 10150, 59399],
+            ss_nonce_zero: false,
+            openout_sync: None,
+            openout_ack: false,
+            openout_scp: false,
+            greet: false,
+        }
+    }
+}
+
+// ==== service configuration (env keys read once at startup) ====
+
+/// Link-detection probe sockets / LinkSwitch replies (`LINK*`, `LINKNS`).
+#[derive(Debug, Clone)]
+pub struct LinkConfig {
+    /// `LINK_PORTS`: probe sockets we answer.
+    pub ports: Vec<u16>,
+    /// `LINK_POISON_IP`: vgate route-poison address (off = none).
+    pub poison: Option<[u8; 4]>,
+    /// `LINK_REPLY_MIRROR`: answer probes with the mirrored frame.
+    pub mirror: bool,
+    /// `LINKNS`: LinkSwitchMgr namespace for publishes.
+    pub ns: String,
+    /// `LINK_ACK`: probe reply flavour (empty = mirror reply).
+    pub ack: String,
+    /// `LINKPUB`: raw hex override for the SERVICE-PUBLISH payload.
+    pub pub_hex: Option<Vec<u8>>,
+    /// `LINK_REPLY_HEX` / `LINK_REPLY_HEX_FILE`: hot reply overrides.
+    pub reply_hex: Option<Vec<u8>>,
+    pub reply_hex_file: Option<String>,
+    /// `LINK_KPD` / settings.json `linkKpd`: known-peer-device ids.
+    pub kpd: Vec<Vec<u8>>,
+}
+
+impl Default for LinkConfig {
+    fn default() -> Self {
+        Self {
+            ports: vec![54227, 57320, 63125, 59566],
+            poison: Some([192, 0, 2, 16]),
+            mirror: true,
+            ns: "LinkSwitchMgr".into(),
+            ack: String::new(),
+            pub_hex: None,
+            reply_hex: None,
+            reply_hex_file: None,
+            kpd: Vec::new(),
+        }
+    }
+}
+
+// ==== service configuration (env keys read once at startup) ====
+
+/// Pairing material: env override first, then `settings.json`.
+#[derive(Debug, Clone, Default)]
+pub struct PairingConfig {
+    /// `SCP_KSC` / settings.json `scpKsc`: 16B KSC pin.
+    pub ksc_pin: Option<Vec<u8>>,
+}
+
+// -- ScpConfig --
+impl ScpConfig {
+    pub fn load() -> Self {
+        let d = Self::default();
+        Self {
+            server: flag("SCP_SERVER", d.server),
+            clientscp: flag("CLIENTSCP", d.clientscp),
+            keytype: num("SCP_KEYTYPE", d.keytype),
+            pdid: str_of("SCP_PDID", &d.pdid),
+            model: str_of("SCP_MODEL", &d.model),
+            interact: str_of("SCP_INTERACT", &d.interact),
+            resp: str_of("RESP", &d.resp),
+            ss_send: flag("SCP_SS_SEND", d.ss_send),
+            ss_enc: flag("SCP_SS_ENC", d.ss_enc),
+            ss_key: str_of("SCP_SS_KEY", &d.ss_key),
+            ss_iv: str_of("SCP_SS_IV", &d.ss_iv),
+            ss_now: flag("SCP_SS_NOW", d.ss_now),
+            ks_dump: flag("SCP_KS_DUMP", d.ks_dump),
+            no_openout: flag("SCP_NO_OPENOUT", d.no_openout),
+            dial_ports: ports("SCP_DIAL_PORTS", &d.dial_ports),
+            ss_nonce_zero: std::env::var("SCP_SS_NONCE_ZERO").is_ok(),
+            openout_sync: std::env::var("OPENOUT_SYNC").ok().filter(|s| !s.is_empty()),
+            openout_ack: std::env::var("OPENOUT_ACK").is_ok(),
+            openout_scp: std::env::var("SCP_OPENOUT_SCP").is_ok(),
+            greet: std::env::var("SCP_GREET").is_ok(),
+        }
+    }
+}
+
+// -- LinkConfig --
+impl LinkConfig {
+    pub fn load(settings: &serde_json::Value) -> Self {
+        let d = Self::default();
+        Self {
+            ports: ports("LINK_PORTS", &d.ports),
+            poison: match std::env::var("LINK_POISON_IP").ok() {
+                Some(v) if v.eq_ignore_ascii_case("off") || v.trim().is_empty() => None,
+                Some(v) => ipv4(v.trim()).or(d.poison),
+                None => d.poison,
+            },
+            mirror: flag("LINK_REPLY_MIRROR", d.mirror),
+            ns: str_of("LINKNS", &d.ns),
+            ack: str_of("LINK_ACK", &d.ack),
+            pub_hex: hex_bytes("LINKPUB"),
+            reply_hex: hex_bytes("LINK_REPLY_HEX"),
+            reply_hex_file: std::env::var("LINK_REPLY_HEX_FILE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            kpd: std::env::var("LINK_KPD")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| setting_str(settings, "linkKpd"))
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().as_bytes().to_vec())
+                        .filter(|v| !v.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+// -- PairingConfig --
+impl PairingConfig {
+    pub fn load(settings: &serde_json::Value) -> Self {
+        Self {
+            ksc_pin: hex_bytes("SCP_KSC")
+                .filter(|v| v.len() == 16)
+                .or_else(|| {
+                    setting_str(settings, "scpKsc")
+                        .and_then(|s| hex::decode(s.replace(':', "")).ok())
+                })
+                .filter(|v| v.len() == 16),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3395,7 +3754,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {
             std::env::set_var("LPLUS_STATE_DIR", &dir);
-            std::env::remove_var("SCP_KSC");
         }
         dir
     }
@@ -3404,11 +3762,11 @@ mod tests {
     fn ksc_bond_is_minted_once_and_replayed_across_restarts() {
         let _guard = crate::state::ENV_TEST_LOCK.lock().expect("ksc test lock");
         let dir = ksc_env_isolate("mint");
-        let (k1, a1) = issue_ksc("192.0.2.102", "A1B2C3D4E5F6");
+        let (k1, a1) = issue_ksc(None, "192.0.2.102", "A1B2C3D4E5F6");
         assert_eq!(k1.len(), 16);
         assert_eq!(a1.len(), 6);
         // "Restart" = fresh process view; the store file is re-read each call.
-        let (k2, a2) = issue_ksc("192.0.2.102", "A1B2C3D4E5F6");
+        let (k2, a2) = issue_ksc(None, "192.0.2.102", "A1B2C3D4E5F6");
         assert_eq!(k1, k2, "resumption must replay the bonded ksc verbatim");
         assert_eq!(a1, a2, "alias must be stable too (loadKsc keys on it)");
         let stored = std::fs::read_to_string(crate::state::ksc_store_path()).expect("store");
@@ -3417,7 +3775,7 @@ mod tests {
             "bond not persisted: {stored}"
         );
         // A different peer gets its own key, not a reuse of the first.
-        let (k3, _) = issue_ksc("192.0.2.103", "A1B2C3D4E5F6");
+        let (k3, _) = issue_ksc(None, "192.0.2.103", "A1B2C3D4E5F6");
         assert_ne!(k1, k3);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3432,17 +3790,20 @@ mod tests {
         let mac = ksc_s(&bonded, &qc, ts);
         let dev_hex = "bcc5b323465c";
         // No bond yet: nothing to verify against (phone would re-pair).
-        assert!(ksc_candidates("192.0.2.102", dev_hex).is_empty());
+        assert!(ksc_candidates(None, "192.0.2.102", dev_hex).is_empty());
         // Bond issued via sync-secure to the peer IP.
-        let (_, alias) = issue_ksc("192.0.2.102", "A1B2C3D4E5F6");
+        let (_, alias) = issue_ksc(None, "192.0.2.102", "A1B2C3D4E5F6");
         ksc_store_put("192.0.2.102", "A1B2C3D4E5F6", &bonded, &alias);
-        let cands = ksc_candidates("192.0.2.102", dev_hex);
+        let cands = ksc_candidates(None, "192.0.2.102", dev_hex);
         assert_eq!(cands, vec![bonded.to_vec()]);
         assert!(cands.iter().any(|c| ksc_s(c, &qc, ts) == mac));
         // Success promotes the bond under the claimed device id, so the
         // next AUTH resolves even from a different socket/port.
         remember_ksc(dev_hex, dev_hex, &bonded);
-        assert_eq!(ksc_candidates("192.0.2.9", dev_hex), vec![bonded.to_vec()]);
+        assert_eq!(
+            ksc_candidates(None, "192.0.2.9", dev_hex),
+            vec![bonded.to_vec()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3457,16 +3818,75 @@ mod tests {
         assert_eq!(v["dbs_msg_type"], "msg_topic_sync");
         // The phone's DbsDataReceiver only parses dbr.a msgType 42/82.
         let mut bad = frame.clone();
-        bad[4 + 3 + 26] = 7;
+        bad[4 + 3 + 26] = 7; // legacy prefix view
+        bad[4 + 11 + 26] = 7; // DATA (0x04 + ctr) prefix view
         assert!(dbs_payload_json(&bad[4..]).is_none());
+    }
+
+    fn row(key: &str, device_id: &str) -> (String, KscRecord) {
+        (
+            key.to_string(),
+            KscRecord {
+                device_id: device_id.to_string(),
+                alias: "aabbccddeeff".into(),
+                ksc: "00112233445566778899aabbccddeeff".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn bond_gate_matches_announced_pdid_case_insensitively() {
+        let rows = vec![row("192.0.2.102", "bcc5b323465c")];
+        assert!(bond_covers(&rows, "192.0.2.5", Some("BCC5B323465C")));
+        assert!(bond_covers(&rows, "192.0.2.102", None));
+    }
+
+    #[test]
+    fn bond_gate_rejects_foreign_pdid_even_with_one_bond() {
+        let rows = vec![row("192.0.2.102", "bcc5b323465c")];
+        assert!(!bond_covers(&rows, "192.0.2.5", Some("DEADBEEFDEAD")));
+    }
+
+    #[test]
+    fn bond_gate_falls_back_to_single_bond_without_pdid() {
+        let one = vec![row("192.0.2.102", "bcc5b323465c")];
+        assert!(bond_covers(&one, "192.0.2.9", None));
+        let two = vec![
+            row("192.0.2.102", "bcc5b323465c"),
+            row("192.0.2.77", "aabbccddeeff"),
+        ];
+        assert!(!bond_covers(&two, "192.0.2.9", None));
+    }
+
+    #[test]
+    fn kms_port_rotation_advances_within_span() {
+        let sdp = Sdp::new(SdpdConfig::default(), crate::svc::epi::Epi::new());
+        let base = sdp.gcfg.kms.port_base;
+        let span = sdp.kms_port_span();
+        let p0 = sdp.kms_bootstrap_env().0;
+        assert!(p0 >= base && p0 < base + span, "port {p0} outside span");
+        sdp.begin_kms_session();
+        let p1 = sdp.kms_bootstrap_env().0;
+        assert_ne!(p0, p1, "begin must change the port (stale same-port guard)");
+        for _ in 0..span {
+            sdp.begin_kms_session();
+        }
+        assert_eq!(sdp.kms_bootstrap_env().0, p1, "rotation must cycle");
     }
 
     #[test]
     fn topic_sync_json_carries_sub_list_and_type() {
         let j = crate::svc::kms::dbs_topic_sync_json("aabb", "ccdd", &["Oplus_PcConnect"], 5);
         assert!(j.contains(r#""dbs_msg_type":"msg_topic_sync""#));
-        assert!(j.contains(r#""sub":["Oplus_PcConnect"]"#));
         assert!(j.contains(r#""dbs_msg_from_device":"aabb""#));
+        // `f.h` Gson-parses the payload as Map<String, Set<ONetTopic>>:
+        // string-typed payload holding ONetTopic-shaped objects.
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(v["dbs_msg_payload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["sub"][0]["dbs_topic_name"], "Oplus_PcConnect");
+        assert_eq!(payload["sub"][0]["dbs_topic_tag"], 0);
+        assert!(payload["pub"].as_array().unwrap().is_empty());
     }
 
     /// The published blob must round-trip the phone parser's contract:
@@ -3630,19 +4050,16 @@ mod auth_tests {
         let f = kms_bootstrap_frame(36863, "pw", "192.0.2.1", "A1B2C3D4E5F6", "0123456789AB")
             .expect("build");
         assert_eq!(&f[2..4], &[0x00, 0x20]); // ftype DATA, sid 8
-        let json = String::from_utf8(f[7 + 52..].to_vec()).expect("utf8 tail");
-        assert!(json.contains("\"key\":\"input_service\""));
-        assert!(json.contains("msg_type\\\":61"));
+        assert_eq!(f[4], 0x04); // b0 DATA
+        let json = String::from_utf8(f[4 + 11 + 58..].to_vec()).expect("utf8 tail");
+        // payload is a quoted JSON string, so inner quotes arrive escaped.
+        assert!(json.contains("\\\"key\\\":\\\"input_service\\\""));
+        assert!(json.contains("msg_type"));
         assert!(json.contains("kms_socket_port"));
-        assert_eq!(&f[7..13], &hex::decode("A1B2C3D4E5F6").unwrap()[..]); // dbr from
-    }
-
-    #[test]
-    fn session_info_frame_is_msgtype_then_raw_name() {
-        // Phone side (session/a.java:878) reads msgType byte then takes the
-        // remainder as deviceName; framing reuses the session header.
-        let f = session_info_frame("NW", 2);
-        assert_eq!(f, vec![0x00, 0x05, 0x00, 0x08, 101, b'N', b'W']);
+        assert_eq!(
+            &f[4 + 11..4 + 17],
+            &hex::decode("A1B2C3D4E5F6").unwrap()[..]
+        ); // dbr from
     }
 
     #[test]

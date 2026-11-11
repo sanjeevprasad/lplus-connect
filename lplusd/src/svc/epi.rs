@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use tokio::sync::Mutex;
 
+use crate::config::{csv, flag, hex_num, num, str_of};
 use crate::svc::Services;
 use crate::svc::sdp::Sdp;
 
@@ -33,11 +34,12 @@ pub enum Command {
     RpcConnect {
         ip: String,
     },
-    /// Inject raw hex onto every EPI sink whose key contains the substring
-    /// (the DataBus cast lane pushes its DbsMessage frames this way).
+    /// Inject raw bytes onto every EPI sink whose key contains the
+    /// substring (the DataBus cast lane pushes its DbsMessage frames this
+    /// way; the gRPC boundary hex-decodes at the edge).
     SendFrame {
         key_substr: String,
-        hex: String,
+        bytes: Vec<u8>,
     },
 }
 
@@ -175,7 +177,22 @@ impl Epi {
                 match cmd {
                     Command::Connect { ip } => {
                         let ip = sdp.resolve_phone_ip(&ip);
-                        crate::scpc::spawn_dial(ip.clone(), sdp.name().to_string());
+                        crate::scpc::spawn_dial(ip.clone(), sdp.cfg.name.clone(), sdp.gcfg.clone());
+                        // Paired-idle case: the phone's :46888 acceptor is
+                        // armed while paired, so dial it ourselves and run
+                        // the client PD/AUTH/capex legs; on success the pump
+                        // pushes the bootstrap + RpcFrames on its own session
+                        // and stays live as an injection sink.
+                        let sdp_dial = sdp.clone();
+                        let ip_dial = ip.clone();
+                        tokio::spawn(async move {
+                            match crate::scpc::dial_epi(&sdp_dial, &ip_dial).await {
+                                Ok(()) => tracing::info!("[epic] {ip_dial} pc-dial session ended"),
+                                Err(e) => {
+                                    tracing::warn!("[epic] {ip_dial} pc-dial FAILED: {e:#}")
+                                }
+                            }
+                        });
                         // Session lane (proven): KMS bootstrap DataBus push is
                         // the trigger the phone's engine acts on (it dialed our
                         // :10152 with a completed handshake after this frame,
@@ -205,25 +222,43 @@ impl Epi {
                     Command::RpcConnect { ip } => {
                         let ip = sdp.resolve_phone_ip(&ip);
                         let epi = epi.clone();
-                        tokio::spawn(async move {
-                            for (label, wire) in crate::scpc::rpc_frames(&ip) {
-                                let sent = epi.push_matching("46888", &wire).await;
-                                tracing::info!("[cmd] rpc {label}: pushed to {sent} sink(s)");
-                                if sent == 0 {
-                                    break;
+                        tokio::spawn({
+                            let sdp = sdp.clone();
+                            async move {
+                                let phone_dev = crate::svc::sdp::ksc_bond(&ip)
+                                    .map(|r| r.device_id)
+                                    .unwrap_or_default();
+                                for (label, wire) in
+                                    crate::scpc::rpc_frames(&ip, &phone_dev, &sdp.gcfg)
+                                {
+                                    let sent = epi.push_matching("46888", &wire).await;
+                                    tracing::info!("[cmd] rpc {label}: pushed to {sent} sink(s)");
+                                    if sent == 0 {
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(1200))
+                                        .await;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
                             }
                         });
                     }
                     Command::KmsBootstrap { ip } => {
-                        let from = std::env::var("LINK_DET_PEER")
-                            .unwrap_or_else(|_| "A1B2C3D4E5F6".into());
-                        let to = std::env::var("LINK_KPD")
-                            .ok()
-                            .and_then(|s| s.split(',').next().map(str::to_string))
+                        let from = "A1B2C3D4E5F6";
+                        // Destination must be the phone's bonded device id
+                        // (dbr.a `to`/dest list gate, PROTOCOL §7.11); the
+                        // vendor constant only as fallback.
+                        let to = sdp
+                            .gcfg
+                            .link
+                            .kpd
+                            .first()
+                            .map(|v| String::from_utf8_lossy(v).to_string())
+                            .or_else(|| crate::svc::sdp::ksc_bond(&ip).map(|r| r.device_id))
                             .unwrap_or_else(|| "0123456789AB".into());
-                        match sdp.kms_bootstrap_frame(&from, &to) {
+                        // Fresh port for this bootstrap (stale same-port
+                        // guard, see Sdp::begin_kms_session).
+                        sdp.begin_kms_session();
+                        match sdp.kms_bootstrap_frame(from, &to) {
                             Ok(frame) => {
                                 let sent = epi.push_matching("46888", &frame).await;
                                 if sent == 0 {
@@ -233,7 +268,7 @@ impl Epi {
                                     );
                                 } else {
                                     crate::svc::sdp::record(
-                                        &std::env::var("LPLUS_LOG").unwrap_or_default(),
+                                        sdp.gcfg.dev.record_path.as_deref().unwrap_or_default(),
                                         "cmd-kms-bootstrap",
                                         &frame,
                                     );
@@ -248,18 +283,101 @@ impl Epi {
                             }
                         }
                     }
-                    Command::SendFrame { key_substr, hex } => match hex::decode(hex.trim()) {
-                        Ok(bytes) => {
-                            let sent = epi.push_matching(&key_substr, &bytes).await;
-                            tracing::info!(
-                                "[cmd] send {key_substr:?}: {sent} sink(s) {}B",
-                                bytes.len()
-                            );
-                        }
-                        Err(e) => tracing::info!("[cmd] send {key_substr:?} bad hex: {e}"),
-                    },
+                    Command::SendFrame { key_substr, bytes } => {
+                        let sent = epi.push_matching(&key_substr, &bytes).await;
+                        tracing::info!(
+                            "[cmd] send {key_substr:?}: {sent} sink(s) {}B",
+                            bytes.len()
+                        );
+                    }
                 }
             }
         });
+    }
+}
+
+// ==== service configuration (env keys read once at startup) ====
+
+/// DataBus/EPI server + PC-dialed client lanes (`EPI*`).
+#[derive(Debug, Clone)]
+pub struct EpiConfig {
+    /// `EPI`: bind the datatrans/EPI server lanes.
+    pub enabled: bool,
+    /// `EPI_DIAL_PORT`: the PC-dialed EPI client port on the phone.
+    pub dial_port: u16,
+    /// `EPI_FRAMING`: `connector`|`raw3`|`3b`.
+    pub framing: String,
+    /// `EPI_CAPEX`: run the capability-exchange leg (default on).
+    pub capex: bool,
+    /// `EPI_CAPEX_FRAME`: `sess` (session-wrapped) or `bare`.
+    pub capex_frame: String,
+    /// `EPI_CAPEX_PROFILES`: accessory profiles we register.
+    pub capex_profiles: Vec<String>,
+    /// `EPI_AUTH_RESP`: AUTH_RESPONSE FrameType byte (hex).
+    pub auth_resp: u8,
+    /// `EPI_AUTH_ACK`: confirm echo after rc_2 verifies (hex, 0 = off).
+    pub auth_ack: u8,
+    /// `EPI_TYPE` / `EPI_PROTO`: PD-offer msgType / protocol version.
+    pub offer_type: u8,
+    pub offer_proto: u16,
+    /// `EPI_PEERID`: 36B peer id presented in the PD offer.
+    pub peer_id: String,
+    /// `EPI_MSG`: raw hex override for the whole PD offer frame.
+    pub msg_override: Option<String>,
+    /// `EPI_CAPEX_DIAL`: also run capex right after dialing this port.
+    pub capex_dial: Option<u16>,
+}
+
+impl Default for EpiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dial_port: 46888,
+            framing: "connector".into(),
+            capex: true,
+            capex_frame: "sess".into(),
+            capex_profiles: [
+                "com.oplus.pantaconnect.globaldevice.discovery",
+                "uuid.icdf.service1",
+                "app:oplus.pantaconnect.app_service",
+                "vdc.service.sync",
+                "oaf.service.iphone.call",
+                "icdf.videocall.service",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+            auth_resp: 0x11,
+            auth_ack: 0x12,
+            offer_type: 1,
+            offer_proto: 10,
+            peer_id: "A1B2C3D4E5F6".repeat(3),
+            msg_override: None,
+            capex_dial: None,
+        }
+    }
+}
+
+// -- EpiConfig --
+impl EpiConfig {
+    pub fn load() -> Self {
+        let d = Self::default();
+        Self {
+            enabled: flag("EPI", d.enabled),
+            dial_port: num("EPI_DIAL_PORT", d.dial_port),
+            framing: str_of("EPI_FRAMING", &d.framing),
+            capex: flag("EPI_CAPEX", d.capex),
+            capex_frame: str_of("EPI_CAPEX_FRAME", &d.capex_frame),
+            capex_profiles: csv("EPI_CAPEX_PROFILES").unwrap_or(d.capex_profiles),
+            auth_resp: hex_num("EPI_AUTH_RESP", d.auth_resp),
+            auth_ack: hex_num("EPI_AUTH_ACK", d.auth_ack),
+            offer_type: num("EPI_TYPE", d.offer_type),
+            offer_proto: num("EPI_PROTO", d.offer_proto),
+            peer_id: str_of("EPI_PEERID", &d.peer_id),
+            msg_override: std::env::var("EPI_MSG").ok().filter(|s| !s.is_empty()),
+            capex_dial: std::env::var("EPI_CAPEX_DIAL")
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
+        }
     }
 }

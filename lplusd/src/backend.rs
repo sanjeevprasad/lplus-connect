@@ -60,7 +60,7 @@ pub fn start(cfg: SdpdConfig) -> Result<u16, String> {
             rt.block_on(async move {
                 let mut rx = sdp.subscribe_devices();
                 while let Ok(ev) = rx.recv().await {
-                    devices::log_presence(&ev);
+                    devices::log_event(ev.kind, &ev.ip, ev.name.as_deref(), ev.connected, ev.ts_ms);
                 }
             });
         })

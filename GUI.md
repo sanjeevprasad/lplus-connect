@@ -94,7 +94,7 @@ to add as new rpcs.
 | `generic_agent_ensure_running` | implemented | `{ok:true,status:'idle'}` |
 | `get_current_connected_device_info_list` | implemented | connected rows of the device model |
 | `lplus_sidecar_status` | implemented | `{running,logTailing}` (in-process backend liveness; `logTailing:"in-process backend"`) |
-| `connect_device` / `disconnect_device` | implemented | queues `sdpd::Command::{Connect,Disconnect}{ip}` on the backend command channel (`{ok,ip}`; `ok:false` when the channel is closed) |
+| `connect_device` / `disconnect_device` | implemented | queues `svc::epi::Command::{Connect,Disconnect}{ip}` on the EPI command bus (`{ok,ip}`; `ok:false` when the bus has no subscribers) |
 | `public_get_system_theme` | implemented | `"light"` |
 | `settings_get_pc_connect_running` | implemented | `false` |
 | `get_main_window_bounds` | implemented | live outer bounds |
@@ -146,11 +146,17 @@ lplus backend (in-process, same binary)
   primary NIC) are filtered: the daemon may report the PC's own side of
   sessions. The adb lane (`adb devices -l`, 5 s) mints USB rows
   (`connectType 128`, `usbSerial`) outside the event path.
-- The backend runs in the **same process** (`sdpd::run`).
-  `apply_daemon_env()` seeds the env-driven knobs — SCP_*, EPI, KMS(36863),
-  LINK_*, `SCP_INTERACT=accept`, `LPLUS_EVENTS_PORT=14752` — in `main`
-  while single-threaded (CLI `--name/--csp/--vip` override `SdpdConfig`).
-  Non-defaulted knobs: `LPLUS_USB=1` re-enables the adb/USB device lane
+- The backend runs in the **same process** (`sdpd::run`). Every daemon
+  knob is a compiled-in default in the per-service config sections
+  (`lplusd/src/config/` bundle + `ScpConfig`/`LinkConfig` in `svc/sdp.rs`,
+  `EpiConfig` in `svc/epi.rs`, `KmsConfig` in `svc/kms.rs`, `DatabusConfig`
+  /`DialConfig` in `scpc.rs`, `EventsConfig` in `svc/events.rs`,
+  `AutolinkConfig` in `svc/autolink.rs`); the environment only overrides
+  (keys documented on each field, read once at startup) and
+  `settings.json` supplies pairing material (`scpKsc`→KSC pin,
+  `linkKpd`). CLI `--name/--csp/--vip` override `SdpdConfig`.
+  Excluded by design: `RUST_LOG`, `LPLUS_STATE_DIR`, `LPLUS_USB=1` (adb/USB lane),
+  `ODMF_*`/`RTSP*` (mirror/video dev harnesses). Non-defaulted knobs: `LPLUS_USB=1` re-enables the adb/USB device lane
   (hidden by default: Wi-Fi-only device lists; paired bonds stay persisted
   either way); `ODMF_LIVE=1` pipes decoded mirror frames to the in-window
   live preview (`ODMF_PLAYER`/`ODMF_FFMPEG` override the players), and
@@ -173,12 +179,14 @@ lplus backend (in-process, same binary)
   dedupe, host-side filtering, model-name preference, adb upsert/prune, and
   TTL pruning with the paired exemption (`cargo test`).
 
-Device actions round-trip through the backend command channel: the
+Device actions round-trip through the EPI command bus: the
 renderer's Connect/Disconnect lane (and the `connect_device` /
 `disconnect_device` channels) queue
-`sdpd::Command::{Connect,Disconnect,KmsBootstrap,SendFrame}`;
-`spawn_command_runner` executes them (adb-side steering via `steer.rs`,
-EPI sink pushes).
+`svc::epi::Command::{Connect,Disconnect,KmsBootstrap,RpcConnect,SendFrame}`;
+`Epi::spawn_runner` executes them — LAN SCP dial (`scpc::dial_connect`),
+the PC-dialed EPI client (`scpc::dial_epi`, which lets a paired device be
+connected from the PC side without a phone tap; PROTOCOL.md §7.11), and
+DataBus pushes onto the live :46888 sinks.
 
 ## 4. Verification reference
 
@@ -214,17 +222,24 @@ cargo run -- panel              # same as default (backend + contract server)
 ```
 
 `lplus` is **the** daemon: default csp 10152, EPI lanes (46888/47888/48888),
-KMS (`KMS=1 KMS_PORT=36863 KMS_PWD=lplus-kms-pw`), presence NDJSON bridge
+KMS (default-on; `KMS_PORT=36863` base, `KMS_PWD=lplus-kms-pw`; bootstrap rotates
+`kms_socket_port` over `KMS_PORT`..+`KMS_PORT_ROT`, one listener per port),
+boot auto-link (after services start the daemon dials whoever is
+broadcasting sdp/1 **and** whose `PDID` matches a bond — no IPs are stored
+as dial targets, so a DHCP-renumbered phone re-links on its next announce
+round; idle phones go SDP-quiet until their accessory service wakes;
+`AUTO_CONNECT=0` to disable, `AUTO_CONNECT_INTERVAL` seconds for cadence),
+presence NDJSON bridge
 (`LPLUS_EVENTS_PORT=14752`), the contract server (:1421), SCP_*/LINK_*
-quickstart table applied via `apply_daemon_env()` (every entry
-only if the environment doesn't already define it — launch with your own
-exported values to override, e.g. `ODMF_RTP_PORT=15550` for the mirror lane). If a foreign process holds any of those ports, startup fails
+quickstart table (all values compiled in as config defaults; export any
+documented key to override at launch, e.g. `ODMF_RTP_PORT=15550` for the
+mirror lane). If a foreign process holds any of those ports, startup fails
 loudly naming port + holder (`ss -ltnp`), so exactly one `lplus` owns the
 network stack. Presence follows external bridges only via
 `LPLUS_EVENTS_PORT=port[,port…]` (dev aid). Persistent state —
 `paired.json`, `unpaired.json`, `settings.json` (host name, pinned
-beacon `name`, pairing material `scpKsc`/`linkKpd` — seeded into the
-environment at startup) — lives in the
+beacon `name`, pairing material `scpKsc`/`linkKpd` — read directly by the
+config loader) — lives in the
 platform config dir (`~/.config/lplus` on XDG; `directories` crate),
 override with `LPLUS_STATE_DIR`; files left in the capture out dir are
 copied over once on first use.
@@ -233,17 +248,16 @@ copied over once on first use.
 
 1. Connect flow: the Connect/Disconnect actions and `connect_device` /
    `disconnect_device` channels are wired to
-   `sdpd::Command::{Connect,Disconnect}` (adb steering via `steer.rs`);
-   finish the end-to-end flip on live phones and drive `KmsBootstrap` /
-   `SendFrame` from UI actions as the lanes mature.
+   `svc::epi::Command::{Connect,Disconnect}` — the PC-dialed EPI client
+   establishes the session on a paired-idle phone (PROTOCOL.md §7.11);
+   remaining: flip the phone UI without a phone-side tap (sealed DbsMessage
+   routing, §7.11 open) and drive `KmsBootstrap` / `SendFrame` from UI
+   actions as the lanes mature.
 2. Work the audit ring (`ipc_registry`) list above as lanes land; every
    implemented channel = one `route_invoke`/`route_bus` arm.
-3. Typed daemon config: parse the env knobs once into `SdpdConfig`,
-   replacing the `DAEMON_ENV` seed table and the per-reader default
-   duplicates (`KMS_PWD`, `KMS_PORT`, `LINK_KPD`). Partially landed:
-   `--name`/`--vip` resolve at parse time (settings-pinned name →
-   hostname; primary-interface VIP) and `settings.json` keys
-   `scpKsc`/`linkKpd` seed `SCP_KSC`/`LINK_KPD` before the defaults.
+3. Typed daemon config: landed — nested per-service config structs
+   (`Arc`-shared, loaded once, owned by `Sdp`/clients/services); env keys
+   remain compat overrides; `settings.json` supplies pairing material.
 4. Bundle step (deb/appimage), icons/branding.
 
 

@@ -90,11 +90,6 @@ pub fn hello_frame_ex(seq: u32, channel: &str, namespace: &str, server: bool) ->
     }
 }
 
-/// [`hello_frame_ex`] with `server = true`.
-pub fn hello_frame(seq: u32, channel: &str, namespace: &str) -> Vec<u8> {
-    hello_frame_ex(seq, channel, namespace, true)
-}
-
 /// SYNC frame with an explicit sequence number. Per `RealScpProtocol.l`, the
 /// wire envelope is `ScpWrapData{ msg_type, data }` = `{1:msg_type, 2:data}`
 /// (mirrors the phone's own HELLO which is `token || {2:q}` with msg_type
@@ -130,25 +125,6 @@ pub fn sync_frame_ex(
     } else {
         frame_t(0, 0, &v)
     }
-}
-
-/// [`sync_frame_ex`] with `server = true` and keyType BOTH.
-pub fn sync_frame(
-    seq: u32,
-    channel: &str,
-    namespace: &str,
-    device_name: &str,
-    model_id: &str,
-) -> Vec<u8> {
-    sync_frame_ex(
-        seq,
-        channel,
-        namespace,
-        device_name,
-        model_id,
-        true,
-        KEY_BOTH as i32,
-    )
 }
 
 /// Split a TCP read into individual cpbus frames:
@@ -240,7 +216,7 @@ pub fn hello_sync_bytes(
     };
     let hello = ScpMessage {
         msg_type: Some(MSG_HELLO),
-        data: q.clone().encode_to_vec(),
+        data: q.encode_to_vec(),
     };
     let sync = ScpMessage {
         msg_type: Some(MSG_SYNC),
@@ -263,11 +239,6 @@ pub fn hello_sync_bytes(
     let mut syncv = TOKEN.to_vec();
     syncv.extend_from_slice(&sync.encode_to_vec());
     (wrap(hello), syncv)
-}
-
-/// Wrap a protobuf payload in the cpbus data frame (`7b` marker + header).
-pub fn frame(seq: u16, protobuf: &[u8]) -> Vec<u8> {
-    frame_t(1, seq, protobuf)
 }
 
 /// As [`frame_t`], with the `isServer` header bit (byte1 = `0x34`).
@@ -361,7 +332,7 @@ mod tests {
     #[test]
     fn frame_has_len_excluding_token_prefix() {
         let proto = [0x08u8, 0xad, 0x12, 0x00]; // TOKEN || msg
-        let f = frame(7, &proto);
+        let f = frame_t(1, 7, &proto);
         assert_eq!(&f[0..2], &[0x40, 0x30]);
         assert_eq!(&f[2..4], &[0x00, 0x01]); // body(5) - 4
         assert_eq!(&f[4..6], &[0x00, 0x01]); // default data type

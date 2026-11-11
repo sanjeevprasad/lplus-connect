@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+pub mod autolink;
 pub mod contract;
 pub mod epi;
 pub mod events;
@@ -43,14 +44,23 @@ impl Services {
     /// loop. Call from a tokio runtime context.
     pub async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
         events::EventsBridge::new(self.sdp.clone()).spawn();
-        let log_path = self.sdp.cfg().log_path.clone();
-        let kms_port = std::env::var("KMS_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(36863u16);
-        let kms_pwd = std::env::var("KMS_PWD").unwrap_or_else(|_| "lplus-kms-pw".into());
-        if std::env::var("KMS").is_ok() {
-            kms::Kms::new(kms_port, kms_pwd, log_path.clone(), self.sdp.clone()).spawn();
+        let log_path = self.sdp.cfg.log_path.clone();
+        let kms_pwd = self.sdp.gcfg.kms.pwd.clone();
+        if self.sdp.gcfg.kms.enabled {
+            // One listener per bootstrap-port candidate: the bootstrap
+            // rotates `kms_socket_port` per session (Sdp::begin_kms_session)
+            // to defeat the phone's stale same-port start() guard, so all
+            // span ports must be listening.
+            let base = self.sdp.gcfg.kms.port_base;
+            for i in 0..self.sdp.kms_port_span() {
+                kms::Kms::new(
+                    base + i,
+                    kms_pwd.clone(),
+                    log_path.clone(),
+                    self.sdp.clone(),
+                )
+                .spawn();
+            }
         }
         if std::env::var("ODMF_SINK").is_ok() {
             let listen: std::net::SocketAddr = std::env::var("ODMF_LISTEN")
@@ -64,6 +74,9 @@ impl Services {
             wfd::Wfd::new(listen, out, respond).spawn();
         }
         Epi::spawn_runner(self);
+        if self.sdp.gcfg.autolink.enabled {
+            autolink::spawn(self.sdp.clone(), self.epi.clone());
+        }
         self.sdp.run().await
     }
 }

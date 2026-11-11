@@ -373,11 +373,11 @@ where
     N: aes_gcm::aead::array::ArraySize,
     aes_gcm::AesGcm<aes::Aes256, N>:
         aes_gcm::KeyInit + aes_gcm::aead::Aead + aes_gcm::aead::AeadCore<NonceSize = N>,
-    aes_gcm::Nonce<N>: TryFrom<Vec<u8>>,
+    for<'a> aes_gcm::Nonce<N>: TryFrom<&'a [u8]>,
 {
     use aes_gcm::aead::Aead;
     let cipher = <aes_gcm::AesGcm<aes::Aes256, N> as aes_gcm::KeyInit>::new_from_slice(key).ok()?;
-    let nonce = aes_gcm::Nonce::<N>::try_from(iv.to_vec()).ok()?;
+    let nonce = aes_gcm::Nonce::<N>::try_from(iv).ok()?;
     cipher
         .decrypt(&nonce, aes_gcm::aead::Payload { msg: ct, aad })
         .ok()
@@ -389,11 +389,11 @@ where
     N: aes_gcm::aead::array::ArraySize,
     aes_gcm::AesGcm<aes::Aes256, N>:
         aes_gcm::KeyInit + aes_gcm::aead::Aead + aes_gcm::aead::AeadCore<NonceSize = N>,
-    aes_gcm::Nonce<N>: TryFrom<Vec<u8>>,
+    for<'a> aes_gcm::Nonce<N>: TryFrom<&'a [u8]>,
 {
     use aes_gcm::aead::Aead;
     let cipher = <aes_gcm::AesGcm<aes::Aes256, N> as aes_gcm::KeyInit>::new_from_slice(key).ok()?;
-    let nonce = aes_gcm::Nonce::<N>::try_from(iv.to_vec()).ok()?;
+    let nonce = aes_gcm::Nonce::<N>::try_from(iv).ok()?;
     cipher
         .encrypt(&nonce, aes_gcm::aead::Payload { msg, aad })
         .ok()
@@ -779,7 +779,7 @@ fn build_replies(req: &Rtsp, session_hdr: &mut Option<String>) -> Vec<Rtsp> {
         Some(RtspMethod::GetParameter) => {
             // WFD capability exchange: echo requested params (values we can
             // honour), pin our RTP sink port, no HDCP.
-            let asked = String::from_utf8_lossy(req.body()).to_string();
+            let asked = String::from_utf8_lossy(req.body());
             let mut body_s = String::new();
             for line in asked.lines() {
                 let Some((k, v)) = line.split_once(':') else {

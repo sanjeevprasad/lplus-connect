@@ -119,17 +119,21 @@ pub fn compat_scp_connect(address: &str, port: u16, device_type: i32) -> Call {
     }
 }
 
-/// `cpbus.networking/connect` (`CpbusNetworkingServiceRpcServer$register$3`
-/// → `NativeBridge.connect/connectV2`): the LAN-callable dial control.
-/// `direct_info` is the "ip:port" the phone should reach us on.
-pub fn networking_connect(device_id: &str, direct_info: &str, scp_key_type: i32) -> Call {
+/// [`networking_connect`] with the `auto_pair` toggle exposed (a paired
+/// peer must not re-pair; the vendor client clears it when a KSC exists).
+pub fn networking_connect_opts(
+    device_id: &str,
+    direct_info: &str,
+    scp_key_type: i32,
+    auto_pair: bool,
+) -> Call {
     let req = ConnectRequest {
         options: Some(ConnectionOptions {
             device_id: device_id.to_string(),
             connection_type: ConnectType::Wlan as i32,
             direct_info: direct_info.to_string(),
             scp_key_type,
-            auto_pair: true,
+            auto_pair,
             show_pin_code: false,
         }),
     };
@@ -194,7 +198,7 @@ mod tests {
 
     #[test]
     fn networking_connect_frame_carries_service_method_and_options() {
-        let call = networking_connect("AABBCCDDEEFF", "192.0.2.5:10152", 3);
+        let call = networking_connect_opts("AABBCCDDEEFF", "192.0.2.5:10152", 3, true);
         let wire = {
             let mut c = call;
             c.request_id = 0x21;

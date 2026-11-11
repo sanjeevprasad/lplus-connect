@@ -41,7 +41,7 @@ tonic-prost = { version = "0.14", default-features = false }
 tonic-prost-build = { version = "0.14", default-features = false }
 # stream adapter handing the contract lane's pre-bound listener to tonic.
 tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
-whoami      = { version = "2", default-features = false }
+whoami      = { version = "2", default-features = false, features = ["std"] }
 thiserror   = { version = "2", default-features = false, features = ["std"] }
 
 [features]

@@ -111,7 +111,7 @@ pub fn rtsp_handshake(tcp: TcpStream, target: &str, rtp_port: u16) -> Result<()>
         &[("Accept", "application/sdp")]
     ));
     let d = read_msg(&mut rd)?;
-    let sdp = String::from_utf8_lossy(d.body()).to_string();
+    let sdp = String::from_utf8_lossy(d.body());
     let info = parse_sdp(&sdp);
     tracing::info!(
         "[rtsp] < DESCRIBE {} recvonly={} pt={:?} codec={:?} rtp_ports={:?}",

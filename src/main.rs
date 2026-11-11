@@ -20,8 +20,7 @@
 //! If a foreign process holds the backend ports, startup fails loudly
 //! naming the port and the holder (`ss -ltnp`), never silently defers.
 //!
-//! The `unsafe` uses are the single-threaded-startup env seed in
-//! [`apply_daemon_env`] and test-local env mutation (`std::env::set_var`
+//! The `unsafe` uses are test-local env mutation (`std::env::set_var`
 //! is unsafe in edition 2024); each carries an `#[expect(unsafe_code)]`
 //! with its safety argument.
 //!
@@ -57,101 +56,6 @@ struct Cli {
     vip: String,
 }
 
-/// Primary backend config: env-driven knobs the daemon reads at run time.
-/// Applied to the process environment (only where unset) before the
-/// backend starts, so the default `lplus` run matches the quickstart the
-/// phone is paired against.
-const DAEMON_ENV: &[(&str, &str)] = &[
-    ("RESP", "off"),
-    ("CLIENTSCP", "1"),
-    ("SCP_SERVER", "1"),
-    ("SCP_KEYTYPE", "1"),
-    ("SCP_SYNC_RESEND", "1"),
-    ("SCP_SS_SEND", "1"),
-    ("SCP_SS_ENC", "1"),
-    ("SCP_SS_NOW", "1"),
-    ("SCP_NO_OPENOUT", "1"),
-    ("SCP_KS_DUMP", "1"),
-    ("SCP_INTERACT", "accept"),
-    ("EPI", "1"),
-    ("KMS", "1"),
-    ("KMS_PORT", "36863"),
-    ("KMS_PWD", "lplus-kms-pw"),
-    ("LINK_PORTS", "54227,57320,63125,59566"),
-    ("LINK_REPLY_HEX_FILE", "/tmp/lrh.hex"),
-    ("LPLUS_EVENTS_PORT", "14752"),
-];
-
-/// Per-pairing material persisted in `settings.json` (state dir) and
-/// seeded into the environment before the generic defaults: the values
-/// the live phone was paired with never live in the tree. `SCP_KSC` acts
-/// as the KSC pin for restored bonds (see `svc::sdp::issue_ksc`); with no
-/// pin and no bond in `ksc.json`, a fresh random bond is minted per peer
-/// on next pairing. LINK knobs fall back to their synthetic env defaults.
-const SETTINGS_ENV: &[(&str, &str)] = &[("scpKsc", "SCP_KSC"), ("linkKpd", "LINK_KPD")];
-
-/// `(env key, value)` pairs from `settings` whose env key is unset
-/// (pure, so the merge is unit-testable without touching files).
-fn settings_seeds(
-    settings: &serde_json::Value,
-    have: &impl Fn(&str) -> Option<String>,
-) -> Vec<(String, String)> {
-    SETTINGS_ENV
-        .iter()
-        .filter_map(|(json_key, env_key)| {
-            let v = settings.get(*json_key)?.as_str()?.trim().to_string();
-            (!v.is_empty() && have(env_key).is_none()).then(|| (env_key.to_string(), v))
-        })
-        .collect()
-}
-
-/// The panel `settings.json` (state dir), or an empty object.
-fn load_settings() -> serde_json::Value {
-    std::fs::read_to_string(state::panel_settings_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}))
-}
-
-/// `DAEMON_ENV` entries the environment does not already define (pure, so
-/// the merge is unit-testable without touching the real env).
-fn missing_daemon_env(have: &impl Fn(&str) -> Option<String>) -> Vec<(&'static str, &'static str)> {
-    DAEMON_ENV
-        .iter()
-        .copied()
-        .filter(|(k, _)| have(k).is_none())
-        .collect()
-}
-
-/// Seed the unset daemon knobs; `main` calls this while single-threaded.
-/// Pairing material from `settings.json` is seeded first, then the
-/// generic quickstart table; a log line names the seeded settings keys
-/// (keys only — never the secret values).
-#[expect(unsafe_code, reason = "std::env::set_var is unsafe in edition 2024")]
-fn apply_daemon_env() {
-    let have = |k: &str| std::env::var(k).ok();
-    let seeds = settings_seeds(&load_settings(), &have);
-    if !seeds.is_empty() {
-        tracing::info!(
-            "[state] seeded from settings.json: {}",
-            seeds
-                .iter()
-                .map(|(k, _)| k.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        for (k, v) in seeds {
-            // SAFETY: single-threaded startup, as below.
-            unsafe { std::env::set_var(k, v) };
-        }
-    }
-    for (k, v) in missing_daemon_env(&have) {
-        // SAFETY: runs in `main` before the tokio runtime (or any other
-        // thread) exists, so no concurrent env reader.
-        unsafe { std::env::set_var(k, v) };
-    }
-}
-
 /// The product's `SdpdConfig` (CLI values already carry parse-time
 /// defaults: name via `pc_beacon_name`, vip via `svc::sdp::default_vip`).
 fn default_config(name: String, csp: u16, vip: String) -> svc::sdp::SdpdConfig {
@@ -177,7 +81,7 @@ fn settings_name(settings: &serde_json::Value) -> Option<String> {
 /// Beacon/local name for the clap defaults: `settings.json` `name` (pins
 /// a paired identity), else the machine hostname, else the product tag.
 fn pc_beacon_name() -> String {
-    settings_name(&load_settings())
+    settings_name(&state::panel_settings())
         .or_else(svc::sdp::system_hostname)
         .unwrap_or_else(|| "L+ PC".into())
 }
@@ -195,10 +99,9 @@ fn held_ports(cfg: &svc::sdp::SdpdConfig) -> Vec<String> {
         47888,
         48888,
     ];
-    if let Ok(p) = std::env::var("LPLUS_EVENTS_PORT")
-        && let Ok(p) = p.parse::<u16>()
-    {
-        tcp.push(p);
+    let events = lplusd::config::Config::load().events.port;
+    if events != 0 {
+        tcp.push(events);
     }
     tcp.sort_unstable();
     tcp.dedup();
@@ -253,7 +156,6 @@ fn preflight_or_die(cfg: &svc::sdp::SdpdConfig) {
 fn main() -> Result<()> {
     let _log_guard = logging::init();
     let cli = Cli::parse();
-    apply_daemon_env();
     let cfg = default_config(cli.name, cli.csp, cli.vip);
     preflight_or_die(&cfg);
     backend::serve(cfg).map_err(|e| anyhow::anyhow!(e))
@@ -320,46 +222,6 @@ mod cli_tests {
                 "{argv:?} must not parse"
             );
         }
-    }
-
-    #[test]
-    fn daemon_env_skips_present_keys() {
-        let have = |k: &str| {
-            if k == "RESP" {
-                Some("preset".to_string())
-            } else {
-                None
-            }
-        };
-        let missing = missing_daemon_env(&have);
-        assert!(!missing.iter().any(|(k, _)| *k == "RESP"));
-        assert!(missing.iter().any(|(k, _)| *k == "EPI"));
-        assert!(missing.iter().any(|(k, _)| *k == "KMS"));
-        assert!(missing.iter().any(|(k, _)| *k == "LPLUS_EVENTS_PORT"));
-        // Pairing material must never live in the generic table.
-        assert!(
-            !missing
-                .iter()
-                .any(|(k, _)| *k == "SCP_KSC" || *k == "LINK_KPD")
-        );
-    }
-
-    #[test]
-    fn settings_seed_pairing_material_unless_present() {
-        let settings = serde_json::json!({
-            "scpKsc": " 00112233445566778899aabbccddeeff ",
-            "linkKpd": "",
-        });
-        let seeds = settings_seeds(&settings, &|k| (k == "LINK_KPD").then(|| "preset".into()));
-        assert_eq!(
-            seeds,
-            vec![(
-                "SCP_KSC".to_string(),
-                "00112233445566778899aabbccddeeff".to_string()
-            )]
-        );
-        let none = settings_seeds(&settings, &|_| Some("set".into()));
-        assert!(none.is_empty());
     }
 
     #[test]
