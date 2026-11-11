@@ -49,18 +49,22 @@ pub fn visible_rows() -> Vec<Device> {
 }
 
 /// Presence-lane probe (`SidecarStatus` rpc).
-pub fn sidecar_status() -> pb::SidecarLane {
+pub fn sidecar_status(up: bool) -> pb::SidecarLane {
     pb::SidecarLane {
-        running: crate::backend::backend_up(),
+        running: up,
         log_tailing: "in-process backend".into(),
     }
 }
 
-/// Connect/Disconnect lane: queue a `sdpd::Command` for the in-process
+/// Connect/Disconnect lane: queue a [`Command`] for the in-process
 /// backend (LAN SCP dial + EPI sink push run there); the `Ack` reports
 /// the queue verdict, not the link outcome.
-pub fn device_action(connect: bool, ip: &str) -> pb::Ack {
-    use crate::svc::epi::{Command, send_command};
+pub fn device_action(
+    epi: &std::sync::Arc<crate::svc::epi::Epi>,
+    connect: bool,
+    ip: &str,
+) -> pb::Ack {
+    use crate::svc::epi::Command;
     if ip.is_empty() {
         return ack(false, ip, Some("missing ip"));
     }
@@ -74,7 +78,7 @@ pub fn device_action(connect: bool, ip: &str) -> pb::Ack {
     } else {
         Command::Disconnect { ip: ip.to_string() }
     };
-    let queued = send_command(cmd);
+    let queued = epi.send(cmd);
     tracing::info!("[daemon] {kind} {ip} queued={queued}");
     ack(
         queued,
@@ -89,12 +93,12 @@ pub fn device_action(connect: bool, ip: &str) -> pb::Ack {
 
 /// KMS input-link lane: push the CastMessage msg-61 bootstrap on the
 /// live :46888 session (`Command::KmsBootstrap`).
-pub fn kms_bootstrap(ip: &str) -> pb::Ack {
-    use crate::svc::epi::{Command, send_command};
+pub fn kms_bootstrap(epi: &std::sync::Arc<crate::svc::epi::Epi>, ip: &str) -> pb::Ack {
+    use crate::svc::epi::Command;
     if ip.is_empty() {
         return ack(false, ip, Some("missing ip"));
     }
-    let queued = send_command(Command::KmsBootstrap { ip: ip.to_string() });
+    let queued = epi.send(Command::KmsBootstrap { ip: ip.to_string() });
     tracing::info!("[daemon] kms_bootstrap {ip} queued={queued}");
     ack(
         queued,
@@ -137,13 +141,14 @@ mod tests {
 
     #[test]
     fn device_lane_reports_the_queue_verdict() {
+        let epi = crate::svc::epi::Epi::new();
+        let _rx = epi.subscribe();
         assert!(
-            !super::device_action(true, "").ok
-                && super::device_action(true, "").error.as_deref() == Some("missing ip"),
+            !super::device_action(&epi, true, "").ok
+                && super::device_action(&epi, true, "").error.as_deref() == Some("missing ip"),
             "blank ip refused before the queue"
         );
-        let _rx = crate::svc::epi::subscribe_commands();
-        let act = super::device_action(true, "192.0.2.11");
+        let act = super::device_action(&epi, true, "192.0.2.11");
         assert!(act.ok, "command queues while the backend listens");
         assert_eq!(act.ip.as_deref(), Some("192.0.2.11"));
     }

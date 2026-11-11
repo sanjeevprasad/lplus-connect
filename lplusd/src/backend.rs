@@ -12,55 +12,53 @@ pub mod cast;
 pub mod devices;
 pub(crate) mod ipc;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
-use crate::svc::sdp::SdpdConfig;
+use crate::svc::{Services, sdp::SdpdConfig};
 
-/// In-process backend liveness (surfaced by `lplus_sidecar_status`).
-static BACKEND_UP: AtomicBool = AtomicBool::new(false);
-
-pub fn backend_up() -> bool {
-    BACKEND_UP.load(Ordering::Relaxed)
-}
-
-/// Spawn the backend on its own tokio runtime. `main` has already run
+/// Spawn the services on their own tokio runtime. `main` has already run
 /// `preflight_or_die`, so a bind failure here means the ports were taken
 /// after the check: fail loudly, never defer.
-fn start_backend(cfg: SdpdConfig) {
-    BACKEND_UP.store(true, Ordering::Relaxed);
+fn start_backend(services: Arc<Services>) {
+    services.up.store(true, Ordering::Relaxed);
     thread::Builder::new()
         .name("backend".into())
         .spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("backend tokio runtime");
-            if rt.block_on(crate::svc::run_all(cfg)).is_err() {
-                BACKEND_UP.store(false, Ordering::Relaxed);
+            if let Err(e) = rt.block_on(services.run()) {
+                tracing::error!("[backend] services stopped: {e:#}");
+                services.up.store(false, Ordering::Relaxed);
                 std::process::exit(1);
             }
         })
         .expect("spawn backend thread");
 }
 
-/// Bring up every daemon-side piece: device registry (presence + adb
-/// lanes), the loopback contract server and the backend lanes.
-/// Non-blocking; everything runs on its own threads. Returns the loopback
-/// port.
+/// Bring up every daemon-side piece: the service graph (SDP/SCP/EPI/KMS/
+/// WFD/events lanes), the device registry (presence + adb lanes) fed by
+/// the SDP service's `DeviceEvent` broadcast, and the loopback contract
+/// server. Non-blocking; everything runs on its own threads. Returns the
+/// contract port.
 pub fn start(cfg: SdpdConfig) -> Result<u16, String> {
-    devices::init();
-    let port = crate::svc::contract::spawn()?;
-    start_backend(cfg);
+    let services = Services::new(cfg);
+    devices::init(&services.sdp);
+    let port = crate::svc::contract::spawn(services.clone())?;
+    start_backend(services.clone());
     // Presence mirror to stdout; on its own tiny runtime so lanes stay
     // independent.
+    let sdp = services.sdp.clone();
     thread::Builder::new()
         .name("presence-log".to_string())
-        .spawn(|| {
+        .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("presence log runtime");
             rt.block_on(async move {
-                let mut rx = crate::svc::sdp::subscribe_devices();
+                let mut rx = sdp.subscribe_devices();
                 while let Ok(ev) = rx.recv().await {
                     devices::log_presence(&ev);
                 }

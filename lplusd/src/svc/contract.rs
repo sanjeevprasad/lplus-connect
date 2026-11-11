@@ -73,12 +73,16 @@ fn take_frame_payload() -> Result<Vec<u8>, String> {
 }
 
 /// Run one rpc; `Err(message)` becomes `Frame.error` on the reply.
-fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+fn handle_method(
+    services: &std::sync::Arc<crate::svc::Services>,
+    method: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
     use crate::backend::{api, cast};
     match method {
         m::PING => Ok(pb::Pong {
             version: env!("CARGO_PKG_VERSION").into(),
-            backend_up: crate::backend::backend_up(),
+            backend_up: services.up.load(std::sync::atomic::Ordering::Relaxed),
         }
         .encode_to_vec()),
         m::LIST_DEVICES => Ok(pb::Devices {
@@ -87,12 +91,12 @@ fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
         .encode_to_vec()),
         m::CONNECT => {
             let c = decode::<pb::ConnectCmd>(method, payload)?;
-            let act = api::device_action(true, &c.ip);
+            let act = api::device_action(&services.epi, true, &c.ip);
             Ok(act.encode_to_vec())
         }
         m::DISCONNECT => {
             let c = decode::<pb::DisconnectCmd>(method, payload)?;
-            let act = api::device_action(false, &c.ip);
+            let act = api::device_action(&services.epi, false, &c.ip);
             Ok(act.encode_to_vec())
         }
         m::REMOVE_DEVICE => {
@@ -130,36 +134,38 @@ fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
             bound: false,
         }
         .encode_to_vec()),
-        m::SIDECAR_STATUS => Ok(api::sidecar_status().encode_to_vec()),
+        m::SIDECAR_STATUS => Ok(api::sidecar_status(
+            services.up.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .encode_to_vec()),
         m::POLL_EVENTS => {
             let p = decode::<pb::PollEventsRequest>(method, payload)?;
             let (next_seq, events) = lplus_ipc::take_events(p.since_seq, p.limit);
             Ok(pb::Events { next_seq, events }.encode_to_vec())
         }
-        m::STATUS => Ok(cast::status().encode_to_vec()),
+        m::STATUS => Ok(
+            cast::status(services.up.load(std::sync::atomic::Ordering::Relaxed)).encode_to_vec(),
+        ),
         m::CAST_PUSH => {
             let c = decode::<pb::CastPushRequest>(method, payload)?;
-            Ok(cast::cast_push(&c.key, &c.value).encode_to_vec())
+            Ok(cast::cast_push(&services.epi, &c.key, &c.value).encode_to_vec())
         }
-        m::ODMF_START => Ok(cast::odmf_start().encode_to_vec()),
+        m::ODMF_START => Ok(cast::odmf_start(&services.epi).encode_to_vec()),
         m::KMS_BOOTSTRAP => {
             let c = decode::<pb::KmsBootstrapRequest>(method, payload)?;
-            let act = api::kms_bootstrap(&c.ip);
+            let act = api::kms_bootstrap(&services.epi, &c.ip);
             Ok(act.encode_to_vec())
         }
         m::SINK_LIST => Ok(pb::SinkRoster {
             // Non-blocking probe path; the gRPC handler awaits the
             // mutex directly (see `sink_list`).
-            keys: crate::svc::epi::EPI_SINKS
-                .try_lock()
-                .map(|s| s.keys().cloned().collect())
-                .unwrap_or_default(),
+            keys: services.epi.try_sink_keys(),
         }
         .encode_to_vec()),
         m::INJECT_FRAME => {
             let c = decode::<pb::InjectFrameRequest>(method, payload)?;
             let bytes = hex::decode(c.hex.trim()).map_err(|e| format!("bad hex: {e}"))?;
-            let queued = crate::svc::epi::send_command(crate::svc::epi::Command::SendFrame {
+            let queued = services.epi.send(crate::svc::epi::Command::SendFrame {
                 key_substr: c.key_substr,
                 hex: hex::encode(bytes),
             });
@@ -175,14 +181,17 @@ fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
 /// the (test-enforced) coverage below is also the router's complete
 /// surface; unknown methods never reach us (`Unimplemented` from the
 /// generated router).
-#[derive(Clone, Copy)]
-struct LplusdSvc;
+#[derive(Clone)]
+struct LplusdSvc {
+    services: std::sync::Arc<crate::svc::Services>,
+}
 
 /// Shared unary body: encode the typed request into the dispatch table,
 /// then decode the typed reply from its bytes. One table for all rpcs
 /// keeps the coverage guarantee meaningful; the encode/decode round
 /// trip through prost is negligible at these message sizes.
 fn rpc<Req, Res>(
+    services: &std::sync::Arc<crate::svc::Services>,
     method: &str,
     request: tonic::Request<Req>,
 ) -> Result<tonic::Response<Res>, tonic::Status>
@@ -191,7 +200,7 @@ where
     Res: prost::Message + Default,
 {
     let payload = request.into_inner().encode_to_vec();
-    let bytes = handle_method(method, &payload)
+    let bytes = handle_method(services, method, &payload)
         .map_err(|e| tonic::Status::internal(format!("{method}: {e}")))?;
     Res::decode(bytes.as_slice())
         .map(tonic::Response::new)
@@ -201,13 +210,8 @@ where
 /// Snapshot the live sink keys. The roster lives in a tokio mutex
 /// (shared with the phone lanes), so it is awaited — the table above is
 /// synchronous and must stay clear of runtime-parking calls.
-async fn sink_roster_payload() -> Vec<u8> {
-    let keys = crate::svc::epi::EPI_SINKS
-        .lock()
-        .await
-        .keys()
-        .cloned()
-        .collect();
+async fn sink_roster_payload(services: &std::sync::Arc<crate::svc::Services>) -> Vec<u8> {
+    let keys = services.epi.sink_keys().await;
     pb::SinkRoster { keys }.encode_to_vec()
 }
 
@@ -217,109 +221,109 @@ impl pb::lplusd_server::Lplusd for LplusdSvc {
         &self,
         request: tonic::Request<pb::PingRequest>,
     ) -> Result<tonic::Response<pb::Pong>, tonic::Status> {
-        rpc(m::PING, request)
+        rpc(&self.services, m::PING, request)
     }
     async fn list_devices(
         &self,
         request: tonic::Request<pb::ListDevicesRequest>,
     ) -> Result<tonic::Response<pb::Devices>, tonic::Status> {
-        rpc(m::LIST_DEVICES, request)
+        rpc(&self.services, m::LIST_DEVICES, request)
     }
     async fn connect(
         &self,
         request: tonic::Request<pb::ConnectCmd>,
     ) -> Result<tonic::Response<pb::Ack>, tonic::Status> {
-        rpc(m::CONNECT, request)
+        rpc(&self.services, m::CONNECT, request)
     }
     async fn disconnect(
         &self,
         request: tonic::Request<pb::DisconnectCmd>,
     ) -> Result<tonic::Response<pb::Ack>, tonic::Status> {
-        rpc(m::DISCONNECT, request)
+        rpc(&self.services, m::DISCONNECT, request)
     }
     async fn remove_device(
         &self,
         request: tonic::Request<pb::RemoveDeviceCmd>,
     ) -> Result<tonic::Response<pb::RemoveDeviceResult>, tonic::Status> {
-        rpc(m::REMOVE_DEVICE, request)
+        rpc(&self.services, m::REMOVE_DEVICE, request)
     }
     async fn get_host_name(
         &self,
         request: tonic::Request<pb::GetHostNameRequest>,
     ) -> Result<tonic::Response<pb::HostName>, tonic::Status> {
-        rpc(m::GET_HOST_NAME, request)
+        rpc(&self.services, m::GET_HOST_NAME, request)
     }
     async fn set_host_name(
         &self,
         request: tonic::Request<pb::SetHostNameCmd>,
     ) -> Result<tonic::Response<pb::SetHostNameResult>, tonic::Status> {
-        rpc(m::SET_HOST_NAME, request)
+        rpc(&self.services, m::SET_HOST_NAME, request)
     }
     async fn get_paired_devices(
         &self,
         request: tonic::Request<pb::GetPairedDevicesRequest>,
     ) -> Result<tonic::Response<pb::PairedDevices>, tonic::Status> {
-        rpc(m::GET_PAIRED_DEVICES, request)
+        rpc(&self.services, m::GET_PAIRED_DEVICES, request)
     }
     async fn get_local_device_id(
         &self,
         request: tonic::Request<pb::GetLocalDeviceIdRequest>,
     ) -> Result<tonic::Response<pb::LocalDeviceId>, tonic::Status> {
-        rpc(m::GET_LOCAL_DEVICE_ID, request)
+        rpc(&self.services, m::GET_LOCAL_DEVICE_ID, request)
     }
     async fn ensure_running(
         &self,
         request: tonic::Request<pb::EnsureRunningRequest>,
     ) -> Result<tonic::Response<pb::EnsureRunningResult>, tonic::Status> {
-        rpc(m::ENSURE_RUNNING, request)
+        rpc(&self.services, m::ENSURE_RUNNING, request)
     }
     async fn get_cloud_bind(
         &self,
         request: tonic::Request<pb::GetCloudBindRequest>,
     ) -> Result<tonic::Response<pb::CloudBindResult>, tonic::Status> {
-        rpc(m::GET_CLOUD_BIND, request)
+        rpc(&self.services, m::GET_CLOUD_BIND, request)
     }
     async fn sidecar_status(
         &self,
         request: tonic::Request<pb::SidecarStatusRequest>,
     ) -> Result<tonic::Response<pb::SidecarLane>, tonic::Status> {
-        rpc(m::SIDECAR_STATUS, request)
+        rpc(&self.services, m::SIDECAR_STATUS, request)
     }
     async fn poll_events(
         &self,
         request: tonic::Request<pb::PollEventsRequest>,
     ) -> Result<tonic::Response<pb::Events>, tonic::Status> {
-        rpc(m::POLL_EVENTS, request)
+        rpc(&self.services, m::POLL_EVENTS, request)
     }
     async fn status(
         &self,
         request: tonic::Request<pb::StatusRequest>,
     ) -> Result<tonic::Response<pb::LplusStatus>, tonic::Status> {
-        rpc(m::STATUS, request)
+        rpc(&self.services, m::STATUS, request)
     }
     async fn cast_push(
         &self,
         request: tonic::Request<pb::CastPushRequest>,
     ) -> Result<tonic::Response<pb::CastPushResult>, tonic::Status> {
-        rpc(m::CAST_PUSH, request)
+        rpc(&self.services, m::CAST_PUSH, request)
     }
     async fn odmf_start(
         &self,
         request: tonic::Request<pb::OdmfStartRequest>,
     ) -> Result<tonic::Response<pb::OdmfStartResult>, tonic::Status> {
-        rpc(m::ODMF_START, request)
+        rpc(&self.services, m::ODMF_START, request)
     }
     async fn kms_bootstrap(
         &self,
         request: tonic::Request<pb::KmsBootstrapRequest>,
     ) -> Result<tonic::Response<pb::Ack>, tonic::Status> {
-        rpc(m::KMS_BOOTSTRAP, request)
+        rpc(&self.services, m::KMS_BOOTSTRAP, request)
     }
     async fn sink_list(
         &self,
         _request: tonic::Request<pb::SinkListRequest>,
     ) -> Result<tonic::Response<pb::SinkRoster>, tonic::Status> {
-        let bytes = sink_roster_payload().await;
+        let bytes = sink_roster_payload(&self.services).await;
         pb::SinkRoster::decode(bytes.as_slice())
             .map(tonic::Response::new)
             .map_err(|e| tonic::Status::internal(format!("{} reply: {e}", m::SINK_LIST)))
@@ -328,24 +332,24 @@ impl pb::lplusd_server::Lplusd for LplusdSvc {
         &self,
         request: tonic::Request<pb::InjectFrameRequest>,
     ) -> Result<tonic::Response<pb::Ack>, tonic::Status> {
-        rpc(m::INJECT_FRAME, request)
+        rpc(&self.services, m::INJECT_FRAME, request)
     }
     async fn request_live(
         &self,
         request: tonic::Request<pb::RequestLiveRequest>,
     ) -> Result<tonic::Response<pb::Ack>, tonic::Status> {
-        rpc(m::REQUEST_LIVE, request)
+        rpc(&self.services, m::REQUEST_LIVE, request)
     }
     async fn take_frame(
         &self,
         request: tonic::Request<pb::TakeFrameRequest>,
     ) -> Result<tonic::Response<pb::FrameReply>, tonic::Status> {
-        rpc(m::TAKE_FRAME, request)
+        rpc(&self.services, m::TAKE_FRAME, request)
     }
 }
 
 /// Start the loopback contract server; returns the bound port.
-pub fn spawn() -> Result<u16, String> {
+pub fn spawn(services: std::sync::Arc<crate::svc::Services>) -> Result<u16, String> {
     // One runtime owns both the bind and the serve: a tokio listener
     // registered on a runtime that is dropped afterwards would accept
     // on a dead reactor.
@@ -363,7 +367,7 @@ pub fn spawn() -> Result<u16, String> {
             tokio::net::TcpListener::bind(("127.0.0.1", 0)).await
         })
         .map_err(|e| format!("bind contract server: {e}"))?;
-    serve_with(listener, rt)
+    serve_with(listener, rt, services)
 }
 
 /// Serve the contract on an already-bound tokio listener, on a dedicated
@@ -374,6 +378,7 @@ pub fn spawn() -> Result<u16, String> {
 fn serve_with(
     listener: tokio::net::TcpListener,
     rt: tokio::runtime::Runtime,
+    services: std::sync::Arc<crate::svc::Services>,
 ) -> Result<u16, String> {
     let addr = listener
         .local_addr()
@@ -384,7 +389,9 @@ fn serve_with(
             rt.block_on(async move {
                 let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
                 if let Err(e) = tonic::transport::Server::builder()
-                    .add_service(pb::lplusd_server::LplusdServer::new(LplusdSvc))
+                    .add_service(pb::lplusd_server::LplusdServer::new(LplusdSvc {
+                        services: services.clone(),
+                    }))
                     .serve_with_incoming(incoming)
                     .await
                 {
@@ -419,7 +426,13 @@ mod tests {
 
     /// Fresh contract server on an ephemeral port plus the generated
     /// gRPC client — the same surface any external gRPC tool reaches.
-    fn client() -> pb::lplusd_client::LplusdClient<tonic::transport::Channel> {
+    fn services() -> std::sync::Arc<crate::svc::Services> {
+        crate::svc::Services::new(crate::svc::sdp::SdpdConfig::default())
+    }
+
+    fn client_with(
+        services: std::sync::Arc<crate::svc::Services>,
+    ) -> pb::lplusd_client::LplusdClient<tonic::transport::Channel> {
         let listener = rt()
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .expect("bind");
@@ -428,7 +441,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("contract runtime");
-        let port = super::serve_with(listener, srv_rt).expect("serve");
+        let port = super::serve_with(listener, srv_rt, services).expect("serve");
         // Channel creation touches the hyper client's timers, so build
         // it inside the shared runtime.
         let channel = rt().block_on(async {
@@ -441,13 +454,17 @@ mod tests {
         pb::lplusd_client::LplusdClient::new(channel)
     }
 
+    fn client() -> pb::lplusd_client::LplusdClient<tonic::transport::Channel> {
+        client_with(services())
+    }
+
     #[test]
     fn dispatch_table_covers_every_service_method() {
         // The schema is the source of truth: every rpc of
         // `service Lplusd` must be dispatched (empty payloads exercise
         // the arm without needing live state).
         for method in pb::SERVICE_METHODS {
-            let error = match super::handle_method(method, &[]) {
+            let error = match super::handle_method(&services(), method, &[]) {
                 Ok(_) => String::new(),
                 Err(error) => error,
             };
@@ -464,9 +481,11 @@ mod tests {
         // `Unimplemented` before the table is consulted, so probe the
         // table directly: it must reject unknown rpcs and undecodable
         // payloads explicitly, never pass through.
-        let err = super::handle_method("lplus.backend.v1.Lplusd/Nope", &[]).expect_err("unknown");
+        let err = super::handle_method(&services(), "lplus.backend.v1.Lplusd/Nope", &[])
+            .expect_err("unknown");
         assert!(err.contains("unknown method"), "{err}");
-        let err = super::handle_method(m::CONNECT, b"not a prost ConnectCmd").expect_err("junk");
+        let err = super::handle_method(&services(), m::CONNECT, b"not a prost ConnectCmd")
+            .expect_err("junk");
         assert!(err.contains("decode"), "{err}");
     }
 
@@ -493,7 +512,8 @@ mod tests {
     #[test]
     fn poll_events_drains_the_presence_ring() {
         let mut c = client();
-        crate::svc::sdp::emit_device(
+        let svc = services();
+        svc.sdp.emit_device(
             "epi",
             "192.0.2.210".into(),
             Some("ring-probe-phone".into()),
@@ -606,14 +626,16 @@ mod tests {
 
     #[test]
     fn sink_and_inject_rpcs_answer() {
-        let mut c = client();
+        // Keep a command subscriber on the server's own bus alive so the
+        // queue verdict is true.
+        let services = services();
+        let _rx = services.epi.subscribe();
+        let mut c = client_with(services);
         let roster = rt()
             .block_on(c.sink_list(pb::SinkListRequest {}))
             .expect("roster")
             .into_inner();
         let _ = roster.keys;
-        // Keep a command subscriber alive so the queue verdict is true.
-        let _rx = crate::svc::epi::subscribe_commands();
         let ack = rt()
             .block_on(c.inject_frame(pb::InjectFrameRequest {
                 key_substr: "46888".into(),

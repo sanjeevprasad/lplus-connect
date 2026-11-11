@@ -302,160 +302,190 @@ pub fn dbs_data_frame(from6: &[u8; 6], to6: &[u8; 6], seq: u64, tid: u16, json: 
 /// session registers an injection sink under `"{port} {peer}"`, so
 /// [`crate::svc::epi::Command::SendFrame`] can write sealed frames (e.g.
 /// event-3 INJECT_REQ via [`seal_frame`]) without a reconnect.
-pub fn spawn_server(port: u16, password: String, log_path: String) {
-    tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-        let Ok(l) = TcpListener::bind(("0.0.0.0", port)).await else {
-            tracing::warn!("[kms] bind :{port} failed");
-            return;
-        };
-        tracing::info!(
-            "[kms] listening :{port} (proof key for pw len {})",
-            password.len()
-        );
-        loop {
-            let Ok((mut sock, peer)) = l.accept().await else {
-                continue;
+pub struct Kms {
+    port: u16,
+    password: String,
+    log_path: String,
+    sdp: std::sync::Arc<crate::svc::sdp::Sdp>,
+}
+
+impl Kms {
+    pub fn new(
+        port: u16,
+        password: String,
+        log_path: String,
+        sdp: std::sync::Arc<crate::svc::sdp::Sdp>,
+    ) -> Self {
+        Self {
+            port,
+            password,
+            log_path,
+            sdp,
+        }
+    }
+
+    pub fn spawn(&self) {
+        let port = self.port;
+        let password = self.password.clone();
+        let log_path = self.log_path.clone();
+        let sdp = self.sdp.clone();
+        let epi = self.sdp.epi().clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+            let Ok(l) = TcpListener::bind(("0.0.0.0", port)).await else {
+                tracing::warn!("[kms] bind :{port} failed");
+                return;
             };
-            tracing::info!("[kms] phone connected {peer}");
-            crate::svc::sdp::emit_device("kms", peer.ip().to_string(), None, true);
-            let pw = password.clone();
-            let lp = log_path.clone();
-            tokio::spawn(async move {
-                let mut seq = 1i32;
-                let inject_key = format!("{port} {peer}");
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                crate::svc::epi::EPI_SINKS
-                    .lock()
-                    .await
-                    .insert(inject_key.clone(), tx);
-                let mut inject_rx = Some(rx);
-                let mut acc: Vec<u8> = Vec::new();
-                let mut tmp = [0u8; 4096];
-                // Rate-limited link-evidence refresh (see epi lane).
-                let mut last_ev = tokio::time::Instant::now();
-                'read: loop {
-                    // Idle guard (see epi lane): prolonged silence from a
-                    // peer that never sent a FIN ends the session view.
-                    const KMS_IDLE: std::time::Duration = std::time::Duration::from_secs(150);
-                    let rd = match &mut inject_rx {
-                        Some(rx) => tokio::select! {
-                            r = sock.read(&mut tmp) => r,
-                            b = rx.recv() => {
-                                match b {
-                                    Some(bytes) => {
-                                        let _ = sock.write_all(&bytes).await;
-                                        crate::svc::sdp::record(&lp, &format!("inject-sent {inject_key}"), &bytes);
-                                        tracing::info!(
-                                            "[inject] -> {inject_key} {}B {}",
-                                            bytes.len(),
-                                            hex::encode(&bytes[..bytes.len().min(64)])
-                                        );
+            tracing::info!(
+                "[kms] listening :{port} (proof key for pw len {})",
+                password.len()
+            );
+            loop {
+                let Ok((mut sock, peer)) = l.accept().await else {
+                    continue;
+                };
+                tracing::info!("[kms] phone connected {peer}");
+                sdp.emit_device("kms", peer.ip().to_string(), None, true);
+                let pw = password.clone();
+                let lp = log_path.clone();
+                let sdp = sdp.clone();
+                let epi = epi.clone();
+                tokio::spawn(async move {
+                    let mut seq = 1i32;
+                    let inject_key = format!("{port} {peer}");
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                    epi.register_sink(inject_key.clone(), tx).await;
+                    let mut inject_rx = Some(rx);
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    // Rate-limited link-evidence refresh (see epi lane).
+                    let mut last_ev = tokio::time::Instant::now();
+                    'read: loop {
+                        // Idle guard (see epi lane): prolonged silence from a
+                        // peer that never sent a FIN ends the session view.
+                        const KMS_IDLE: std::time::Duration = std::time::Duration::from_secs(150);
+                        let rd = match &mut inject_rx {
+                            Some(rx) => tokio::select! {
+                                r = sock.read(&mut tmp) => r,
+                                b = rx.recv() => {
+                                    match b {
+                                        Some(bytes) => {
+                                            let _ = sock.write_all(&bytes).await;
+                                            crate::svc::sdp::record(&lp, &format!("inject-sent {inject_key}"), &bytes);
+                                            tracing::info!(
+                                                "[inject] -> {inject_key} {}B {}",
+                                                bytes.len(),
+                                                hex::encode(&bytes[..bytes.len().min(64)])
+                                            );
+                                        }
+                                        None => inject_rx = None,
                                     }
-                                    None => inject_rx = None,
+                                    continue;
                                 }
-                                continue;
-                            }
-                            _ = tokio::time::sleep(KMS_IDLE) => Ok(0),
-                        },
-                        None => tokio::time::timeout(KMS_IDLE, sock.read(&mut tmp))
-                            .await
-                            .unwrap_or(Ok(0)),
-                    };
-                    match rd {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            acc.extend_from_slice(&tmp[..n]);
-                            if last_ev.elapsed() >= std::time::Duration::from_secs(60) {
-                                last_ev = tokio::time::Instant::now();
-                                crate::svc::sdp::emit_device(
-                                    "kms",
-                                    peer.ip().to_string(),
-                                    None,
-                                    true,
-                                );
-                            }
-                        }
-                    }
-                    // Frame-split the accumulator (24 B header + length body).
-                    loop {
-                        if acc.len() < 24 {
-                            continue 'read;
-                        }
-                        let Ok(hdr) = KmsHeader::decode(&<[u8; 24]>::try_from(&acc[..24]).unwrap())
-                        else {
-                            crate::svc::sdp::record(&lp, &format!("kms-badhdr {peer}"), &acc[..24]);
-                            tracing::info!("[kms] {peer} bad header {}", hex::encode(&acc[..24]));
-                            acc.clear();
-                            break 'read;
+                                _ = tokio::time::sleep(KMS_IDLE) => Ok(0),
+                            },
+                            None => tokio::time::timeout(KMS_IDLE, sock.read(&mut tmp))
+                                .await
+                                .unwrap_or(Ok(0)),
                         };
-                        let want = hdr.length.max(0) as usize;
-                        if want > 4 << 20 {
-                            tracing::info!("[kms] {peer} bogus length {want}");
-                            acc.clear();
-                            break 'read;
-                        }
-                        if acc.len() < 24 + want {
-                            continue 'read;
-                        }
-                        let body = acc[24..24 + want].to_vec();
-                        acc.drain(..24 + want);
-                        crate::svc::sdp::record(
-                            &lp,
-                            &format!("kms-recv {peer} ev{}", hdr.event_type),
-                            &body,
-                        );
-                        let pt = if hdr.encrypted() && want > 0 {
-                            match gcm_open(&kms_key(&pw), &body) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::info!(
-                                        "[kms] {peer} ev{} decrypt fail: {e}",
-                                        hdr.event_type
-                                    );
-                                    body.clone()
+                        match rd {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                acc.extend_from_slice(&tmp[..n]);
+                                if last_ev.elapsed() >= std::time::Duration::from_secs(60) {
+                                    last_ev = tokio::time::Instant::now();
+                                    sdp.emit_device("kms", peer.ip().to_string(), None, true);
                                 }
                             }
-                        } else {
-                            body.clone()
-                        };
-                        tracing::info!(
-                            "[kms] {peer} ev{} enc={} {}B | {}",
-                            hdr.event_type,
-                            hdr.encrypted(),
-                            pt.len(),
-                            String::from_utf8_lossy(&pt[..pt.len().min(160)])
-                        );
-                        if hdr.event_type == event::HEARTBEAT_REQ {
-                            let wire = heartbeat_resp_frame(
-                                &pw,
-                                &hdr,
-                                &body,
-                                {
-                                    seq += 1;
-                                    seq
-                                },
-                                now_ms(),
-                            )
-                            .unwrap_or_else(|_| Vec::new());
-                            if !wire.is_empty() {
+                        }
+                        // Frame-split the accumulator (24 B header + length body).
+                        loop {
+                            if acc.len() < 24 {
+                                continue 'read;
+                            }
+                            let Ok(hdr) =
+                                KmsHeader::decode(&<[u8; 24]>::try_from(&acc[..24]).unwrap())
+                            else {
                                 crate::svc::sdp::record(
                                     &lp,
-                                    &format!("kms-send {peer} ev5"),
-                                    &wire,
+                                    &format!("kms-badhdr {peer}"),
+                                    &acc[..24],
                                 );
-                                let _ = sock.write_all(&wire).await;
+                                tracing::info!(
+                                    "[kms] {peer} bad header {}",
+                                    hex::encode(&acc[..24])
+                                );
+                                acc.clear();
+                                break 'read;
+                            };
+                            let want = hdr.length.max(0) as usize;
+                            if want > 4 << 20 {
+                                tracing::info!("[kms] {peer} bogus length {want}");
+                                acc.clear();
+                                break 'read;
+                            }
+                            if acc.len() < 24 + want {
+                                continue 'read;
+                            }
+                            let body = acc[24..24 + want].to_vec();
+                            acc.drain(..24 + want);
+                            crate::svc::sdp::record(
+                                &lp,
+                                &format!("kms-recv {peer} ev{}", hdr.event_type),
+                                &body,
+                            );
+                            let pt = if hdr.encrypted() && want > 0 {
+                                match gcm_open(&kms_key(&pw), &body) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        tracing::info!(
+                                            "[kms] {peer} ev{} decrypt fail: {e}",
+                                            hdr.event_type
+                                        );
+                                        body.clone()
+                                    }
+                                }
+                            } else {
+                                body.clone()
+                            };
+                            tracing::info!(
+                                "[kms] {peer} ev{} enc={} {}B | {}",
+                                hdr.event_type,
+                                hdr.encrypted(),
+                                pt.len(),
+                                String::from_utf8_lossy(&pt[..pt.len().min(160)])
+                            );
+                            if hdr.event_type == event::HEARTBEAT_REQ {
+                                let wire = heartbeat_resp_frame(
+                                    &pw,
+                                    &hdr,
+                                    &body,
+                                    {
+                                        seq += 1;
+                                        seq
+                                    },
+                                    now_ms(),
+                                )
+                                .unwrap_or_else(|_| Vec::new());
+                                if !wire.is_empty() {
+                                    crate::svc::sdp::record(
+                                        &lp,
+                                        &format!("kms-send {peer} ev5"),
+                                        &wire,
+                                    );
+                                    let _ = sock.write_all(&wire).await;
+                                }
                             }
                         }
                     }
-                }
-                crate::svc::epi::EPI_SINKS.lock().await.remove(&inject_key);
-                crate::svc::sdp::emit_device("kms", peer.ip().to_string(), None, false);
-                tracing::info!("[kms] {peer} closed");
-            });
-        }
-    });
+                    epi.unregister_sink(&inject_key).await;
+                    sdp.emit_device("kms", peer.ip().to_string(), None, false);
+                    tracing::info!("[kms] {peer} closed");
+                });
+            }
+        });
+    }
 }
 
 mod base64 {

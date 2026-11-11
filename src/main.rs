@@ -5,7 +5,7 @@
 //! runs the daemon plus the loopback gRPC contract server
 //! (see `lplusd/src/contract.rs`; GUI.md keeps the vendor-parity notes).
 //!
-//! * default: the backend **in-process** (`sdpd::run` on a tokio runtime:
+//! * default: the backend **in-process** (`svc::run`-style lanes on a tokio runtime:
 //!   csp 10152, EPI, KMS, LINK_*, presence events bridge) **plus** the
 //!   loopback gRPC contract server (`lplusd/src/contract.rs`) — the
 //!   machine-facing control lane.
@@ -85,7 +85,7 @@ const DAEMON_ENV: &[(&str, &str)] = &[
 /// Per-pairing material persisted in `settings.json` (state dir) and
 /// seeded into the environment before the generic defaults: the values
 /// the live phone was paired with never live in the tree. `SCP_KSC` acts
-/// as the KSC pin for restored bonds (see `sdpd::issue_ksc`); with no
+/// as the KSC pin for restored bonds (see `svc::sdp::issue_ksc`); with no
 /// pin and no bond in `ksc.json`, a fresh random bond is minted per peer
 /// on next pairing. LINK knobs fall back to their synthetic env defaults.
 const SETTINGS_ENV: &[(&str, &str)] = &[("scpKsc", "SCP_KSC"), ("linkKpd", "LINK_KPD")];

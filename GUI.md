@@ -10,8 +10,8 @@ crate: the daemon plus the loopback contract server:
 | Member | Role |
 | --- | --- |
 | `ipc/` (`lplus-ipc`) | the backend contract: `protos/lplus.proto` — `service Lplusd` with one rpc per capability (ping, device wall, connect/disconnect/remove, identity, pairing, probes, event ring, status, cast/ODMF/KMS, sink list/inject, screencast frames), **strictly typed — no JSON carriers**, served as gRPC (`service Lplusd` over tonic/HTTP/2) on `127.0.0.1:1421`; also `Device`, the internal channel structs (`api`, the vendor phone-JSON seam), the event ring and the live-frame bus |
-| `lplusd/` (`lplusd`) | phone stack + loopback backend: `sdpd`, `scp/scpc/rpc`, `kms`, `odmf_pc/rtsp/wfd_sink`, `d2d`, the backend orchestration (`lplusd/src/backend/{api,cast,devices,ipc}.rs`) and the contract implementation (`lplusd/src/contract.rs`) |
-| `.` (`lplus`) | the wiring: CLI + the product binary that starts the daemon and the contract server (`cargo run`, `daemon`, `panel`) |
+| `lplusd/` (`lplusd`) | phone stack + loopback backend: `scp/scpc/rpc`, `odmf_pc/rtsp`, `d2d`, the service lanes (`lplusd/src/svc/{mod,epi,sdp,scp_server,events,kms,wfd}.rs` — SDP/UNI responder, SCP session server, EPI datatrans, KMS, WFD sink, events bridge) and the contract implementation (`lplusd/src/svc/contract.rs`), plus the backend orchestration (`lplusd/src/backend/{api,cast,devices,ipc}.rs`) |
+| `.` (`lplus`) | the wiring: the product binary — preflight, then the service graph + contract server (`cargo run`) |
 | `proto/` | the separate phone↔PC wire contract |
 
 `cargo run` starts the backend **in-process** and serves the contract
@@ -69,7 +69,7 @@ were used to drive this port (call sites, response shapes, boot order).
 
 | Concern | Solution |
 |---|---|
-| `ipcMain` side | the contract server (`lplusd/src/contract.rs`, gRPC on 127.0.0.1:1421) is the only control entry point; the webview-era channel registry in `lplusd/src/backend/ipc.rs` was cut with the parked window (the module now owns only the `settings.json` identity blob) |
+| `ipcMain` side | the contract server (`lplusd/src/svc/contract.rs`, gRPC on 127.0.0.1:1421) is the only control entry point; the webview-era channel registry in `lplusd/src/backend/ipc.rs` was cut with the parked window (the module now owns only the `settings.json` identity blob) |
 | Renderer bus (`ipc_main_event`) | the bus arm left with the window; `GUI_BUS` today carries `devices::tick` row pushes. The ring keeps its `bus`/`log` event variants in the schema (`PollEvents`) for the revived renderer's producers |
 | Console mirror | `lplus_ipc::push_log_event` records mirrored renderer logs; the producer (the webview console bridge) returns with the window |
 | Reference bundle | `vendor/renderer` is served nowhere; the `.html`/`.js`/`.css` keep the historical `app://`→`/` rewrite so RE diffs against the asar stay line-aligned |

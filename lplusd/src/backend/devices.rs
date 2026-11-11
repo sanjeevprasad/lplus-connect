@@ -276,11 +276,12 @@ static INIT: std::sync::Once = std::sync::Once::new();
 
 /// Subscribe to the in-process event broadcast and to any external daemon
 /// bridges. Idempotent: every entry point calls it, the lanes start once.
-pub fn init() {
-    INIT.call_once(init_inner);
+pub fn init(sdp: &std::sync::Arc<crate::svc::sdp::Sdp>) {
+    let sdp = sdp.clone();
+    INIT.call_once(|| init_inner(sdp));
 }
 
-fn init_inner() {
+fn init_inner(sdp: std::sync::Arc<crate::svc::sdp::Sdp>) {
     {
         let persisted = load_paired(&paired_path());
         let blocked = load_unpaired(&unpaired_path());
@@ -298,7 +299,7 @@ fn init_inner() {
         rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         i.paired_saved = serde_json::to_string_pretty(&rows).unwrap_or_default();
     }
-    let mut rx = crate::svc::sdp::subscribe_devices();
+    let mut rx = sdp.subscribe_devices();
     // Own thread + tiny current-thread runtime: presence ingest must not
     // depend on a UI runtime being up.
     thread::spawn(move || {

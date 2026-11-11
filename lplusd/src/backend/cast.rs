@@ -138,9 +138,13 @@ fn next_seq() -> u64 {
 /// Push one DbsMessage key/value onto the live :46888 session through the
 /// backend's [`crate::svc::epi::Command::SendFrame`] broadcast. Returns the
 /// frame bytes and whether the command was accepted by the backend channel.
-pub fn push_value(key: &str, value_json: &str) -> (Vec<u8>, bool) {
+pub fn push_value(
+    epi: &std::sync::Arc<crate::svc::epi::Epi>,
+    key: &str,
+    value_json: &str,
+) -> (Vec<u8>, bool) {
     let frame = dbs_frame(key, value_json, next_seq());
-    let queued = crate::svc::epi::send_command(crate::svc::epi::Command::SendFrame {
+    let queued = epi.send(crate::svc::epi::Command::SendFrame {
         key_substr: CAST_SINK_SUBSTR.to_string(),
         hex: hex::encode(&frame),
     });
@@ -150,7 +154,11 @@ pub fn push_value(key: &str, value_json: &str) -> (Vec<u8>, bool) {
 
 /// Inject one DbsMessage frame and report its size and hex alongside
 /// the queue verdict (contract rpc `CastPush`).
-pub fn cast_push(key: &str, value: &str) -> CastPushResult {
+pub fn cast_push(
+    epi: &std::sync::Arc<crate::svc::epi::Epi>,
+    key: &str,
+    value: &str,
+) -> CastPushResult {
     if key.trim().is_empty() {
         return CastPushResult {
             ok: false,
@@ -161,7 +169,7 @@ pub fn cast_push(key: &str, value: &str) -> CastPushResult {
             error: Some("missing key".into()),
         };
     }
-    let (frame, queued) = push_value(key, value);
+    let (frame, queued) = push_value(epi, key, value);
     CastPushResult {
         ok: true,
         key: Some(key.to_string()),
@@ -178,7 +186,7 @@ pub fn cast_push(key: &str, value: &str) -> CastPushResult {
 /// `CastDbsReceiver` looks the key up in the `CastDispatchMessage` list and
 /// anything else dispatches with type 0 and is silently dropped — the inner
 /// `msg_cmd` is what routes inside `CastSceneManager.handleReceiveData`.
-pub fn odmf_start() -> OdmfStartResult {
+pub fn odmf_start(epi: &std::sync::Arc<crate::svc::epi::Epi>) -> OdmfStartResult {
     let pub_file = env_or("ODMF_PUB_FILE", "/tmp/odmf_pub.b64");
     let raw = match std::fs::read_to_string(&pub_file) {
         Ok(raw) => raw,
@@ -207,8 +215,8 @@ pub fn odmf_start() -> OdmfStartResult {
         tracing::warn!("[cast] odmf_start: cannot write {auth_file}: {e}");
     }
     let (body1, body2) = odmf_bodies(&server_ip, &auth);
-    let (_, q1) = push_value("cast_ability_sync", &body1);
-    let (_, q2) = push_value("cast_ability_sync", &body2);
+    let (_, q1) = push_value(epi, "cast_ability_sync", &body1);
+    let (_, q2) = push_value(epi, "cast_ability_sync", &body2);
     OdmfStartResult {
         ok: true,
         id: Some(id),
@@ -266,11 +274,11 @@ fn cast_message(msg_cmd: &str, msg_body: &str) -> String {
 /// Backend liveness, KMS lane, ODMF sink files and the RTSP lane
 /// (contract rpc `Status`). Never panics; the KMS probe is bounded
 /// to 300 ms.
-pub fn status() -> LplusStatus {
+pub fn status(up: bool) -> LplusStatus {
     let out = out_dir();
     LplusStatus {
         ok: true,
-        backend_up: crate::backend::backend_up(),
+        backend_up: up,
         kms_listening: tcp_probe(kms_port()),
         odmf: Some(OdmfInfo {
             enabled: env_flag("ODMF_SINK"),
@@ -435,7 +443,7 @@ mod tests {
 
     #[test]
     fn status_shape_is_complete() {
-        let s = status();
+        let s = status(true);
         assert!(s.ok);
         let odmf = s.odmf.expect("odmf info");
         assert_eq!(

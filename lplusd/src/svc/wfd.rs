@@ -31,14 +31,32 @@ use strum::IntoEnumIterator;
 const START_CODE: &[u8] = b"\x00\x00\x00\x01";
 const MAX_NAL: usize = 4 * 1024 * 1024;
 
-/// Arm the sink once (called from sdpd startup when `ODMF_SINK` is set).
-pub fn spawn(listen: SocketAddr, out_dir: String, respond: bool) {
-    tokio::spawn(async move {
-        match run(listen, out_dir, respond).await {
-            Ok(()) => tracing::info!("[odmf] listener ended"),
-            Err(e) => tracing::warn!("[odmf] listener failed: {e:#}"),
+/// The ODMF sink service: config-only state; each spawn arms one
+/// listener task (started when `ODMF_SINK` is set).
+pub struct Wfd {
+    listen: SocketAddr,
+    out_dir: String,
+    respond: bool,
+}
+
+impl Wfd {
+    pub fn new(listen: SocketAddr, out_dir: String, respond: bool) -> Self {
+        Self {
+            listen,
+            out_dir,
+            respond,
         }
-    });
+    }
+
+    pub fn spawn(&self) {
+        let (listen, out_dir, respond) = (self.listen, self.out_dir.clone(), self.respond);
+        tokio::spawn(async move {
+            match run(listen, out_dir, respond).await {
+                Ok(()) => tracing::info!("[odmf] listener ended"),
+                Err(e) => tracing::warn!("[odmf] listener failed: {e:#}"),
+            }
+        });
+    }
 }
 
 async fn run(listen: SocketAddr, out_dir: String, respond: bool) -> Result<()> {
