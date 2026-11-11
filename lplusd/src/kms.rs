@@ -298,10 +298,10 @@ pub fn dbs_data_frame(from6: &[u8; 6], to6: &[u8; 6], seq: u64, tid: u16, json: 
 
 /// PC-side KMS TCP server: phone connects here after receiving the cast
 /// bootstrap (`kms_socket_port`). Frames: 24 B header + body; encrypted
-/// bodies decrypt under `password`. Answers HEARTBEAT_REQ with RESP. With
-/// `LPLUS_REPL_PORT` set the socket registers a REPL sink under
-/// `"{port} {peer}"`, so `send {port} <hex>` injects sealed frames
-/// (e.g. event-3 INJECT_REQ via [`seal_frame`]) without reconnecting.
+/// bodies decrypt under `password`. Answers HEARTBEAT_REQ with RESP. Each
+/// session registers an injection sink under `"{port} {peer}"`, so
+/// [`crate::sdpd::Command::SendFrame`] can write sealed frames (e.g.
+/// event-3 INJECT_REQ via [`seal_frame`]) without a reconnect.
 pub fn spawn_server(port: u16, password: String, log_path: String) {
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -324,16 +324,13 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
             let lp = log_path.clone();
             tokio::spawn(async move {
                 let mut seq = 1i32;
-                let repl_key = format!("{port} {peer}");
-                let mut repl_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> = None;
-                if std::env::var("LPLUS_REPL_PORT").is_ok() {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                    crate::sdpd::EPI_SINKS
-                        .lock()
-                        .await
-                        .insert(repl_key.clone(), tx);
-                    repl_rx = Some(rx);
-                }
+                let inject_key = format!("{port} {peer}");
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                crate::sdpd::EPI_SINKS
+                    .lock()
+                    .await
+                    .insert(inject_key.clone(), tx);
+                let mut inject_rx = Some(rx);
                 let mut acc: Vec<u8> = Vec::new();
                 let mut tmp = [0u8; 4096];
                 // Rate-limited link-evidence refresh (see epi lane).
@@ -342,21 +339,21 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                     // Idle guard (see epi lane): prolonged silence from a
                     // peer that never sent a FIN ends the session view.
                     const KMS_IDLE: std::time::Duration = std::time::Duration::from_secs(150);
-                    let rd = match &mut repl_rx {
+                    let rd = match &mut inject_rx {
                         Some(rx) => tokio::select! {
                             r = sock.read(&mut tmp) => r,
                             b = rx.recv() => {
                                 match b {
                                     Some(bytes) => {
                                         let _ = sock.write_all(&bytes).await;
-                                        crate::sdpd::record(&lp, &format!("repl-sent {repl_key}"), &bytes);
+                                        crate::sdpd::record(&lp, &format!("inject-sent {inject_key}"), &bytes);
                                         tracing::info!(
-                                            "[repl] -> {repl_key} {}B {}",
+                                            "[inject] -> {inject_key} {}B {}",
                                             bytes.len(),
                                             hex::encode(&bytes[..bytes.len().min(64)])
                                         );
                                     }
-                                    None => repl_rx = None,
+                                    None => inject_rx = None,
                                 }
                                 continue;
                             }
@@ -444,9 +441,7 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                         }
                     }
                 }
-                if repl_rx.is_some() {
-                    crate::sdpd::EPI_SINKS.lock().await.remove(&repl_key);
-                }
+                crate::sdpd::EPI_SINKS.lock().await.remove(&inject_key);
                 crate::sdpd::emit_device("kms", peer.ip().to_string(), None, false);
                 tracing::info!("[kms] {peer} closed");
             });

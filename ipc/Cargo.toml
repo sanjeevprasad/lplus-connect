@@ -1,0 +1,25 @@
+[package]
+name    = "lplus-ipc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish    = false
+# daemon↔ui contract only: the prost `Request`/`Response` envelope and
+# `DeviceRow` come from protos/ui.proto; the typed channel arg/reply
+# structs (`api`) are the shared JSON shapes both sides parse. No
+# sockets, no tokio, no state — the ui-click queue and the Direct-mode
+# dispatcher registry are pure process-global plumbing that both members
+# may touch. Anything that reads daemon state belongs to `lplusd`.
+
+[dependencies]
+image      = { version = "0.25", default-features = false }
+prost      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Codegen from protos/. Requires protoc.
+[build-dependencies]
+prost-build = { workspace = true }
+
+[dev-dependencies]
+prost = { workspace = true }

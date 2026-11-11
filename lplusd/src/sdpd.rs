@@ -588,13 +588,15 @@ pub(crate) fn record(log_path: &str, tag: &str, bytes: &[u8]) {
     let _ = f.flush();
 }
 
-/// Live TCP sink registry for manual frame injection (`LPLUS_REPL_PORT`).
+/// Live TCP sink registry: every accepted EPI session registers an
+/// injection handle so command frames (DISCONNECT, KMS bootstrap,
+/// RpcFrame) can be written onto the open socket without a re-handshake.
 /// Key: `"{epi_port} {peer}"`; consumers unregister on socket death.
 pub(crate) static EPI_SINKS: std::sync::LazyLock<
     tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
 > = std::sync::LazyLock::new(tokio::sync::Mutex::default);
 
-/// Abort handles for the live session pump tasks, per peer IP: a GUI/REPL
+/// Abort handles for the live session pump tasks, per peer IP: a GUI
 /// Disconnect must close our side of the vendor session (FIN/RST), not
 /// just push a DISCONNECT frame the phone may ignore.
 pub(crate) static SESSION_KILLERS: std::sync::LazyLock<
@@ -602,7 +604,7 @@ pub(crate) static SESSION_KILLERS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(std::sync::Mutex::default);
 
 /// Last LAN peer that probed the SDP planes (the phone). Used to resolve
-/// the REPL's `connect phone` shorthand.
+/// the `connect phone` shorthand in device actions.
 pub(crate) static PHONE_IP: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
     std::sync::LazyLock::new(std::sync::Mutex::default);
 
@@ -647,29 +649,12 @@ pub enum Command {
     RpcConnect {
         ip: String,
     },
-    /// Inject raw hex onto every EPI sink whose key contains the substring.
+    /// Inject raw hex onto every EPI sink whose key contains the substring
+    /// (the DataBus cast lane pushes its DbsMessage frames this way).
     SendFrame {
         key_substr: String,
         hex: String,
     },
-    /// Invoke a named GUI element action (REPL `click <id>`), executed by
-    /// the window's own handlers — see `AppState::handle_ui_click`.
-    UiClick {
-        id: String,
-    },
-}
-
-/// Clicks queued by the REPL for the GUI lane to drain (element ids like
-/// `connect:0`, `disconnect:0`, `confirm`). Only meaningful in the unified
-/// process that hosts the window.
-static UI_CLICKS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
-    std::sync::LazyLock::new(std::sync::Mutex::default);
-
-pub fn take_ui_clicks() -> Vec<String> {
-    UI_CLICKS
-        .lock()
-        .map(|mut q| std::mem::take(&mut *q))
-        .unwrap_or_default()
 }
 
 static CMD_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<Command>> =
@@ -718,7 +703,7 @@ pub(crate) fn kms_bootstrap_frame(
     ))
 }
 
-/// Resolve the REPL/GUI `"phone"` shorthand to the last LAN peer seen on
+/// Resolve the `"phone"` shorthand device-action target to the last LAN peer seen on
 /// the SDP planes; anything else is already an address.
 fn resolve_phone_ip(ip: &str) -> String {
     if ip != "phone" {
@@ -855,12 +840,6 @@ fn spawn_command_runner(dev_name: String, kms_pwd: String, local_ip: String, kms
                     }
                     Err(e) => tracing::info!("[cmd] send {key_substr:?} bad hex: {e}"),
                 },
-                Command::UiClick { id } => {
-                    tracing::info!("[cmd] ui click queued {id:?}");
-                    if let Ok(mut q) = UI_CLICKS.lock() {
-                        q.push(id);
-                    }
-                }
             }
         }
     });
@@ -926,128 +905,6 @@ pub fn spawn_events_bridge() {
     });
 }
 
-/// Exact-word REPL commands (the prefix forms `connect [ip]` etc. are
-/// parsed separately above this match).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
-#[strum(serialize_all = "lowercase")]
-enum ReplCmd {
-    Connect,
-    Disconnect,
-    Kms,
-    Rpc,
-}
-
-/// Loopback line REPL to probe open pipes without redoing handshakes:
-/// `list` enumerates live epi sessions; `send <substr> <hex>` injects raw
-/// bytes into every session whose key contains <substr>.
-pub fn spawn_repl() {
-    let Ok(ps) = std::env::var("LPLUS_REPL_PORT") else {
-        return;
-    };
-    let Ok(port) = ps.parse::<u16>() else {
-        tracing::info!("[repl] bad LPLUS_REPL_PORT={ps}");
-        return;
-    };
-    tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let Ok(l) = TcpListener::bind(("127.0.0.1", port)).await else {
-            tracing::warn!("[repl] bind :{port} failed");
-            return;
-        };
-        tracing::info!("[repl] listening 127.0.0.1:{port}");
-        loop {
-            let Ok((c, _)) = l.accept().await else {
-                continue;
-            };
-            tokio::spawn(async move {
-                let mut rd = tokio::io::BufReader::new(c);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match rd.read_line(&mut line).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                    let t = line.trim().to_string();
-                    if t.is_empty() {
-                        continue;
-                    }
-                    let out: String;
-                    if t == "list" {
-                        let m = EPI_SINKS.lock().await;
-                        let mut keys: Vec<&String> = m.keys().collect();
-                        keys.sort();
-                        out = format!("peers {}\n", keys.len())
-                            + &keys.iter().map(|k| format!("  {k}\n")).collect::<String>();
-                    } else if let Some(rest) = t.strip_prefix("send ") {
-                        let Some((sub, hx)) = rest.split_once(' ') else {
-                            out = "usage: send <substr> <hex>\n".into();
-                            let _ = rd.get_mut().write_all(out.as_bytes()).await;
-                            continue;
-                        };
-                        match hex::decode(hx.trim().replace(':', "")) {
-                            Ok(d) => {
-                                let m = EPI_SINKS.lock().await;
-                                let mut n = 0usize;
-                                for (k, tx) in m.iter() {
-                                    if k.contains(sub) && tx.send(d.clone()).is_ok() {
-                                        n += 1;
-                                    }
-                                }
-                                out = format!("sent {n} {}B\n", d.len());
-                            }
-                            Err(e) => out = format!("bad hex: {e}\n"),
-                        }
-                    } else if let Some(rest) = t
-                        .strip_prefix("connect ")
-                        .or_else(|| t.strip_prefix("disconnect "))
-                        .or_else(|| t.strip_prefix("kms "))
-                        .or_else(|| t.strip_prefix("rpc "))
-                    {
-                        let ip = rest.trim().to_string();
-                        let ip = if ip.is_empty() {
-                            "phone".to_string()
-                        } else {
-                            ip
-                        };
-                        let cmd = if t.starts_with("connect") {
-                            Command::Connect { ip }
-                        } else if t.starts_with("disconnect") {
-                            Command::Disconnect { ip }
-                        } else if t.starts_with("rpc") {
-                            Command::RpcConnect { ip }
-                        } else {
-                            Command::KmsBootstrap { ip }
-                        };
-                        out = format!("queued {}\n", send_command(cmd));
-                    } else if let Some(id) = t.strip_prefix("click ") {
-                        let id = id.trim().to_string();
-                        if id.is_empty() {
-                            out = "usage: click <element-id> (device-connect:<i>|card-disconnect:<i>|menu-delete:<i>|card-more:<i>|confirm|cancel)\n"
-                                .into();
-                        } else {
-                            out = format!("queued {}\n", send_command(Command::UiClick { id }));
-                        }
-                    } else if let Ok(repl) = ReplCmd::from_str(t.as_str()) {
-                        let cmd = match repl {
-                            ReplCmd::Connect => Command::Connect { ip: "phone".into() },
-                            ReplCmd::Disconnect => Command::Disconnect { ip: "phone".into() },
-                            ReplCmd::Kms => Command::KmsBootstrap { ip: "phone".into() },
-                            ReplCmd::Rpc => Command::RpcConnect { ip: "phone".into() },
-                        };
-                        out = format!("queued {}\n", send_command(cmd));
-                    } else {
-                        out =
-                            "commands: list | send <substr> <hex> | connect|disconnect|kms|rpc [ip] | click <element-id>\n"
-                                .into();
-                    }
-                    let _ = rd.get_mut().write_all(out.as_bytes()).await;
-                }
-            });
-        }
-    });
-}
-
 /// `LINK_ACK` reply flavours for the link-detect probe socket.
 #[derive(Debug, Clone, PartialEq, Eq, EnumString)]
 #[strum(serialize_all = "lowercase")]
@@ -1089,7 +946,6 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
         }
     }
     let log_path = cfg.log_path.clone();
-    spawn_repl();
     spawn_events_bridge();
     {
         let kms_port = std::env::var("KMS_PORT")
@@ -1614,22 +1470,19 @@ fn spawn_session_logger(
                 // AUTH MAC matches a bond in the per-peer KSC store
                 // (`ksc.json`) — unpaired peers get no AUTH response.
                 let mut ksc: Option<Vec<u8>> = None;
-                // Manual-injection sink: REPL `send` bytes are written onto
-                // this live socket from the read loop's select, no
-                // re-handshake needed. Key: "{port} {peer}".
-                let repl_on = std::env::var("LPLUS_REPL_PORT").is_ok();
-                let repl_key = format!("{epi_port} {peer}");
+                // Command-frame injection sink: DISCONNECT / KMS bootstrap /
+                // RpcFrame bytes are written onto this live socket from the
+                // read loop's select, no re-handshake needed.
+                // Key: "{port} {peer}".
+                let inject_key = format!("{epi_port} {peer}");
                 // Rate-limited link-evidence refresh: devices.rs drops
                 // `is_connected` when a row goes quiet, so live traffic
                 // must re-assert presence (≤1/min, cheap broadcast).
                 let mut last_ev = tokio::time::Instant::now();
                 emit_device("epi", event_host(&peer), None, true);
-                let mut repl_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> = None;
-                if repl_on {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                    EPI_SINKS.lock().await.insert(repl_key.clone(), tx);
-                    repl_rx = Some(rx);
-                }
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                EPI_SINKS.lock().await.insert(inject_key.clone(), tx);
+                let mut inject_rx = Some(rx);
                 // Expected rc_2 = s(ksc, qc, ts) for the pending AUTH_CONFIRM.
                 let mut expect_rc2: Option<[u8; 8]> = None;
                 // FrameType byte for our AUTH_RESPONSE; phone dispatches on
@@ -1710,7 +1563,7 @@ fn spawn_session_logger(
                         // must not pin the row's connected flag — silence
                         // for `EPI_IDLE` is treated as a closed link.
                         const EPI_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
-                        match &mut repl_rx {
+                        match &mut inject_rx {
                             Some(rx) => {
                                 tokio::select! {
                                     r = sock.read(&mut tmp) => r,
@@ -1718,15 +1571,15 @@ fn spawn_session_logger(
                                         match b {
                                             Some(bytes) => {
                                                 let _ = sock.write_all(&bytes).await;
-                                                record(&path, &format!("repl-sent {repl_key}"), &bytes);
+                                                record(&path, &format!("inject-sent {inject_key}"), &bytes);
                                                 tracing::info!(
-                                                    "[repl] -> {repl_key} {}B {}",
+                                                    "[inject] -> {inject_key} {}B {}",
                                                     bytes.len(),
                                                     hex::encode(&bytes[..bytes.len().min(64)])
                                                 );
                                             }
                                             // Registry dropped: stop selecting.
-                                            None => repl_rx = None,
+                                            None => inject_rx = None,
                                         }
                                         continue;
                                     }
@@ -1740,9 +1593,7 @@ fn spawn_session_logger(
                     };
                     match rd {
                         Ok(0) | Err(_) => {
-                            if repl_on {
-                                EPI_SINKS.lock().await.remove(&repl_key);
-                            }
+                            EPI_SINKS.lock().await.remove(&inject_key);
                             emit_device("epi", event_host(&peer), None, false);
                             break;
                         }

@@ -1,7 +1,7 @@
 //! Process-wide `tracing` setup: file + line at every call site, module
 //! target suppressed, level via `RUST_LOG` (default `info`). Output goes to
 //! stderr through a dedicated writer thread so log volume never blocks the
-//! hot lanes (RTP, REPL, DataBus).
+//! hot lanes (RTP, EPI, DataBus).
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;

@@ -6,16 +6,16 @@ use gpui::{
     AnyElement, Context, FontWeight, Render, SharedString, Window, div, prelude::*, px, svg,
 };
 
-use crate::ui::app::{
+use crate::app::{
     AppState, Quality, card_menu_labels, connect_conflict_labels, delete_confirm_labels,
     disconnect_confirm_labels, qr_dialog_labels, quick_feature_labels, wall_labels,
 };
-use crate::ui::ipc::Channel;
-use crate::ui::router::Route;
-use crate::ui::stores::connection::{ConnectState, DEVICE_TYPE_PAD};
-use crate::ui::stores::toast::ToastKind;
-use crate::ui::stores::transfer::{Direction, TransferStatus};
-use crate::ui::theme::*;
+use crate::ipc::Channel;
+use crate::router::Route;
+use crate::stores::connection::{ConnectState, DEVICE_TYPE_PAD};
+use crate::stores::toast::ToastKind;
+use crate::stores::transfer::{Direction, TransferStatus};
+use crate::theme::*;
 use lucide_static_svg::Icon;
 use strum::Display;
 
@@ -35,8 +35,8 @@ enum ConfirmKind {
 }
 
 /// Single source of truth for user-facing element ids: the real GPUI tree
-/// stamps these via `.id(...)` and the REPL `click <id>` driver parses the
-/// same strings back into actions (`AppState::handle_ui_click`).
+/// stamps these via `.id(...)` and the click lane (`handle_ui_click`)
+/// parses the same strings back into actions.
 pub(crate) mod element {
     /// A device wall entry, addressed by position or by device id.
     #[derive(Debug, PartialEq, Eq)]

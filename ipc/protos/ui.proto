@@ -1,0 +1,102 @@
+// L+ connect daemon↔ui wire contract (POST /rpc on the loopback backend).
+//
+// Control verbs are typed oneof arms; everything else rides the vendor
+// pattern the phone itself uses (cpbus.networking: method string + opaque
+// payload bytes) via `InvokeCall`, whose `payload`/`json` bodies are the
+// JSON shapes declared by the structs in `lplus_ipc::api`. Field names are
+// written exactly as the JSON keys they mirror (`protcol_device_id` keeps
+// the vendor typo); serde derives are attached in build.rs.
+syntax = "proto3";
+
+package lplus.ui.v1;
+
+// One card row, shaped to what mydevice/devicesList consumers read
+// (lplusd devices.rs minted this hand-written twin before codegen).
+message DeviceRow {
+  string device_id = 1;
+  string device_name = 2;
+  string ip = 3;
+  uint32 connect_type = 4;
+  uint32 device_type = 5;
+  bool is_same_account = 6;
+  string status = 7;
+  uint64 time = 8;
+  optional string usb_serial = 9;
+  bool is_discovered = 10;
+  bool is_connected = 11;
+  bool is_paired = 12;
+  string protcol_device_id = 13;
+  uint64 last_seen = 14;
+  uint64 last_session = 15;
+}
+
+// GUI Connect button lane (queues sdpd Command::Connect in the daemon).
+message ConnectCmd {
+  string ip = 1;
+}
+
+// GUI Disconnect lane (queues Command::Disconnect, aborts session pumps).
+message DisconnectCmd {
+  string ip = 1;
+}
+
+// Card "..." → Delete (prunes the row set and blocks stale re-mints).
+message RemoveDeviceCmd {
+  string device_id = 1;
+}
+
+// Element-click injection (`click <element-id>` lane): automation and
+// attach clients push ids here; the ui drains them with PollClicks on its
+// presence tick.
+message ClickCmd {
+  string id = 1;
+}
+
+message PollClicks {}
+
+// Vendor-style passthrough: channel name + JSON args (lplus_ipc::api
+// structs on both ends), reply is the dispatcher's JSON in
+// Response.InvokeResult.json.
+message InvokeCall {
+  string method = 1;
+  bytes payload = 2;
+}
+
+message Request {
+  oneof call {
+    ConnectCmd connect = 1;
+    DisconnectCmd disconnect = 2;
+    RemoveDeviceCmd remove_device = 3;
+    ClickCmd click = 4;
+    PollClicks poll_clicks = 5;
+    InvokeCall invoke = 6;
+  }
+}
+
+message Ack {
+  bool ok = 1;
+  optional string ip = 2;
+  optional string error = 3;
+  optional bool code_success = 4;
+}
+
+message Clicks {
+  repeated string ids = 1;
+}
+
+message InvokeResult {
+  bytes json = 1;
+}
+
+message Error {
+  string message = 1;
+}
+
+message Response {
+  oneof res {
+    Ack ack = 1;
+    Clicks clicks = 2;
+    InvokeResult invoke_result = 3;
+    Error error = 4;
+  }
+}

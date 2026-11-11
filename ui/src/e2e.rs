@@ -2,14 +2,14 @@
 //! harness, click handlers drive the router, and mock transfer ticks
 //! converge on the executor.
 
-use crate::ui::app::AppState;
-use crate::ui::router::Route;
+use crate::app::AppState;
+use crate::router::Route;
 use gpui::{MouseButton, Size, TestApp, px};
 
 #[test]
 fn clicking_screencast_entry_opens_mirroring_and_starts_cast() {
-    use crate::ui::ipc::Ipc;
-    use crate::ui::ipc::http_tests::stub_backend;
+    use crate::ipc::Ipc;
+    use crate::ipc::rpc_tests::stub_backend;
     use serde_json::json;
     let addr = stub_backend(vec![
         (
@@ -29,7 +29,7 @@ fn clicking_screencast_entry_opens_mirroring_and_starts_cast() {
     let mut app = TestApp::new();
     let mut window = app.open_window(|_window, _cx| {
         let mut a = AppState::new();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         a
     });
     window.update(|a, _window, _cx| a.refresh_devices());
@@ -185,7 +185,7 @@ fn add_device_button_on_device_list_opens_dialog() {
 #[test]
 fn sidebar_labels_match_vendor_nav() {
     assert_eq!(
-        crate::ui::app::sidebar_labels(),
+        crate::app::sidebar_labels(),
         vec!["Devices", "Remote control"]
     );
 }

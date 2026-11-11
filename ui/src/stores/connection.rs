@@ -245,7 +245,7 @@ impl UiStore {
         if self.sidebar_collapsed {
             64.0
         } else {
-            crate::ui::theme::SIDEBAR_W
+            crate::theme::SIDEBAR_W
         }
     }
 }

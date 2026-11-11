@@ -34,9 +34,6 @@ pub const SESSION_BIN_NAME: &str = "odmf-session.bin";
 pub const VIDEO_NAME: &str = "video_odmf.h265";
 /// Default KMS listen port (`KMS_PORT` in `main.rs` preflight).
 pub const DEFAULT_KMS_PORT: u16 = 36863;
-/// Default REPL port when `LPLUS_REPL_PORT` is unset.
-pub const DEFAULT_REPL_PORT: u16 = 47991;
-
 // ---------------------------------------------------------------- env facts
 /// Parse one port env var, falling back to `default` on missing/garbage.
 fn env_port(key: &str, default: u16) -> u16 {
@@ -54,11 +51,6 @@ fn env_flag(key: &str) -> bool {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-/// TCP port of the backend line REPL (panel Console tab dials it).
-pub fn repl_port() -> u16 {
-    env_port("LPLUS_REPL_PORT", DEFAULT_REPL_PORT)
 }
 
 /// TCP port of the PC-side KMS server (`lplus_status` probe target).
@@ -144,9 +136,8 @@ fn next_seq() -> u64 {
 }
 
 /// Push one DbsMessage key/value onto the live :46888 session through the
-/// backend's [`crate::sdpd::Command::SendFrame`] broadcast (the REPL
-/// `send 46888 <hex>` path, in-process). Returns the frame bytes and
-/// whether the command was accepted by the backend channel.
+/// backend's [`crate::sdpd::Command::SendFrame`] broadcast. Returns the
+/// frame bytes and whether the command was accepted by the backend channel.
 pub fn push_value(key: &str, value_json: &str) -> (Vec<u8>, bool) {
     let frame = dbs_frame(key, value_json, next_seq());
     let queued = crate::sdpd::send_command(crate::sdpd::Command::SendFrame {
@@ -158,8 +149,8 @@ pub fn push_value(key: &str, value_json: &str) -> (Vec<u8>, bool) {
 }
 
 // ----------------------------------------------------------- ipc channels
-/// `cast_push {key, value}`: inject one DbsMessage frame and report the
-/// live sink roster (best-effort REPL `list`) alongside the frame size.
+/// `cast_push {key, value}`: inject one DbsMessage frame and report its
+/// size and hex alongside the queue verdict.
 pub fn cast_push(key: &str, value: &str) -> CastPushResp {
     if key.trim().is_empty() {
         return CastPushResp {
@@ -168,19 +159,16 @@ pub fn cast_push(key: &str, value: &str) -> CastPushResp {
             frame_bytes: None,
             frame_hex: None,
             queued: None,
-            repl_out: None,
             error: Some("missing key".into()),
         };
     }
     let (frame, queued) = push_value(key, value);
-    let roster = crate::gui::ipc::repl_exec_line("list");
     CastPushResp {
         ok: true,
         key: Some(key.to_string()),
         frame_bytes: Some(frame.len()),
         frame_hex: Some(hex::encode(&frame)),
         queued: Some(queued),
-        repl_out: Some(roster.out.unwrap_or_default()),
         error: None,
     }
 }
@@ -276,16 +264,14 @@ fn cast_message(msg_cmd: &str, msg_body: &str) -> String {
 }
 
 // -------------------------------------------------------------- status/ops
-/// `lplus_status {}`: env-read snapshot of backend liveness, REPL/KMS
-/// lanes, ODMF sink files and the RTSP lane. Never panics; the KMS probe
+/// `lplus_status {}`: env-read snapshot of backend liveness, KMS lane,
+/// ODMF sink files and the RTSP lane. Never panics; the KMS probe
 /// is bounded to 300 ms.
 pub fn status() -> LplusStatus {
     let out = out_dir();
     LplusStatus {
         ok: true,
         backend_up: crate::gui::backend_up(),
-        repl_port: repl_port(),
-        repl_enabled: std::env::var("LPLUS_REPL_PORT").is_ok(),
         kms_listening: tcp_probe(kms_port()),
         odmf: OdmfInfo {
             enabled: env_flag("ODMF_SINK"),
@@ -328,21 +314,6 @@ fn file_info(path: &Path) -> FileInfo {
 fn tcp_probe(port: u16) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
-}
-
-// ---------------------------------------------------------------- capture
-/// Whitelisted capture artifact names for `GET /__capture/<name>`.
-pub const CAPTURE_FILES: [&str; 2] = [SESSION_BIN_NAME, VIDEO_NAME];
-
-/// Resolve one whitelisted capture artifact inside `out_dir`. Anything not
-/// exactly listed (traversal, absolute paths, subdirs) or missing on disk
-/// resolves to `None` — the route then answers 404.
-pub fn capture_file(out_dir: &Path, name: &str) -> Option<PathBuf> {
-    if !CAPTURE_FILES.contains(&name) {
-        return None;
-    }
-    let file = out_dir.join(name);
-    file.is_file().then_some(file)
 }
 
 // ------------------------------------------------------------------- tests
@@ -399,30 +370,6 @@ mod tests {
         assert_eq!(frame[34], 1); // version
         assert!(frame[35..59].iter().all(|&b| b == 0)); // zero tail
         assert_eq!(&frame[59..61], b"{\""); // payload JSON starts
-    }
-
-    #[test]
-    fn capture_file_whitelist_and_traversal() {
-        let dir = std::env::temp_dir().join(format!("lplus-capture-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir temp capture dir");
-        std::fs::write(dir.join(SESSION_BIN_NAME), b"session").expect("write session");
-        let _ = std::fs::remove_file(dir.join(VIDEO_NAME));
-
-        // whitelisted + present → Some
-        assert_eq!(
-            capture_file(&dir, SESSION_BIN_NAME),
-            Some(dir.join(SESSION_BIN_NAME))
-        );
-        // whitelisted but missing → None
-        assert_eq!(capture_file(&dir, VIDEO_NAME), None);
-        // traversal / absolute / subdir / empty / lookalikes → None
-        assert_eq!(capture_file(&dir, "../../etc/passwd"), None);
-        assert_eq!(capture_file(&dir, "/etc/passwd"), None);
-        assert_eq!(capture_file(&dir, &format!("../{SESSION_BIN_NAME}")), None);
-        assert_eq!(capture_file(&dir, &format!("sub/{SESSION_BIN_NAME}")), None);
-        assert_eq!(capture_file(&dir, ""), None);
-        assert_eq!(capture_file(&dir, "odmf-session.bin "), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -491,7 +438,6 @@ mod tests {
     fn status_shape_is_complete() {
         let s = status();
         assert!(s.ok);
-        assert!(s.repl_port > 0, "repl port always reported");
         assert_eq!(
             s.odmf.rtp_port,
             std::env::var("ODMF_RTP_PORT").unwrap_or_else(|_| "15550".into())

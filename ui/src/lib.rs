@@ -1,7 +1,7 @@
 //! L+ connect desktop UI: the GPUI port of the vendored O+ Connect
 //! renderer. In the combined binary the window dispatches straight into the
 //! in-process daemon registry (`ipc::Transport::Direct` — same dispatcher,
-//! no wire); `lplus gui` keeps the HTTP attach transport for connecting to
+//! no wire); `lplus gui` keeps the frame-socket attach transport for connecting to
 //! an externally running daemon.
 
 // The UI port keeps the full vendor-facing surface (screens, stores,
@@ -39,9 +39,9 @@ use router::Route;
 /// How the window reaches the daemon.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Transport {
-    /// Same-process daemon: dispatcher calls, no HTTP.
+    /// Same-process daemon: dispatcher calls, no wire.
     Direct,
-    /// External daemon: loopback `POST /__ipc` (respects `LPLUS_BACKEND`).
+    /// External daemon: loopback length-prefixed prost frames (respects `LPLUS_BACKEND`).
     Attach,
 }
 
@@ -122,7 +122,7 @@ pub fn run(transport: Transport, flags: UiFlags) {
         let state: gpui::Entity<AppState> = root_state.expect("window root view");
         // Live refresh: the merged app re-pulls the device lists on a timer
         // so adb/pairing changes surface without user action. Direct
-        // dispatch is a cheap registry read; attach mode is loopback HTTP.
+        // dispatch is a cheap registry read; attach mode is the loopback frame socket.
         let refresh_task = cx.spawn(async move |cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;

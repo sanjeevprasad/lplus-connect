@@ -4,23 +4,39 @@ Sources: `../winzip/resources/app.asar` (O+Connect
 17.100.10 Windows build, extracted to `vendor/` here), second source
 `../mac/O+Connect.app` (paths relative to this crate).
 
-**One crate, one binary**: this crate (`lplus`) IS the product. `cargo run`
-starts the backend **in-process** and opens the GPUI window; the same
-process serves the HTTP seam (`POST /__ipc`, `GET /__events`) on
-`127.0.0.1:1421` — the attach transport for `lplus gui`, `--probe-transport`
-and curl-level debugging. The GUI code lives in `src/gui/` (seam: `ipc.rs`
-dispatch registry, `server.rs`, `devices.rs`, `cast.rs`); the desktop UI
-port is `src/ui/`. The legacy
+**Workspace, one shipped binary**: the product is still `cargo run` from
+this crate — but the code is segregated so the window and the daemon never
+compile against each other:
+
+| Member | Role |
+| --- | --- |
+| `ipc/` (`lplus-ipc`) | the daemon↔ui contract: prost `Request`/`Response` (`protos/ui.proto`, served as length-prefixed frames on `127.0.0.1:1421`), `DeviceRow`, the shared channel structs (`api`), the ui-click queue, the Direct-mode dispatcher registry, the live-frame bus |
+| `lplusd/` (`lplusd`) | phone stack + loopback backend: `sdpd`, `scp/scpc/rpc`, `kms`, `odmf_pc/rtsp/wfd_sink`, `ble/d2d`, and the seam (`lplusd/src/gui/{ipc,server,devices,cast}.rs`) implementing the contract |
+| `ui/` (`lplus-ui`) | the GPUI port (screens, stores, view tree, e2e); deps on `lplus-ipc` only — never on `lplusd`. **Parked**: not a workspace member until the `gui` feature returns |
+| `.` (`lplus`) | the wiring: CLI + the product binary that starts the daemon and the contract server (`cargo run`, `daemon`, `panel`) |
+| `proto/` | the separate phone↔PC wire contract |
+
+`cargo run` starts the backend **in-process**, installs the channel
+dispatcher into `lplus-ipc`, and opens the GPUI window; the same process
+serves the contract server (length-prefixed prost frames on
+`127.0.0.1:1421`) — the attach transport for `lplus gui` and
+`--probe-transport`. The legacy
 `loopback/pair/connect/sdpd/ble` subcommands stay for dev/CI.
 
-**Status: the GPUI port (`src/ui/`) is the UI.** The vendored
+**Status: the GPUI port (`ui/`) is the UI — currently parked.** The root
+manifest comments out the `ui` member, the `gui` feature and the
+`lplus-ui` dependency (see `Cargo.toml`; the window wiring sits commented
+in `src/main.rs`), so builds ship `lplusd` + the contract server. The
+vendored
 `vendor/renderer/index.html` bundle (Vue 3.5 + Element Plus + vue-router +
 vuex + vue-i18n) is no longer served or booted — the in-page Electron-era
 shim (`shim.js`) was removed together with the browser path. The bundle
 stays in the tree as the behaviour reference: its `.js.map` sources drive
 the port's screens, channel names and response shapes. Electron/Node is
-replaced in Rust by the IPC channel registry (`src/gui/ipc.rs`), which the
-GPUI window calls directly and HTTP clients reach through `POST /__ipc`.
+replaced in Rust by the IPC channel registry (`lplusd/src/gui/ipc.rs`),
+which the GPUI window calls through the `lplus-ipc` dispatcher in-process
+and an attached window reaches through the frame socket (`lplus_ipc::pb`
+`Request`/`Response`, one frame per connection).
 
 ## 1. What the Electron app is
 
@@ -58,14 +74,14 @@ were used to drive this port (call sites, response shapes, boot order).
 
 | Concern | Solution |
 |---|---|
-| `ipcMain` side | `src/gui/ipc.rs`: registry commands; unknown channels answer `{ok:false,__unhandled}` — never a crash. The GPUI window calls `dispatch` in-process; HTTP clients go through `POST /__ipc` on `src/gui/server.rs` (127.0.0.1:1421) |
-| Renderer bus (`ipc_main_event`) | `ipc_bus` → `GET /__events` SSE of the process-global `GUI_BUS` (`{callbackId, code, data}` envelopes, exactly the Electron bus helper's shape) |
-| Console mirror | `console_log` IPC / `GET /__log` beacon mirror remote client logs onto the host log |
+| `ipcMain` side | `lplusd/src/gui/ipc.rs`: registry commands; unknown channels answer `{ok:false,__unhandled}` — never a crash. The GPUI window calls `dispatch` through the `lplus-ipc` dispatcher; attached windows go through the contract server (`lplusd/src/gui/server.rs`, frame socket on 127.0.0.1:1421) |
+| Renderer bus (`ipc_main_event`) | `ipc_bus` → the process-global `GUI_BUS` (`{callbackId, code, data}` envelopes, exactly the Electron bus helper's shape); in-process subscribers only |
+| Console mirror | `console_log` IPC channel mirrors remote client logs onto the host log |
 | Reference bundle | `vendor/renderer` is served nowhere; the `.html`/`.js`/`.css` keep the historical `app://`→`/` rewrite so RE diffs against the asar stay line-aligned |
 | Locale | The port authors English strings; the bundle's bundled zh packs remain as reference data |
-| UI transports | direct (merged default): the window calls `gui::ipc::dispatch` in-process; attach (`gui` subcommand): `POST /__ipc` to a running daemon, `LPLUS_BACKEND=off/1/host:port`. The in-process mock main (stub devices + audit ring) compiles into **test builds only** (`#[cfg(test)]`); shipped builds without a backend keep the vendor `__unhandled` contract. Tests run mock-only and never touch the network |
+| UI transports | direct (merged default): the window invokes `gui::ipc::dispatch` through the `lplus-ipc` dispatcher registry (installed by `start_backend`); attach (`gui` subcommand): length-prefixed prost frames to a running daemon's contract server (`LPLUS_BACKEND=off/1/host:port`). The in-process mock main (stub devices + audit ring) compiles into **test builds only** (`#[cfg(test)]`); shipped builds without a backend keep the vendor `__unhandled` contract. Tests run mock-only and never touch the network |
 
-## 3. IPC channel registry (`src/gui/ipc.rs`)
+## 3. IPC channel registry (`lplusd/src/gui/ipc.rs`)
 
 `ipc_invoke` routes `ipcRenderer.invoke` channels; `ipc_bus` routes bus
 `name`s and answers `code_success` envelopes; unknown names are recorded in
@@ -98,12 +114,12 @@ arrives over the wire or in-process.
 | `generic_agent_*` (remaining ~50) | unhandled | typed unhandled + audit |
 | bus `shell_share_locale_changed`, `get_app_config_path_to_contents`, `check_if_exist_remote_device`, `note_get_sidebar_width`, `FILE_QUEUE_AVAILABLE`, `initQueue`, `update_get_update_info` | unhandled (observed on boot) | typed unhandled + audit |
 
-### 3.1 Device model (`src/gui/devices.rs`)
+### 3.1 Device model (`lplusd/src/gui/devices.rs`)
 
 ```
 lplus backend (in-process, same binary)
   sdpd::run(SdpdConfig csp 10152) on the GUI async runtime
-  + KMS :36863 · REPL · events bridge :14752 · EPI lanes
+  + KMS :36863 · events bridge :14752 · EPI lanes · contract server :1421
   DeviceEvent{kind,ip,name,connected,ts_ms}  tokio broadcast
     ├─ subscribe_devices() ───────────►   (GUI ingest; `lplus daemon`
     │                                      mirrors the same lines to stdout)
@@ -114,7 +130,7 @@ lplus backend (in-process, same binary)
                         ▼
         rows {deviceId,deviceName,ip,isDiscovered,isConnected,…}
         ├── GPUI device wall (ui) ──► renders the cards directly
-        ├── GET  /__devices ──────────► attach / curl clients
+        ├── frame socket :1421 ───────► attach windows (prost Request/Response)
         │     (row shape = the vendor `devicesList` electron-store entry)
         └── tick(): bus push to subscribers
               {event:"push_search_devices_in_deivce_list",
@@ -137,7 +153,7 @@ lplus backend (in-process, same binary)
   (`connectType 128`, `usbSerial`) outside the event path.
 - The backend runs in the **same process** (`sdpd::run`).
   `apply_daemon_env()` seeds the env-driven knobs — SCP_*, EPI, KMS(36863),
-  LINK_*, REPL, `SCP_INTERACT=accept`, `LPLUS_EVENTS_PORT=14752` — in `main`
+  LINK_*, `SCP_INTERACT=accept`, `LPLUS_EVENTS_PORT=14752` — in `main`
   while single-threaded (CLI `--name/--csp/--vip` override `SdpdConfig`).
   Non-defaulted knobs: `LPLUS_USB=1` re-enables the adb/USB device lane
   (hidden by default: Wi-Fi-only device lists; paired bonds stay persisted
@@ -148,11 +164,11 @@ lplus backend (in-process, same binary)
   LinkSwitchMgr `SERVICE-PUBLISH` carries, `LINKNS` pins the published
   service id instead of rotating candidates.
   Before the backend starts, `preflight_or_die` bind-checks every port the
-  daemon takes (csp family, datatrans lanes, UDP 10150/10151, REPL, bridge)
+  daemon takes (csp family, datatrans lanes, UDP 10150/10151, contract server, bridge)
   and **fails loudly** naming each port and the holder (`ss -ltnp` /
   `ss -lunp` lines), never deferring: only one `lplus` owns the network
   stack. A backend bind failure after preflight also exits non-zero.
-- Rows are consumed verbatim by the GPUI device wall and `GET /__devices`:
+- Rows are consumed verbatim by the GPUI device wall and the attach contract server:
   `protcol_device_id` keeps the renderer's typo and the row shape matches
   the vendor `devicesList` electron-store entry, so attach clients see the
   same JSON mydevice used to render its cards from. The wall re-pulls on a
@@ -176,7 +192,7 @@ EPI sink pushes).
   `[repl] listening 127.0.0.1:47991`, `[events] NDJSON bridge :14752`,
   `sdpd up: :10150 (mcast 239.255.255.250) :10151 (uni)
   tcp[10152,10153,10151,10150,46888,47888,48888]`.
-- Event-fed device rows: with the backend live, `GET /__devices` returns
+- Event-fed device rows: with the backend live, the row table reports
   the paired rows (`deviceName CPH2745`, `isConnected true`) while the log
   shows `[presence] event kind=scp_sync …` / `kind=epi …` lines.
   Unclassified events (neighbour SSDP/probe noise) and
@@ -184,7 +200,7 @@ EPI sink pushes).
 - Loud port conflict: startup against a machine where a foreign process
   holds the stack exits non-zero naming every port plus the holder's
   `ss -ltnp` line, preflighting csp family, datatrans lanes, UDP
-  10150/10151, REPL and the events bridge.
+  10150/10151, the contract server and the events bridge.
 - `--probe-transport` exits 0 only when every probed channel
   (status, connected, found, host-name) is answered by the backend.
 
@@ -194,22 +210,21 @@ EPI sink pushes).
 cd oneplus/linux-client    # from the repo root (the dir holding this document)
 cargo run                       # daemon + GPUI window
 cargo run -- daemon             # headless backend, stdout logs
-cargo run -- panel              # daemon + HTTP seam only (no window)
+cargo run -- panel              # daemon + contract server only (no window)
 cargo run -- gui                # window attached to a running daemon
 ./target/debug/lplus --csp 10152          # name from settings.json/hostname, vip auto-detected
 ./connect.sh <resp> <linkpub-hex>   # one scripted connect attempt (restarts sdpd, taps phone, waits on markers)
 ./waitlex.sh <ERE> [timeout_s]      # block until regex appears in the live taplog (TAPLOG override honored)
-# seam: curl -s -XPOST 127.0.0.1:1421/__ipc \
-#   -d '{"cmd":"ipc_invoke","args":{"channel":"get_current_connected_device_info_list","payload":null}}'
+# seam: speak 4-byte-BE-length + lplus_ipc::pb::Request frames to
+#   127.0.0.1:1421 (typed control verbs + Invoke channels; §11 shows one)
 ```
 
 `lplus` is **the** daemon: default csp 10152, EPI lanes (46888/47888/48888),
-KMS (`KMS=1 KMS_PORT=36863 KMS_PWD=lplus-kms-pw`), REPL
-(`LPLUS_REPL_PORT`), presence NDJSON bridge (`LPLUS_EVENTS_PORT=14752`),
-SCP_*/LINK_* quickstart table applied via `apply_daemon_env()` (every entry
+KMS (`KMS=1 KMS_PORT=36863 KMS_PWD=lplus-kms-pw`), presence NDJSON bridge
+(`LPLUS_EVENTS_PORT=14752`), the contract server (:1421), SCP_*/LINK_*
+quickstart table applied via `apply_daemon_env()` (every entry
 only if the environment doesn't already define it — launch with your own
-exported values to override, e.g. `LPLUS_REPL_PORT=47991` for the cast
-tooling). If a foreign process holds any of those ports, startup fails
+exported values to override, e.g. `ODMF_RTP_PORT=15550` for the mirror lane). If a foreign process holds any of those ports, startup fails
 loudly naming port + holder (`ss -ltnp`), so exactly one `lplus` owns the
 network stack. Presence follows external bridges only via
 `LPLUS_EVENTS_PORT=port[,port…]` (dev aid). Persistent state —
@@ -239,19 +254,19 @@ copied over once on first use.
    `scpKsc`/`linkKpd` seed `SCP_KSC`/`LINK_KPD` before the defaults.
 5. Bundle step (deb/appimage), icons/branding.
 
-## 7. UI module map (`src/ui/`)
+## 7. UI module map (`ui/src/`, crate `lplus-ui`)
 
 | Module | Ports |
 | --- | --- |
-| `src/ui/router.rs` | vendor hash router (`home`, `crossfile/*`, `aiSearch`, `screen`, `screenshare`, `remotecontrol`, `settings`, `uploaddownload`, `generic-agent`, `note`) |
-| `src/ui/ipc.rs` | transports (direct / attach; test-only mock filler), vendor channels as a typed strum `Channel` enum + `__unhandled` audit ring |
-| `src/ui/stores/connection.rs` | vuex `connection.js`: found/connected merge, `deviceListSort`, connect state machine (incl. on-device permission wait) |
-| `src/ui/stores/transfer.rs` | vuex `uploadDownload.js`: queue, progress clamp, clear-finished |
-| `src/ui/stores/toast.rs` | vuex `toast.js` |
-| `src/ui/app.rs` | root `AppState` entity: pure handlers (TDD), mirroring/account/quality state |
-| `src/ui/views.rs` | element trees; tokens from `src/ui/theme.rs` |
-| `src/ui/theme.rs` | design tokens **measured from the live renderer** |
-| `src/ui/e2e.rs` | gpui `TestApp` integration suite (click-walks the sidebar nav, transfer queue) |
+| `ui/src/router.rs` | vendor hash router (`home`, `crossfile/*`, `aiSearch`, `screen`, `screenshare`, `remotecontrol`, `settings`, `uploaddownload`, `generic-agent`, `note`) |
+| `ui/src/ipc.rs` | transports (direct via the `lplus-ipc` dispatcher / served via the daemon's length-prefixed prost frame socket; test-only mock filler), vendor channels as a typed strum `Channel` enum + `__unhandled` audit ring |
+| `ui/src/stores/connection.rs` | vuex `connection.js`: found/connected merge, `deviceListSort`, connect state machine (incl. on-device permission wait) |
+| `ui/src/stores/transfer.rs` | vuex `uploadDownload.js`: queue, progress clamp, clear-finished |
+| `ui/src/stores/toast.rs` | vuex `toast.js` |
+| `ui/src/app.rs` | root `AppState` entity: pure handlers (TDD), mirroring/account/quality state |
+| `ui/src/views.rs` | element trees; tokens from `ui/src/theme.rs` |
+| `ui/src/theme.rs` | design tokens **measured from the live renderer** |
+| `ui/src/e2e.rs` | gpui `TestApp` integration suite (click-walks the sidebar nav, transfer queue) |
 
 Window flags: `--demo` (manual-connect lane; device mock is test-builds-only),
 `--dialog [--usb]`, `--start-home`, `--route <name>` (accepted names:
@@ -307,21 +322,25 @@ wall 9/9 PASS against vendor references.
 - The QR pairing payload awaits the real pairing lane (`get_pairing_qr_code`
   is mock-filled and audited).
 
-## 11. REPL element-click driver
+## 11. Element-click lane
 
-Every user-facing button shares one stable id (`src/ui/views.rs::element`)
-between the real GPUI tree (`.id(...)`) and the line REPL:
+Every user-facing button shares one stable id (`ui/src/views.rs::element`)
+between the real GPUI tree (`.id(...)`) and the click lane. Automation
+pushes ids as contract-server `ClickCmd` frames — a 4-byte BE length over
+the prost `Request` below — on `127.0.0.1:1421`:
 
-```
-$ echo 'click card-disconnect:192-168-0-100' | nc 127.0.0.1 14321
-$ echo 'click confirm'                    | nc 127.0.0.1 14321
+```python
+call = b'\x0a' + bytes([len(b"card-disconnect:192-168-0-100")]) \
+     + b"card-disconnect:192-168-0-100"          # ClickCmd.id = 1
+req  = b'\x22' + bytes([len(call)]) + call       # Request.click = 4
+s.sendall(len(req).to_bytes(4, "big") + req)     # → Ack{ok:true}
 ```
 
 Ids: `device-connect:<wall-index-or-device-id>`, `card-disconnect:…`,
 `menu-delete:…`, `card-more:…`, plus `confirm`/`cancel` (also the dialog's
-`{kind}-confirm`/`{kind}-cancel` forms). Clicks queue in sdpd
-(`Command::UiClick`) and drain on the presence tick
+`{kind}-confirm`/`{kind}-cancel` forms). The server queues them in the
+shared `lplus-ipc` click queue; the window drains on its presence tick
 (`AppState::drain_ui_clicks`), invoking the very handlers the on-screen
 buttons call — `request_connect`, `request_disconnect` (+ vendor confirm
-dialog), `request_remove_device`, `toggle_more_menu`. Log lines:
-`[cmd] ui click queued …` then `[ui] click … (repl)`.
+dialog), `request_remove_device`, `toggle_more_menu`. Log line:
+`[ui] click … (daemon queue)`. 

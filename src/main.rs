@@ -6,8 +6,8 @@
 //! (see `GUI.md` for the vendored-renderer seam and the IPC registry).
 //!
 //! * default: backend **in-process** (`sdpd::run` on a tokio runtime:
-//!   csp 10152, EPI, KMS, LINK_*, REPL, presence events bridge) **plus**
-//!   the loopback seam server (`POST /__ipc`, `GET /__events`) and the
+//!   csp 10152, EPI, KMS, LINK_*, presence events bridge) **plus**
+//!   the loopback contract server (length-prefixed prost frames) and the
 //!   desktop window; the window
 //!   attaches to an already-running daemon instead of double-starting it.
 //! * `daemon` / `--headless`: the same backend with stdout logs only — the
@@ -30,34 +30,13 @@
 #![deny(unsafe_code)]
 #![warn(clippy::all)]
 
-mod ble;
-// dev/CI surface kept for wire-capture work (was lib-public)
-#[allow(dead_code)]
-mod d2d;
-mod gui;
-// dev/CI surface kept for wire-capture work (was lib-public)
-#[allow(dead_code)]
-mod kms;
 mod logging;
-mod odmf_pc;
-#[allow(dead_code)] // opt-in video lane (RTSP=1); lane entry via sdpd
-mod rtsp;
-// dev/CI surface kept for wire-capture work (was lib-public)
-#[allow(dead_code)]
-mod scp;
-#[cfg(feature = "gui")]
-mod ui;
 
-mod rpc;
-// dev/CI surface kept for wire-capture work (was lib-public)
-#[allow(dead_code)]
-mod scpc;
-mod sdpd;
-mod state;
-#[allow(dead_code)] // test helpers + Error state used by module tests/CI only
-mod ukey2;
-#[allow(dead_code)] // ODMF sink lane; armed via ODMF_SINK=1
-mod wfd_sink;
+// dev/CI surface kept for wire-capture work lives in `lplusd`.
+// ui wiring parked (ui/ member + `gui` feature commented in Cargo.toml):
+// #[cfg(feature = "gui")]
+// use lplus_ui as ui;
+use lplusd::{ble, gui, scpc, sdpd, state, ukey2};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -188,7 +167,6 @@ const DAEMON_ENV: &[(&str, &str)] = &[
     ("KMS_PWD", "lplus-kms-pw"),
     ("LINK_PORTS", "54227,57320,63125,59566"),
     ("LINK_REPLY_HEX_FILE", "/tmp/lrh.hex"),
-    ("LPLUS_REPL_PORT", "14321"),
     ("LPLUS_EVENTS_PORT", "14752"),
 ];
 
@@ -217,7 +195,7 @@ fn settings_seeds(
 
 /// The panel `settings.json` (state dir), or an empty object.
 fn load_settings() -> serde_json::Value {
-    std::fs::read_to_string(crate::state::panel_settings_path())
+    std::fs::read_to_string(state::panel_settings_path())
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_else(|| serde_json::json!({}))
@@ -300,17 +278,15 @@ fn held_ports(cfg: &sdpd::SdpdConfig) -> Vec<String> {
         cfg.uni_port.wrapping_add(1),
         cfg.sdp_port,
         cfg.sdp_port.wrapping_add(1),
-        // datatrans channel dial list + the daemon's REPL/events bridge.
+        // datatrans channel dial list + the daemon's events bridge.
         46888,
         47888,
         48888,
     ];
-    for key in ["LPLUS_REPL_PORT", "LPLUS_EVENTS_PORT"] {
-        if let Ok(p) = std::env::var(key)
-            && let Ok(p) = p.parse::<u16>()
-        {
-            tcp.push(p);
-        }
+    if let Ok(p) = std::env::var("LPLUS_EVENTS_PORT")
+        && let Ok(p) = p.parse::<u16>()
+    {
+        tcp.push(p);
     }
     tcp.sort_unstable();
     tcp.dedup();
@@ -454,12 +430,8 @@ fn main() -> Result<()> {
             gui::serve(cfg).map_err(|e| anyhow::anyhow!(e))
         }
         Some(Cmd::Gui) => {
-            #[cfg(feature = "gui")]
-            {
-                ui::run(ui::Transport::Attach, ui_flags(&cli));
-            }
-            #[cfg(not(feature = "gui"))]
-            tracing::error!("this lplus build has no `gui` feature — rebuild with it enabled");
+            // ui wiring parked: ui::run(ui::Transport::Attach, ui_flags(&cli));
+            tracing::error!("the GPUI window is parked — run `lplus daemon` or `lplus panel`");
             Ok(())
         }
         None => {
@@ -471,36 +443,11 @@ fn main() -> Result<()> {
     }
 }
 
-/// Default entry (`lplus`): the daemon and the desktop window in one
-/// process. If a daemon is already running, the window attaches to it
-/// instead of double-starting the backend.
-#[cfg(feature = "gui")]
+/// Default entry (`lplus`): the daemon and the contract server in one
+/// process, no window (the GPUI lane is parked with the ui/ member).
 fn product(cli: &Cli, cfg: sdpd::SdpdConfig) -> Result<()> {
     if cli.probe_transport {
-        if !ui::probe_transport() {
-            std::process::exit(2);
-        }
-        return Ok(());
-    }
-    if cli.headless {
-        preflight_or_die(&cfg);
-        return headless(cfg);
-    }
-    if daemon_running() {
-        tracing::info!("[lplus] daemon already up — opening the window attached to it");
-        ui::run(ui::Transport::Attach, ui_flags(cli));
-        return Ok(());
-    }
-    gui::start(cfg).map_err(|e| anyhow::anyhow!(e))?;
-    ui::run(ui::Transport::Direct, ui_flags(cli));
-    Ok(())
-}
-
-/// Headless build (no `gui` feature): the pre-merge product UX.
-#[cfg(not(feature = "gui"))]
-fn product(cli: &Cli, cfg: sdpd::SdpdConfig) -> Result<()> {
-    if cli.probe_transport {
-        tracing::error!("--probe-transport needs a build with the `gui` feature");
+        tracing::error!("--probe-transport is parked with the GPUI window");
         std::process::exit(2);
     }
     preflight_or_die(&cfg);
@@ -511,27 +458,26 @@ fn product(cli: &Cli, cfg: sdpd::SdpdConfig) -> Result<()> {
     }
 }
 
-#[cfg(feature = "gui")]
-fn ui_flags(cli: &Cli) -> ui::UiFlags {
-    ui::UiFlags {
-        demo: cli.demo,
-        dialog: cli.dialog,
-        usb: cli.usb,
-        start_home: cli.start_home,
-        route: (!cli.route.is_empty()).then(|| cli.route.clone()),
-    }
-}
-
-/// Cheap single-instance guard: a loopback GUI server already answering
-/// means another `lplus` daemon owns the ports.
-#[cfg(feature = "gui")]
-fn daemon_running() -> bool {
-    std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:1421".parse().expect("static"),
-        std::time::Duration::from_millis(200),
-    )
-    .is_ok()
-}
+// ui wiring parked (restore with the ui/ member and the `gui` feature):
+// fn ui_flags(cli: &Cli) -> ui::UiFlags {
+//     ui::UiFlags {
+//         demo: cli.demo,
+//         dialog: cli.dialog,
+//         usb: cli.usb,
+//         start_home: cli.start_home,
+//         route: (!cli.route.is_empty()).then(|| cli.route.clone()),
+//     }
+// }
+//
+// /// Cheap single-instance guard: a loopback GUI server already answering
+// /// means another `lplus` daemon owns the ports.
+// fn daemon_running() -> bool {
+//     std::net::TcpStream::connect_timeout(
+//         &"127.0.0.1:1421".parse().expect("static"),
+//         std::time::Duration::from_millis(200),
+//     )
+//     .is_ok()
+// }
 
 /// `--headless`: the same backend as the GUI lane, stdout logs, no window
 /// (old `lplus sdpd` UX). Presence events mirror to stdout as
@@ -678,7 +624,7 @@ mod cli_tests {
     #[test]
     fn daemon_env_skips_present_keys() {
         let have = |k: &str| {
-            if k == "RESP" || k == "LPLUS_REPL_PORT" {
+            if k == "RESP" {
                 Some("preset".to_string())
             } else {
                 None
@@ -686,7 +632,6 @@ mod cli_tests {
         };
         let missing = missing_daemon_env(&have);
         assert!(!missing.iter().any(|(k, _)| *k == "RESP"));
-        assert!(!missing.iter().any(|(k, _)| *k == "LPLUS_REPL_PORT"));
         assert!(missing.iter().any(|(k, _)| *k == "EPI"));
         assert!(missing.iter().any(|(k, _)| *k == "KMS"));
         assert!(missing.iter().any(|(k, _)| *k == "LPLUS_EVENTS_PORT"));

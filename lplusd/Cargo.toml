@@ -1,0 +1,49 @@
+[package]
+name    = "lplusd"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish    = false
+# Everything except the window: the phone-facing lanes (SCP/UKEY2, EPI,
+# KMS, ODMF/RTSP cast, BLE/WFD) and the loopback backend that implements
+# the daemon↔ui contract (`lplus-ipc`): the length-prefixed prost frame
+# server on `127.0.0.1:1421`. Talks to the ui only through `lplus-ipc`;
+# never depends on it.
+
+[dependencies]
+aes                = { version = "0.9", default-features = false }
+aes-gcm            = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+anyhow             = { workspace = true }
+base64             = { version = "0.23", default-features = false, features = ["std"] }
+bluer              = { version = "0.17", default-features = false, features = ["bluetoothd"] }
+cbc                = { version = "0.2", default-features = false, features = ["alloc", "block-padding"] }
+# cross-platform base dirs (XDG config / %APPDATA% / Application Support)
+# for the per-user state files; hand-rolling the per-OS fallback rules is
+# the bug-prone part (OSV: no advisories).
+directories        = { version = "6", default-features = false }
+futures            = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+hex                = { version = "0.4", default-features = false, features = ["std"] }
+hkdf               = { version = "0.13", default-features = false }
+hmac               = { version = "0.13", default-features = false }
+# JPEG decode for the ODMF webrtc live lane (raw frames go on the
+# `lplus-ipc` live bus; the GPUI side renders them).
+image              = { version = "0.25", default-features = false, features = ["jpeg"] }
+# daemon↔ui wire + shared contract (workspace member `ipc/`)
+lplus-ipc          = { path = "../ipc" }
+# phone↔PC wire contract (workspace member `proto/`)
+proto              = { path = "../proto" }
+p256               = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "precomputed-tables", "std"] }
+prost              = { workspace = true }
+rand               = { version = "0.10", default-features = false, features = ["thread_rng"] }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+sha2               = { version = "0.11", default-features = false, features = ["alloc"] }
+strum              = { workspace = true }
+# rust-crypto backend (no str0m-aws-lc-rs, no example-server rouille stack
+# from the `examples` default). Note: `aws-lc-sys` still links — str0m's
+# DTLS crate `dimpl` enables its aws-lc-rs + rcgen defaults unconditionally
+# upstream; pruning that needs an upstream feature gate.
+str0m              = { version = "0.25", default-features = false, features = ["rust-crypto"] }
+str0m-rust-crypto  = { version = "0.7", default-features = false }
+tokio              = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "sync", "net", "io-util", "macros", "process"] }
+tracing            = { version = "0.1", default-features = false, features = ["std"] }

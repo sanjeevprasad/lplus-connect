@@ -23,11 +23,9 @@
 //! concerns and are not part of this registry.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write as _};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
 use strum::{Display, EnumString};
 
 use serde::Serialize;
@@ -38,10 +36,6 @@ const RENDERER_EVENT: &str = "ipc_renderer_event";
 
 const AUDIT_CAP: usize = 400;
 const APP_VERSION: &str = "17.100.10";
-/// Cap for one panel REPL round-trip (`repl_exec`): read until EOF or this
-/// deadline, whichever comes first.
-const REPL_TIMEOUT: Duration = Duration::from_millis(1500);
-
 // ------------------------------------------------------------------ audit
 /// Ring buffer of channels the renderer hit that we do not serve yet.
 /// Process-global so `dispatch` stays a free function.
@@ -161,63 +155,6 @@ fn persist_host_name(path: &Path, name: &str) -> std::io::Result<()> {
     std::fs::write(path, serde_json::to_string(&blob).expect("settings blob"))
 }
 
-// ------------------------------------------------------------------- repl
-/// Panel REPL lane (`repl_exec`): run one line through the backend line
-/// REPL on 127.0.0.1:`LPLUS_REPL_PORT` (default 47991). Empty lines are
-/// refused before touching the socket.
-pub(crate) fn repl_exec_line(line: &str) -> crate::gui::api::ReplExec {
-    if line.trim().is_empty() {
-        return crate::gui::api::ReplExec {
-            ok: false,
-            out: None,
-            error: Some("empty line".into()),
-        };
-    }
-    repl_exec_port(line, crate::gui::cast::repl_port())
-}
-
-/// `repl_exec` against an explicit port (one-shot listener in tests).
-fn repl_exec_port(line: &str, port: u16) -> crate::gui::api::ReplExec {
-    use crate::gui::api::ReplExec;
-    let fail = |error: String| ReplExec {
-        ok: false,
-        out: None,
-        error: Some(error),
-    };
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = match std::net::TcpStream::connect_timeout(&addr, REPL_TIMEOUT) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("[ipc] repl_exec connect {addr} failed: {e}");
-            return fail(format!("repl connect {addr}: {e}"));
-        }
-    };
-    let _ = stream.set_write_timeout(Some(REPL_TIMEOUT));
-    let _ = stream.set_read_timeout(Some(REPL_TIMEOUT));
-    if writeln!(stream, "{line}").is_err() {
-        return fail("repl write failed".into());
-    }
-    // Half-close so the REPL's line loop sees EOF and hangs up: the reply
-    // arrives without waiting out the read timeout.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break, // EOF or the 1500 ms deadline
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-        }
-    }
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    let out: Vec<String> = text.lines().map(str::to_string).collect();
-    tracing::info!("[ipc] repl_exec {line:?} -> {} line(s)", out.len());
-    ReplExec {
-        ok: true,
-        out: Some(out),
-        error: None,
-    }
-}
-
 // -------------------------------------------------------------- dispatch
 /// Shape used by the renderer bus (`IpcRender.send`) for request payloads.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -280,7 +217,6 @@ enum WireCmd {
     ConsoleLog(crate::gui::api::ConsoleLogArgs),
     OpenExternal(crate::gui::api::OpenExternalArgs),
     IpcRegistry,
-    ReplExec(crate::gui::api::ReplArgs),
     CastPush(crate::gui::api::CastPushArgs),
     OdmfStart,
     KmsBootstrap(crate::gui::api::IpPayload),
@@ -324,7 +260,6 @@ impl WireCmd {
             K::ConsoleLog => Self::ConsoleLog(args_of(args)),
             K::OpenExternal => Self::OpenExternal(args_of(args)),
             K::IpcRegistry => Self::IpcRegistry,
-            K::ReplExec => Self::ReplExec(args_of(args)),
             K::CastPush => Self::CastPush(args_of(args)),
             K::OdmfStart => Self::OdmfStart,
             K::KmsBootstrap => Self::KmsBootstrap(args_of(args)),
@@ -562,7 +497,6 @@ pub fn dispatch(cmd: &str, args: Value) -> Value {
         WireCmd::IpcRegistry => wire(&audit_snapshot()),
 
         // ---- panel product channels (contract) -----------------------------
-        WireCmd::ReplExec(parsed) => wire(&repl_exec_line(&parsed.line)),
         WireCmd::CastPush(parsed) => wire(&crate::gui::cast::cast_push(&parsed.key, &parsed.value)),
         WireCmd::OdmfStart => wire(&crate::gui::cast::odmf_start()),
         WireCmd::KmsBootstrap(parsed) => wire(&api::kms_bootstrap(parsed.ip())),
@@ -655,59 +589,6 @@ mod tests {
 
     // ---- panel product channels ------------------------------------------
 
-    /// One-shot fake REPL: answers the first connection's line with fixed
-    /// output, then hangs up (exercises the read-until-EOF path).
-    fn fake_repl(reply: &'static str) -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake repl");
-        let port = listener.local_addr().expect("local addr").port();
-        std::thread::spawn(move || {
-            if let Ok((sock, _)) = listener.accept() {
-                use std::io::{BufRead, BufReader, Write};
-                let mut rd = BufReader::new(sock);
-                let mut line = String::new();
-                let _ = rd.read_line(&mut line); // the request line
-                let mut sock = rd.into_inner();
-                let _ = sock.write_all(reply.as_bytes());
-                // socket drop → EOF for the client
-            }
-        });
-        port
-    }
-
-    /// A port with nothing listening (bind + release).
-    fn dead_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-        l.local_addr().expect("probe addr").port()
-    }
-
-    #[test]
-    fn repl_exec_roundtrips_against_fake_repl() {
-        let port = fake_repl("peers 1\n  46888 192.0.2.2:52000\n");
-        let v = repl_exec_port("list", port);
-        assert!(v.ok, "{v:?}");
-        let out = v.out.clone().expect("out vector");
-        assert_eq!(out.len(), 2, "{v:?}");
-        assert_eq!(out[0], "peers 1");
-        assert!(out[1].contains("46888"));
-    }
-
-    #[test]
-    fn repl_exec_refuses_empty_line() {
-        let v = dispatch("repl_exec", json!({ "line": "   " }));
-        assert_eq!(v["ok"], json!(false));
-        assert_eq!(v["error"], json!("empty line"));
-        let v = dispatch("repl_exec", json!({}));
-        assert_eq!(v["ok"], json!(false));
-    }
-
-    #[test]
-    fn repl_exec_reports_unreachable_backend() {
-        // Nothing is listening on the dead port: typed failure, no hang.
-        let v = repl_exec_port("list", dead_port());
-        assert!(!v.ok);
-        assert!(v.error.unwrap().contains("repl connect"));
-    }
-
     #[test]
     fn dispatch_device_found_list_wraps_rows() {
         let v = dispatch(
@@ -734,7 +615,6 @@ mod tests {
         );
         assert_eq!(v["ok"], json!(true), "{v}");
         assert!(v["frame_bytes"].as_u64().unwrap() > 52, "{v}");
-        assert!(v["repl_out"].is_array(), "{v}");
     }
 
     #[test]
@@ -787,8 +667,6 @@ mod tests {
         let v = dispatch("lplus_status", json!({}));
         assert_eq!(v["ok"], json!(true));
         assert!(v["backend_up"].is_boolean());
-        assert!(v["repl_port"].is_number());
-        assert!(v["repl_enabled"].is_boolean());
         assert!(v["kms_listening"].is_boolean());
         assert!(v["odmf"]["enabled"].is_boolean());
         assert!(v["odmf"]["session_bin"]["exists"].is_boolean());

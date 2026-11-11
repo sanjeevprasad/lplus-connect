@@ -32,7 +32,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use strum::EnumString;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::sdpd::DeviceEvent;
 
@@ -73,33 +72,11 @@ fn is_local(ip: &str) -> bool {
     ip.starts_with("127.") || local_ips().contains(ip)
 }
 
-/// One card row, shaped to what mydevice/`devicesList` consumers read.
-#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct DeviceRow {
-    pub device_id: String,
-    pub device_name: String,
-    pub ip: String,
-    pub connect_type: u8,
-    pub device_type: u8,
-    pub is_same_account: bool,
-    pub status: String,
-    pub time: u64,
-    pub usb_serial: Option<String>,
-    pub is_discovered: bool,
-    pub is_connected: bool,
-    /// Persistent pairing bond (scp_sync session or a bond carried in
-    /// `paired.json`; adb authorization alone is transport presence, not
-    /// a bond). Paired rows survive TTL pruning and show offline.
-    pub is_paired: bool,
-    /// Spelling as consumed by mydevice.handleDiscoveryDevice.
-    #[serde(rename = "protcol_device_id")]
-    pub protcol_device_id: String,
-    #[serde(rename = "lastSeen")]
-    pub last_seen: u64,
-    #[serde(rename = "lastSession")]
-    pub last_session: u64,
-}
+/// One card row, shaped to what mydevice/`devicesList` consumers read —
+/// the generated contract type (`lplus_ipc::pb::DeviceRow`, from
+/// `protos/ui.proto`), re-exported so in-crate callers keep saying
+/// `crate::gui::devices::DeviceRow`.
+pub use lplus_ipc::pb::DeviceRow;
 
 /// NDJSON wire form of `crate::sdpd::DeviceEvent` for external-bridge
 /// subscribers. (The backend type derives `Serialize` only; this mirror
@@ -132,8 +109,8 @@ struct Inner {
 }
 
 /// Vendor `CONNECT_TYPE` bits (renderer `Ve.gy`): LAN discovery vs adb/USB.
-pub const CONNECT_TYPE_LAN: u8 = 16;
-pub const CONNECT_TYPE_USB: u8 = 128;
+pub const CONNECT_TYPE_LAN: u32 = 16;
+pub const CONNECT_TYPE_USB: u32 = 128;
 
 /// The product is Wi-Fi only. Legacy USB rows (from the removed adb
 /// transport lane) stay hidden from every read surface unless
@@ -408,15 +385,8 @@ pub fn is_subscribed(name: &str) -> bool {
         .contains(name)
 }
 
-/// Rows for `ipc_invoke`/bus routes and `/__devices`.
-pub fn rows_json() -> Value {
-    let mut i = inner().lock().expect("devices lock poisoned");
-    serde_json::to_value(visible_rows(&mut i)).unwrap_or_else(|_| Value::Array(Vec::new()))
-}
-
 /// Serializable visible rows (sorted, ephemeral flags refreshed, stale
-/// rows pruned) as typed rows — the API surface; `rows_json` is its
-/// serialization boundary.
+/// rows pruned) as typed rows — the API surface.
 pub fn visible_device_rows() -> Vec<DeviceRow> {
     let mut i = inner().lock().expect("devices lock poisoned");
     visible_rows(&mut i)

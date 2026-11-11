@@ -7,13 +7,13 @@ use std::str::FromStr;
 use gpui::{Context, Task};
 use strum::EnumString;
 
-use crate::ui::ipc::{ConnectApi, Ipc};
+use crate::ipc::{ConnectApi, Ipc};
 
-use crate::ui::router::{Route, Router};
-use crate::ui::stores::connection::UiStore;
-use crate::ui::stores::connection::{ConnectionStore, Device};
-use crate::ui::stores::toast::{ToastKind, ToastStore};
-use crate::ui::stores::transfer::{Direction, TransferItem, TransferStatus, TransferStore};
+use crate::router::{Route, Router};
+use crate::stores::connection::UiStore;
+use crate::stores::connection::{ConnectionStore, Device};
+use crate::stores::toast::{ToastKind, ToastStore};
+use crate::stores::transfer::{Direction, TransferItem, TransferStatus, TransferStore};
 #[cfg(test)]
 use serde_json::json;
 
@@ -128,7 +128,7 @@ impl AppState {
 
     /// Pull connected + found device lists through the vendor channels.
     /// Typed service surface (`ConnectApi`): Direct calls the daemon API
-    /// with no JSON round-trip, http/mock answers are parsed to `Device`.
+    /// with no JSON round-trip; remote/mock answers are parsed to `Device`.
     /// Unhandled answers parse to `None` and leave the store untouched.
     pub fn refresh_devices(&mut self) {
         if let Some(devices) = self.ipc.connected_devices() {
@@ -510,12 +510,12 @@ impl AppState {
         self.transfer.clear_finished();
     }
 
-    /// Invoke one named GUI element action queued by the REPL
+    /// Invoke one named GUI element action queued by the backend
     /// (`click <id>`); ids are the same the GPUI tree stamps
     /// (`views::element`).
     pub fn handle_ui_click(&mut self, id: &str) {
-        use crate::ui::views::element::{self, Click, Target};
-        tracing::info!("[ui] click {id:?} (repl)");
+        use crate::views::element::{self, Click, Target};
+        tracing::info!("[ui] click {id:?} (daemon queue)");
         let resolve = |app: &Self, t: &Target| -> Option<(usize, Device)> {
             let wall = app.connection.wall();
             match t {
@@ -563,10 +563,10 @@ impl AppState {
         }
     }
 
-    /// Drain REPL-queued clicks (see `handle_ui_click`). Called from the
+    /// Drain daemon-queued clicks (see `handle_ui_click`). Called from the
     /// presence tick so clicks land within one poll on any page.
     pub fn drain_ui_clicks(&mut self) {
-        for id in crate::sdpd::take_ui_clicks() {
+        for id in self.ipc.take_ui_clicks() {
             self.handle_ui_click(&id);
         }
     }
@@ -747,7 +747,7 @@ pub fn connect_conflict_labels() -> (&'static str, &'static str, &'static str, &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::stores::connection::ConnectState;
+    use crate::stores::connection::ConnectState;
     use base64::Engine as _;
 
     #[test]
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn connected_devices_visible_signed_out_with_add_device_header() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         use gpui::{MouseButton, Size, TestApp, px};
         let addr = stub_backend(vec![(
             "via:get_current_connected_device_info_list",
@@ -795,7 +795,7 @@ mod tests {
             },
             |_window, _cx| {
                 let mut a = AppState::new();
-                a.ipc = Ipc::http(addr);
+                a.ipc = Ipc::served(addr);
                 a.refresh_devices();
                 a
             },
@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn confirm_remove_device_unbinds_via_backend_and_drops_row() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![
             (
                 "generic_agent_get_paired_devices",
@@ -868,7 +868,7 @@ mod tests {
             ),
         ]);
         let mut a = AppState::new();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         a.refresh_devices();
         let dev = a.connection.wall()[0].clone();
         a.request_remove_device(&dev);
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn card_delete_click_opens_confirm_then_removes() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         use gpui::{MouseButton, Size, TestApp, px};
         let addr = stub_backend(vec![
             (
@@ -919,7 +919,7 @@ mod tests {
             },
             |_window, _cx| {
                 let mut a = AppState::new();
-                a.ipc = Ipc::http(addr);
+                a.ipc = Ipc::served(addr);
                 a.refresh_devices();
                 a
             },
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn refresh_devices_includes_paired_offline_device() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![(
             "generic_agent_get_paired_devices",
             json!({ "ok": true,
@@ -1008,7 +1008,7 @@ mod tests {
                                   "deviceType": 8 }] }),
         )]);
         let mut a = AppState::new();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         a.refresh_devices();
         let wall = a.connection.wall();
         let offline = wall
@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn refresh_devices_surfaces_backend_usb_connected_row() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![(
             "via:get_current_connected_device_info_list",
             json!([{ "deviceId": "usb-FAKESERIAL000001",
@@ -1034,7 +1034,7 @@ mod tests {
                      "usbSerial": "FAKESERIAL000001" }]),
         )]);
         let mut a = AppState::new();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         a.refresh_devices();
         assert!(a.connection.is_connected("usb-FAKESERIAL000001"));
         assert_eq!(a.connection.wall()[0].device_name, "OnePlus 15");
@@ -1047,7 +1047,7 @@ mod tests {
         // the daemon's row later reports the phone-initiated session up.
         // A presence poll must settle the card to Connected — the wall is
         // daemon truth, not the one-shot ack.
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![(
             "via:get_current_connected_device_info_list",
             json!([{ "deviceId": "192-0-2-100",
@@ -1059,7 +1059,7 @@ mod tests {
                      "deviceType": 8 }]),
         )]);
         let mut a = AppState::new();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         a.connection.state = ConnectState::WaitingPermission("192-0-2-100".into());
         a.refresh_devices();
         assert!(a.connection.is_connected("192-0-2-100"));
@@ -1071,7 +1071,7 @@ mod tests {
 
     #[test]
     fn element_ids_round_trip_through_the_click_parser() {
-        use crate::ui::views::element::{self, Click, Target};
+        use crate::views::element::{self, Click, Target};
         assert_eq!(
             element::parse(&element::connect(2)),
             Some(Click::Connect(Target::Index(2)))
@@ -1101,8 +1101,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_click_drives_disconnect_dialog_and_backend() {
-        use crate::ui::ipc::http_tests::stub_backend;
+    fn daemon_click_drives_disconnect_dialog_and_backend() {
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![
             (
                 "generic_agent_get_paired_devices",
@@ -1122,7 +1122,7 @@ mod tests {
             ),
         ]);
         let mut a = AppState::new();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         a.refresh_devices();
         a.handle_ui_click("card-disconnect:192-0-2-100");
         assert_eq!(a.ui.disconnect_pending.as_deref(), Some("192-0-2-100"));
@@ -1141,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn repl_click_unknown_element_is_inert() {
+    fn daemon_click_unknown_element_is_inert() {
         let mut a = device_app();
         a.handle_ui_click("definitely-not-an-element");
         assert!(a.ui.disconnect_pending.is_none());
@@ -1226,13 +1226,13 @@ mod tests {
 
     #[test]
     fn connect_device_against_backend_queues_and_defers_to_list() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![(
             "via:get_current_connected_device_info_list",
             json!([]),
         )]);
         let mut a = device_app();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         let phone = Device {
             device_id: "p1".into(),
             device_name: "Phone".into(),
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn connect_conflict_gates_second_connect_until_confirmed() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![
             (
                 "via:get_current_connected_device_info_list",
@@ -1327,7 +1327,7 @@ mod tests {
             ),
         ]);
         let mut a = AppState::new();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         a.refresh_devices();
         let idle = a
             .connection
@@ -1357,7 +1357,7 @@ mod tests {
 
     #[test]
     fn connect_without_conflict_goes_directly() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![
             ("via:get_current_connected_device_info_list", json!([])),
             (
@@ -1374,7 +1374,7 @@ mod tests {
             ),
         ]);
         let mut a = AppState::new();
-        a.ipc = Ipc::http(addr);
+        a.ipc = Ipc::served(addr);
         a.refresh_devices();
         let idle = a
             .connection

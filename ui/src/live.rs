@@ -1,14 +1,16 @@
-//! Native live screencast preview: the ODMF webrtc lane decodes received
-//! H.265 access units to JPEG frames (`ffmpeg` image2pipe) and drops the
-//! latest decoded frame into a process-global slot; this module polls that
-//! slot from the GPUI main loop (16 ms) and renders it in its own window.
+//! Native live screencast preview: the ODMF webrtc lane (daemon side)
+//! decodes received H.265 access units and hands the newest RGBA frame to
+//! the shared [`lplus_ipc::live`] bus; this module polls that bus from the
+//! GPUI main loop (16 ms) and renders it in its own window.
 //!
-//! Cross-thread handoff is a plain `Mutex<Option<Arc<RenderImage>>>` — no
-//! GPUI handles ever leave the main thread. The lane asks for the window
-//! via [`request_native`]; if the GUI bridge never started (headless
-//! daemon) the caller falls back to the external player sink.
+//! The cross-thread handoff lives in `lplus_ipc` (raw pixels only — the
+//! GPUI texture types belong here), so the daemon lane never names the ui
+//! crate; the lane asks for the window via `lplus_ipc::live::request_native`
+//! and if the GUI bridge never started (headless daemon) the caller falls
+//! back to the external player sink.
 
 use std::sync::Mutex;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use gpui::{
@@ -20,12 +22,6 @@ use image::{Frame, RgbaImage};
 /// Letterbox backdrop behind the contained video frame.
 const VIDEO_BG: u32 = 0x10_10_10;
 
-/// Latest decoded frame awaiting display (taken by the main loop).
-static FRAME: Mutex<Option<std::sync::Arc<RenderImage>>> = Mutex::new(None);
-/// The lane wants a preview window (set cross-thread, consumed by the loop).
-static REQUESTED: AtomicBool = AtomicBool::new(false);
-/// The GPUI bridge loop is running in this process.
-static BRIDGE_ON: AtomicBool = AtomicBool::new(false);
 /// Keeps long-lived `cx.spawn` futures alive for the process lifetime —
 /// dropping a [`gpui::Task`] before completion cancels it.
 static KEEPALIVE: Mutex<Vec<gpui::Task<()>>> = Mutex::new(Vec::new());
@@ -36,9 +32,7 @@ pub(crate) fn retain_task(task: gpui::Task<()>) {
         tasks.push(task);
     }
 }
-/// Total frames handed to the bridge since process start (never reset;
-/// lets the decoder test observe production regardless of consumers).
-static PRODUCED: AtomicUsize = AtomicUsize::new(0);
+
 /// Test-only: end the bridge loop after its next iteration.
 #[cfg(test)]
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -105,35 +99,16 @@ pub fn render_image(pixels: RgbaImage) -> std::sync::Arc<RenderImage> {
     std::sync::Arc::new(RenderImage::new(vec![Frame::new(pixels)]))
 }
 
-/// Called by the ODMF lane (any thread) before building a native sink:
-/// returns `true` when a GPUI bridge exists in this process, meaning the
-/// window will materialize on the main loop.
-pub fn request_native() -> bool {
-    if !BRIDGE_ON.load(Ordering::Relaxed) {
-        return false;
-    }
-    REQUESTED.store(true, Ordering::Relaxed);
-    true
-}
-
-/// Hand the freshly decoded frame to the main loop (any thread).
-pub fn push_frame(image: std::sync::Arc<RenderImage>) {
-    PRODUCED.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut slot) = FRAME.lock() {
-        *slot = Some(image);
-    }
-}
-
 /// Start the 16 ms bridge loop; call once from `ui::run` on the main thread.
 pub fn start_bridge(cx: &mut App) {
-    BRIDGE_ON.store(true, Ordering::Relaxed);
+    lplus_ipc::live::mark_bridge_on();
     let mut handle: Option<gpui::WindowHandle<LivePreview>> = None;
     let bridge_task = cx.spawn(async move |cx| {
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(16))
                 .await;
-            if REQUESTED.swap(false, Ordering::Relaxed) && handle.is_none() {
+            if lplus_ipc::live::take_request() && handle.is_none() {
                 handle = match cx.open_window(LivePreview::window_options(), |_window, app_cx| {
                     app_cx.new(|_cx| LivePreview::new())
                 }) {
@@ -147,10 +122,12 @@ pub fn start_bridge(cx: &mut App) {
                 WINDOW_OPENED.store(handle.is_some(), Ordering::Relaxed);
             }
             // Only consume once a window exists to show the frame; until
-            // then the slot keeps the newest frame (overwrites, no backlog).
+            // then the bus slot keeps the newest frame (overwrites, no
+            // backlog).
             if let Some(h) = handle.as_mut()
-                && let Some(image) = FRAME.lock().ok().and_then(|mut s| s.take())
+                && let Some(pixels) = lplus_ipc::live::take_frame()
             {
+                let image = render_image(pixels);
                 let _ = h.update(cx, |view, _window, cx| {
                     view.image = Some(image);
                     cx.notify();
@@ -167,43 +144,46 @@ pub fn start_bridge(cx: &mut App) {
     retain_task(bridge_task);
 }
 
-/// Total frames handed to the bridge (test observation for the lane).
-#[cfg(test)]
-pub(crate) fn produced_frames() -> usize {
-    PRODUCED.load(Ordering::Relaxed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestApp;
     use image::Rgba;
 
-    fn test_frame() -> std::sync::Arc<RenderImage> {
-        let pixels = RgbaImage::from_pixel(2, 3, Rgba([10, 20, 30, 255]));
-        render_image(pixels)
+    fn test_pixels() -> RgbaImage {
+        RgbaImage::from_pixel(2, 3, Rgba([10, 20, 30, 255]))
     }
 
     #[test]
     fn bridge_request_semantics_and_frame_apply() {
         let mut app = TestApp::new();
         STOP.store(false, Ordering::Relaxed);
-        REQUESTED.store(false, Ordering::Relaxed);
         WINDOW_OPENED.store(false, Ordering::Relaxed);
         APPLIED.store(0, Ordering::Relaxed);
-        BRIDGE_ON.store(false, Ordering::Relaxed);
-        assert!(!request_native(), "no bridge yet: lane must decline native");
+        // The bus is process-global: start from a drained slot.
+        while lplus_ipc::live::take_frame().is_some() {}
+        let _ = lplus_ipc::live::take_request();
         assert!(
-            !REQUESTED.load(Ordering::Relaxed),
+            !lplus_ipc::live::request_native(),
+            "no bridge yet: lane must decline native"
+        );
+        assert!(
+            !lplus_ipc::live::take_request(),
             "no latch without a bridge"
         );
         app.update(start_bridge);
-        assert!(request_native(), "bridge is up after start");
         assert!(
-            REQUESTED.load(Ordering::Relaxed),
+            lplus_ipc::live::request_native(),
+            "bridge is up after start"
+        );
+        assert!(
+            lplus_ipc::live::take_request(),
             "request latched for the loop"
         );
-        push_frame(test_frame());
+        // Re-latch for the loop itself (the assertion above consumed the
+        // first request before any virtual tick could fire).
+        lplus_ipc::live::request_native();
+        lplus_ipc::live::push_frame(test_pixels());
         STOP.store(true, Ordering::Relaxed);
         // Each tick: the timer fires, the loop applies the frame and opens
         // the window, then sees STOP and exits. Two cycles cover the

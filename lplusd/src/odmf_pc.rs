@@ -120,7 +120,7 @@ fn ensure_task() {
         let pc_ip: IpAddr = env_or("LPLUS_PC_IP", &crate::sdpd::default_vip())
             .parse()
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        let out_path = env_or("ODMF_VIDEO_OUT", "../capture/video_odmf.h265");
+        let out_path = env_or("ODMF_VIDEO_OUT", "../../capture/video_odmf.h265");
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 h.spawn(run(rx, pc_ip, rtp_port, out_path));
@@ -640,13 +640,11 @@ fn live_pref_from(value: Option<&str>) -> LivePref {
 
 fn open_sink(out_path: &str) -> FrameSink {
     let pref = live_pref();
-    if pref == LivePref::Native {
-        #[cfg(feature = "gui")]
-        if crate::ui::live::request_native()
-            && let Some(n) = spawn_native()
-        {
-            return n;
-        }
+    if pref == LivePref::Native
+        && lplus_ipc::live::request_native()
+        && let Some(n) = spawn_native()
+    {
+        return n;
     }
     if pref != LivePref::Off {
         if let Some(player) = spawn_player() {
@@ -659,7 +657,6 @@ fn open_sink(out_path: &str) -> FrameSink {
 
 /// ffmpeg invocation: raw Annex-B H.265 on stdin → JPEG frames on stdout,
 /// buffering/analysis disabled for lowest practical latency.
-#[cfg(feature = "gui")]
 fn native_args() -> Vec<&'static str> {
     vec![
         "-loglevel",
@@ -690,7 +687,6 @@ fn native_args() -> Vec<&'static str> {
 /// stream as RGBA images. Entropy-coded JPEG data may itself contain
 /// `FFD9` byte pairs, so candidate ends are accepted only when the slice
 /// actually decodes; any trailing partial frame stays in `buf`.
-#[cfg(feature = "gui")]
 fn extract_preview_frames(buf: &mut Vec<u8>) -> Vec<image::RgbaImage> {
     const SOI: [u8; 2] = [0xff, 0xd8];
     const EOI: [u8; 2] = [0xff, 0xd9];
@@ -739,7 +735,6 @@ fn extract_preview_frames(buf: &mut Vec<u8>) -> Vec<image::RgbaImage> {
     }
 }
 
-#[cfg(feature = "gui")]
 fn spawn_native() -> Option<FrameSink> {
     let prog = env_or("ODMF_FFMPEG", "ffmpeg");
     let mut child = match Command::new(&prog)
@@ -771,7 +766,7 @@ fn spawn_native() -> Option<FrameSink> {
                     Ok(n) => {
                         buf.extend_from_slice(&chunk[..n]);
                         for rgba in extract_preview_frames(&mut buf) {
-                            crate::ui::live::push_frame(crate::ui::live::render_image(rgba));
+                            lplus_ipc::live::push_frame(rgba);
                         }
                     }
                     Err(e) => {
@@ -917,14 +912,14 @@ fn offer_or_resend(
 #[cfg(test)]
 mod tests {
     /// Opt-in live smoke: run with `ODMF_LIVE=1` and a real
-    /// `../capture/video_odmf.h265` present; asserts the player sink
+    /// `../../capture/video_odmf.h265` present; asserts the player sink
     /// spawns and accepts access-unit bytes. Skips otherwise.
     #[test]
     fn live_sink_accepts_real_access_units() {
         if std::env::var("ODMF_LIVE").is_err() {
             return;
         }
-        let Ok(bytes) = std::fs::read("../capture/video_odmf.h265") else {
+        let Ok(bytes) = std::fs::read("../../capture/video_odmf.h265") else {
             return;
         };
         let mut sink = open_sink("/tmp/lplus-live-verify.h265");
@@ -938,13 +933,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "gui")]
     #[test]
     fn native_decoder_pipeline_yields_frames() {
         // Exercises the real chain: Annex-B bytes → ffmpeg → jpeg splitter
         // → image decode → bridge slot. Needs the recorded dump; skipped
         // without it or without a spawnable ffmpeg.
-        let Ok(bytes) = std::fs::read("../capture/video_odmf.h265") else {
+        let Ok(bytes) = std::fs::read("../../capture/video_odmf.h265") else {
             return;
         };
         let Some(mut sink) = spawn_native() else {
@@ -960,7 +954,7 @@ mod tests {
             eprintln!("capture shorter than probe window; skipping");
             return;
         }
-        let before = crate::ui::live::produced_frames();
+        let before = lplus_ipc::live::produced();
         for chunk in bytes[START..START + (8 << 20)].chunks(1 << 20) {
             sink.write(chunk);
         }
@@ -972,11 +966,11 @@ mod tests {
         // hang guard, not the expected runtime.
         drop(sink);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while crate::ui::live::produced_frames() == before && std::time::Instant::now() < deadline {
+        while lplus_ipc::live::produced() == before && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(
-            crate::ui::live::produced_frames() > before,
+            lplus_ipc::live::produced() > before,
             "decoder produced no frames from real stream bytes"
         );
     }
@@ -992,7 +986,6 @@ mod tests {
         assert_eq!(live_pref_from(Some("gpui")), LivePref::Native);
     }
 
-    #[cfg(feature = "gui")]
     #[test]
     fn preview_frame_extractor_handles_partials_and_junk() {
         use image::ImageBuffer;

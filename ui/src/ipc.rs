@@ -1,29 +1,30 @@
 //! IPC seam for the GPUI port.
 //!
 //! The vendor renderer talked to Electron main through `IpcService`/
-//! `ipcManager` channels; the backend answers the same channel
-//! names in `src/gui/ipc.rs`. `Ipc` dispatches into that backend; with no
-//! backend every channel keeps the vendor contract — `{ok:false,
-//! __unhandled:"<channel>"}` — and is recorded in an audit ring exposed as
-//! `ipc_registry` (same ring idea as the real backend). Test builds also
-//! compile a stateful mock main (`MockMain`) that answers the served
-//! channels with the identical `{ok:true,…}` contract, so the UI suite runs
-//! without a phone or daemon.
+//! `ipcManager` channels; the daemon answers the same channel names via
+//! the `lplus_ipc` contract (Direct dispatcher / length-prefixed prost frames).
+//! `Ipc` dispatches into that backend; with no backend every channel keeps
+//! the vendor contract — `{ok:false, __unhandled:"<channel>"}` — and is
+//! recorded in an audit ring exposed as `ipc_registry` (same ring idea as
+//! the real backend). Test builds also compile a stateful mock main
+//! (`MockMain`) that answers the served channels with the identical
+//! `{ok:true,…}` contract, so the UI suite runs without a phone or daemon.
 
 use std::collections::VecDeque;
 use std::str::FromStr;
 
 #[cfg(test)]
 use base64::{Engine as _, engine::general_purpose};
+use prost::Message as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-#[cfg(test)]
-use serde_json::json;
+use serde_json::{Value, json};
 use strum::{Display, EnumIter, EnumString};
 
-use crate::gui::api::{self, ConnectAck, DeviceRow};
-use crate::ui::stores::connection::Device;
+use lplus_ipc::api::{self, ConnectAck};
+use lplus_ipc::pb;
+
+use crate::stores::connection::Device;
 
 /// Every IPC channel the ported UI invokes. `Display`/`FromStr` (strum)
 /// carry the vendor wire names — the same ones the Electron renderer sends
@@ -48,7 +49,6 @@ pub enum Channel {
     SettingsGetHostName,
     SettingsSetHostName,
     LplusStatus,
-    ReplExec,
     UploadDownloadList,
     IpcRegistry,
     // Dialog QR pairing payload: backend not wired yet, mock serves the
@@ -188,13 +188,6 @@ struct MockHostName {
 
 #[cfg(test)]
 #[derive(Serialize)]
-struct MockRepl {
-    ok: bool,
-    out: String,
-}
-
-#[cfg(test)]
-#[derive(Serialize)]
 struct MockCastPush {
     ok: bool,
     key: Value,
@@ -319,8 +312,6 @@ impl MockMain {
             Channel::LplusStatus => mock_wire(&api::LplusStatus {
                 ok: true,
                 backend_up: true,
-                repl_port: crate::gui::cast::DEFAULT_REPL_PORT,
-                repl_enabled: true,
                 kms_listening: true,
                 odmf: api::OdmfInfo {
                     enabled: true,
@@ -343,13 +334,6 @@ impl MockMain {
                     target: String::new(),
                 },
             }),
-            Channel::ReplExec => {
-                let parsed: api::ReplArgs = serde_json::from_value(args).unwrap_or_default();
-                mock_wire(&MockRepl {
-                    ok: true,
-                    out: format!("(mock) {:?}", parsed.line),
-                })
-            }
             Channel::UploadDownloadList => mock_wire(&api::UploadDownloadList {
                 ok: Some(true),
                 items: Some(Vec::new()),
@@ -481,71 +465,107 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-/// Loopback `POST /__ipc` client for the linux-client GUI server
-/// (`src/gui/server.rs` + `src/gui/ipc.rs` in the backend crate). Hand-rolled
-/// HTTP/1.1 (`Connection: close`, read to EOF) on purpose: a local pipe does
-/// not justify an http dependency, and the reply is the same `{ok,…}` JSON
-/// the mock answers with.
+/// Loopback contract client for a running daemon (`daemon/src/gui/server.rs`).
+/// One connection per call: a 4-byte big-endian length and the prost
+/// `Request` go out, the matching `Response` frame comes back — decoded
+/// replies become the same `{ok,…}` JSON the mock answers with. Same
+/// framing as the phone lanes; no http anywhere.
 #[derive(Debug, Clone, Copy)]
-pub struct HttpBackend {
+pub struct RpcBackend {
     pub addr: SocketAddr,
 }
 
-/// `POST /__ipc` request envelope (`{cmd,args}`), typed both directions
-/// of the client edge.
-#[derive(Serialize)]
-struct IpcEnvelope<'a, A: Serialize + ?Sized> {
-    cmd: &'a str,
-    args: &'a A,
+/// String arg extraction for the typed `/rpc` arms (absent key = empty).
+fn arg_str(args: &Value, key: &str) -> String {
+    args.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
-impl HttpBackend {
+impl RpcBackend {
+    /// Typed-channel edge: control verbs use their prost arms (keying on
+    /// the same arg fields the daemon lanes read), everything else rides
+    /// `InvokeCall` — method name + JSON args, the vendor passthrough.
     fn post(&self, channel: &str, args: &Value) -> std::io::Result<Value> {
-        let direct = self.post_raw(&IpcEnvelope { cmd: channel, args })?;
-        if direct.get("__unhandled").is_some() {
-            // Vendor renderer channels live under the backend's `ipc_invoke`
-            // registry; a direct miss has no side effects, so one retry is
-            // safe (managed cmds like odmf_start answer directly, once).
-            let via = self.post_raw(&IpcEnvelope {
-                cmd: "ipc_invoke",
-                args: &api::IpcInvokeArgs {
-                    channel: channel.to_string(),
-                    payload: args.clone(),
-                },
-            })?;
-            if via.get("__unhandled").is_none() {
-                return Ok(via);
+        let call = match channel {
+            "connect_device" => pb::request::Call::Connect(pb::ConnectCmd {
+                ip: arg_str(args, "ip"),
+            }),
+            "disconnect_device" => pb::request::Call::Disconnect(pb::DisconnectCmd {
+                ip: arg_str(args, "ip"),
+            }),
+            "generic_agent_settings_remove_device" => {
+                pb::request::Call::RemoveDevice(pb::RemoveDeviceCmd {
+                    device_id: args
+                        .get("device_id")
+                        .or_else(|| args.get("deviceId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
             }
-        }
-        Ok(direct)
+            _ => pb::request::Call::Invoke(pb::InvokeCall {
+                method: channel.to_string(),
+                payload: serde_json::to_vec(args)
+                    .map_err(|e| std::io::Error::other(format!("bad args: {e}")))?,
+            }),
+        };
+        self.rpc(pb::Request { call: Some(call) })
     }
 
-    fn post_raw<T: Serialize>(&self, body_json: &T) -> std::io::Result<Value> {
-        let body = serde_json::to_string(body_json)
-            .map_err(|e| std::io::Error::other(format!("bad request: {e}")))?;
-        let req = format!(
-            "POST /__ipc HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            self.addr,
-            body.len()
-        );
+    /// Presence tick: drain the daemon's element-click queue.
+    fn poll_clicks(&self) -> std::io::Result<Vec<String>> {
+        let req = pb::Request {
+            call: Some(pb::request::Call::PollClicks(pb::PollClicks {})),
+        };
+        let v = self.rpc(req)?;
+        Ok(v.get("ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn rpc(&self, req: pb::Request) -> std::io::Result<Value> {
+        let body = req.encode_to_vec();
         let mut s = TcpStream::connect_timeout(&self.addr, Duration::from_millis(400))
             .map_err(|e| std::io::Error::other(format!("connect {}: {e}", self.addr)))?;
         s.set_write_timeout(Some(Duration::from_millis(750)))?;
         s.set_read_timeout(Some(Duration::from_millis(1500)))?;
-        s.write_all(req.as_bytes())?;
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        s.write_all(&frame)?;
         s.flush()?;
-        let mut buf = Vec::new();
-        s.read_to_end(&mut buf)?;
-        let head = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| std::io::Error::other("no http head"))?;
-        if !buf[..head].starts_with(b"HTTP/1.1 200") {
-            return Err(std::io::Error::other("http status not 200"));
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head)
+            .map_err(|e| std::io::Error::other(format!("read reply head: {e}")))?;
+        let len = u32::from_be_bytes(head) as usize;
+        if len > 4 * 1024 * 1024 {
+            return Err(std::io::Error::other(format!(
+                "reply frame too large: {len}"
+            )));
         }
-        serde_json::from_slice(&buf[head + 4..])
-            .map_err(|e| std::io::Error::other(format!("bad json: {e}")))
+        let mut payload = vec![0u8; len];
+        s.read_exact(&mut payload)
+            .map_err(|e| std::io::Error::other(format!("read reply body: {e}")))?;
+        let resp = pb::Response::decode(&payload[..])
+            .map_err(|e| std::io::Error::other(format!("bad rpc reply: {e}")))?;
+        match resp.res {
+            Some(pb::response::Res::Ack(ack)) => serde_json::to_value(ack)
+                .map_err(|e| std::io::Error::other(format!("bad ack: {e}"))),
+            Some(pb::response::Res::Clicks(clicks)) => serde_json::to_value(clicks)
+                .map_err(|e| std::io::Error::other(format!("bad clicks: {e}"))),
+            Some(pb::response::Res::InvokeResult(r)) => serde_json::from_slice(&r.json)
+                .map_err(|e| std::io::Error::other(format!("bad invoke json: {e}"))),
+            Some(pb::response::Res::Error(e)) => Ok(json!({ "ok": false, "error": e.message })),
+            None => Err(std::io::Error::other("empty rpc response")),
+        }
     }
 }
 
@@ -555,21 +575,27 @@ const DEFAULT_BACKEND_ADDR: &str = "127.0.0.1:1421";
 /// Backend a live `Ipc` dispatches into before falling back to the mock.
 #[derive(Debug)]
 enum Transport {
-    Http(HttpBackend),
-    /// Same-process daemon (merged binary): call `gui::ipc::dispatch`
-    /// directly — shared state, same `{cmd,args}` → `{ok,…}` contract,
-    /// same `ipc_invoke` escalation for vendor renderer channels.
+    Remote(RpcBackend),
+    /// Same-process daemon (merged binary): call the dispatcher the daemon
+    /// registered via [`lplus_ipc::install_dispatcher`] — shared state,
+    /// same `{name,args}` → `{ok,…}` contract, same `ipc_invoke` escalation
+    /// for vendor renderer channels.
     Direct,
 }
 
 impl Transport {
     fn post(&self, channel: &str, args: &Value) -> std::io::Result<Value> {
         match self {
-            Self::Http(b) => b.post(channel, args),
+            Self::Remote(b) => b.post(channel, args),
             Self::Direct => {
-                let direct = crate::gui::ipc::dispatch(channel, args.clone());
+                // No dispatcher registered at all (window is Attach-only):
+                // keep the vendor unhandled contract so the caller falls
+                // back and the audit entry stays recorded.
+                let Some(direct) = lplus_ipc::dispatch(channel, args.clone()) else {
+                    return Ok(unhandled(channel));
+                };
                 if direct.get("__unhandled").is_some() {
-                    let via = crate::gui::ipc::dispatch(
+                    let via = lplus_ipc::dispatch(
                         "ipc_invoke",
                         serde_json::to_value(api::IpcInvokeArgs {
                             channel: channel.to_string(),
@@ -577,7 +603,7 @@ impl Transport {
                         })
                         .expect("typed invoke args"),
                     );
-                    if via.get("__unhandled").is_none() {
+                    if let Some(via) = via.filter(|v| v.get("__unhandled").is_none()) {
                         return Ok(via);
                     }
                 }
@@ -588,12 +614,17 @@ impl Transport {
 
     fn addr(&self) -> SocketAddr {
         match self {
-            Self::Http(b) => b.addr,
+            Self::Remote(b) => b.addr,
             Self::Direct => DEFAULT_BACKEND_ADDR
                 .parse()
                 .unwrap_or_else(|_| "127.0.0.1:0".parse().expect("static")),
         }
     }
+}
+
+/// The vendor unhandled contract as a `Value` (serialisation never fails).
+fn unhandled(channel: &str) -> Value {
+    serde_json::to_value(api::Unhandled::new(channel)).expect("unhandled is serializable")
 }
 
 /// `LPLUS_BACKEND` spellings that mean "no backend" (case-insensitive).
@@ -681,8 +712,8 @@ impl Ipc {
         Self::detached()
     }
 
-    pub fn http(addr: SocketAddr) -> Self {
-        Self::with_backend(Some(Transport::Http(HttpBackend { addr })), "backend")
+    pub fn served(addr: SocketAddr) -> Self {
+        Self::with_backend(Some(Transport::Remote(RpcBackend { addr })), "backend")
     }
 
     /// Merged-binary transport: dispatch straight into the in-process
@@ -709,7 +740,7 @@ impl Ipc {
     fn from_spec(default_backend: bool) -> Self {
         let spec = std::env::var("LPLUS_BACKEND").unwrap_or_default();
         match ipc_spec(spec.trim(), default_backend) {
-            Some(addr) => Self::http(addr),
+            Some(addr) => Self::served(addr),
             None => Self::fallback(),
         }
     }
@@ -725,6 +756,29 @@ impl Ipc {
             Ok(channel) => self.invoke(channel, args),
             Err(_) => self.dispatch(name, args),
         }
+    }
+
+    /// Drain the element-click queue (presence tick; see
+    /// `AppState::drain_ui_clicks`). Direct shares the process-global
+    /// `lplus_ipc` queue; served mode polls `/rpc` (`PollClicks`); with no
+    /// healthy backend (mock filler) the same process queue stays the
+    /// test injection point.
+    pub fn take_ui_clicks(&mut self) -> Vec<String> {
+        let polled = match self.backend.as_ref() {
+            Some(Transport::Remote(backend)) if !self.backend_down => Some(backend.poll_clicks()),
+            _ => None,
+        };
+        if let Some(result) = polled {
+            return match result {
+                Ok(ids) => ids,
+                Err(e) => {
+                    self.backend_down = true;
+                    self.record(&format!("backend-down:{e}"));
+                    Vec::new()
+                }
+            };
+        }
+        lplus_ipc::take_ui_clicks()
     }
 
     fn dispatch(&mut self, channel: &str, args: Value) -> Value {
@@ -758,7 +812,7 @@ impl Ipc {
             // contract and audit it for the audit page / probe.
             self.last_served = "none";
             self.record(&format!("unhandled-invoke:{channel}"));
-            serde_json::to_value(api::Unhandled::new(channel)).expect("unhandled is serializable")
+            unhandled(channel)
         }
     }
 
@@ -847,23 +901,6 @@ struct RemoveOutcome {
     unhandled: Option<String>,
 }
 
-fn rows_to_devices(rows: Vec<DeviceRow>) -> Vec<Device> {
-    rows.into_iter()
-        .map(|r| Device {
-            device_id: r.device_id,
-            device_name: r.device_name,
-            ip: r.ip,
-            is_connected: r.is_connected,
-            is_discovered: r.is_discovered,
-            is_paired: r.is_paired,
-            connect_type: r.connect_type,
-            device_type: r.device_type,
-            // Daemon rows carry no battery reading yet.
-            battery: None,
-        })
-        .collect()
-}
-
 /// The service surface `AppState` calls. Implementing it as a trait keeps
 /// the mock/daemon contract compile-checked: any second impl (test fakes)
 /// must cover every method.
@@ -891,10 +928,11 @@ pub trait ConnectApi {
 }
 
 impl ConnectApi for Ipc {
+    // Device lists always go through the channel contract: in Direct mode
+    // `Transport::Direct::post` is the daemon dispatcher the merged binary
+    // installed, so the row JSON comes from the same state the `/rpc`
+    // server answers — no daemon types are named here.
     fn connected_devices(&mut self) -> Option<Vec<Device>> {
-        if self.using_direct() {
-            return Some(rows_to_devices(api::connected_devices()));
-        }
         self.invoke_typed::<DevicesWire>(Channel::ConnectedDeviceInfoList, &api::NoArgs {})
             .map(|w| match w {
                 DevicesWire::Bare(d) | DevicesWire::Wrapped { devices: d } => d,
@@ -902,9 +940,6 @@ impl ConnectApi for Ipc {
     }
 
     fn paired_devices(&mut self) -> Option<Vec<Device>> {
-        if self.using_direct() {
-            return Some(rows_to_devices(api::paired_devices().devices));
-        }
         self.invoke_typed::<DevicesWire>(Channel::GenericAgentGetPairedDevices, &api::NoArgs {})
             .map(|w| match w {
                 DevicesWire::Bare(d) | DevicesWire::Wrapped { devices: d } => d,
@@ -912,9 +947,6 @@ impl ConnectApi for Ipc {
     }
 
     fn found_devices(&mut self) -> Option<Vec<Device>> {
-        if self.using_direct() {
-            return Some(rows_to_devices(api::device_found_list().devices));
-        }
         self.invoke_typed::<DevicesWire>(Channel::DeviceFoundList, &api::NoArgs {})
             .map(|w| match w {
                 DevicesWire::Bare(d) | DevicesWire::Wrapped { devices: d } => d,
@@ -953,9 +985,6 @@ impl ConnectApi for Ipc {
             device_id: device_id.to_string(),
             remove_state_dir: true,
         };
-        if self.using_direct() {
-            return api::remove_device(&args).ok;
-        }
         match self.invoke_typed::<RemoveOutcome>(Channel::GenericAgentSettingsRemoveDevice, &args) {
             Some(o) => o.unhandled.is_some() || o.ok == Some(true),
             None => true,
@@ -963,15 +992,6 @@ impl ConnectApi for Ipc {
     }
 
     fn connect(&mut self, device_id: &str, ip: &str) -> ConnectAck {
-        if self.using_direct() {
-            let a = api::device_action(true, ip);
-            return ConnectAck {
-                ok: a.ok,
-                ip: (!a.ip.is_empty()).then_some(a.ip),
-                error: a.error,
-                code_success: None,
-            };
-        }
         let args = api::ConnectArgs {
             device_id: device_id.to_string(),
             ip: ip.to_string(),
@@ -986,15 +1006,6 @@ impl ConnectApi for Ipc {
     }
 
     fn disconnect(&mut self, device_id: &str, ip: &str) -> ConnectAck {
-        if self.using_direct() {
-            let a = api::device_action(false, ip);
-            return ConnectAck {
-                ok: a.ok,
-                ip: (!a.ip.is_empty()).then_some(a.ip),
-                error: a.error,
-                code_success: None,
-            };
-        }
         let args = api::ConnectArgs {
             device_id: device_id.to_string(),
             ip: ip.to_string(),
@@ -1010,8 +1021,13 @@ impl ConnectApi for Ipc {
 
     fn odmf_start(&mut self) -> Option<String> {
         if self.using_direct() {
-            let r = crate::gui::cast::odmf_start();
-            return r.ok.then_some(r.listen).flatten();
+            // Merged binary: ask the installed dispatcher to start the
+            // ODMF sink and parse its `{ok, listen}` report.
+            let r = lplus_ipc::dispatch("odmf_start", Value::Null)?;
+            let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            return ok
+                .then(|| r.get("listen").and_then(Value::as_str).map(str::to_string))
+                .flatten();
         }
         let r = self.invoke_typed::<api::OdmfStartResp>(Channel::OdmfStart, &api::NoArgs {})?;
         r.ok.then_some(r.listen).flatten()
@@ -1042,9 +1058,6 @@ impl ConnectApi for Ipc {
     }
 
     fn host_name(&mut self) -> Option<String> {
-        if self.using_direct() {
-            return Some(api::host_name().host_name);
-        }
         self.invoke_typed::<HostNameWire>(Channel::SettingsGetHostName, &api::NoArgs {})
             .map(|w| match w {
                 HostNameWire::Bare(s) => s,
@@ -1053,9 +1066,6 @@ impl ConnectApi for Ipc {
     }
 
     fn set_host_name(&mut self, name: &str) -> bool {
-        if self.using_direct() {
-            return api::set_host_name(name).is_ok();
-        }
         // One typed arg type; the daemon reads `name`, the mock `hostName`
         // — the alias on `SetHostNameArgs` binds both.
         let args = api::SetHostNameArgs {
@@ -1084,9 +1094,9 @@ mod tests {
 
     #[test]
     fn typed_host_name_accepts_daemon_and_mock_shapes() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![("settings_get_host_name", json!("desk-1"))]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         assert_eq!(ipc.host_name().as_deref(), Some("desk-1"));
 
         let mut mock = Ipc::mock_only();
@@ -1095,14 +1105,14 @@ mod tests {
 
     #[test]
     fn typed_set_host_name_requires_ok_and_falls_back() {
-        use crate::ui::ipc::http_tests::stub_backend;
+        use crate::ipc::rpc_tests::stub_backend;
         let addr = stub_backend(vec![("settings_set_host_name", json!({ "ok": true }))]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         assert!(ipc.set_host_name("desk-2"));
         assert_eq!(ipc.last_served(), "backend");
 
         let addr = stub_backend(vec![("settings_set_host_name", json!({ "ok": false }))]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         assert!(
             !ipc.set_host_name("desk-2"),
             "ok=false must be a typed false"
@@ -1110,7 +1120,7 @@ mod tests {
 
         // No stubbed reply: the mock answers the same typed call.
         let addr = stub_backend(vec![]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         assert!(ipc.set_host_name("desk-2"));
         assert_eq!(ipc.last_served(), "mock");
     }
@@ -1277,10 +1287,12 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) mod http_tests {
-    use super::{Channel, ConnectApi, HttpBackend, Ipc, SocketAddr, ipc_spec};
+pub(crate) mod rpc_tests {
+    use super::{Channel, ConnectApi, Ipc, RpcBackend, SocketAddr, ipc_spec};
+    use lplus_ipc::pb;
+    use prost::Message as _;
     use serde_json::{Value, json};
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufReader, Read, Write};
     use std::net::TcpListener;
 
     #[test]
@@ -1300,80 +1312,110 @@ pub(crate) mod http_tests {
         assert_eq!(ipc_spec("garbage", true), None);
     }
 
-    /// Loopback stub of the backend `POST /__ipc` seam: answers canned
-    /// replies per registry key, mirrors `dispatch_device`'s `ip` keying,
-    /// and reports every other channel `__unhandled` — exactly the
-    /// behaviour mix the hybrid dispatcher must survive.
+    /// Wrap a JSON reply as the `InvokeResult` arm (dispatcher answers).
+    fn invoke_result(v: Value) -> pb::response::Res {
+        pb::response::Res::InvokeResult(pb::InvokeResult {
+            json: serde_json::to_vec(&v).unwrap(),
+        })
+    }
+
+    /// Vendor unhandled contract, carried as dispatcher JSON so the client
+    /// still records `backend-unhandled:<channel>` and falls back.
+    fn unhandled_reply(channel: &str) -> pb::response::Res {
+        invoke_result(json!({ "ok": false, "__unhandled": channel }))
+    }
+
+    /// Connect/Disconnect stub lane: a canned reply wins; otherwise ack as
+    /// queued, keying on `ip` exactly like the daemon's `dispatch_device`.
+    fn keyed_action(canned: Option<Value>, ip: String) -> pb::response::Res {
+        match canned {
+            Some(v) => invoke_result(v),
+            None => {
+                let missing = ip.is_empty();
+                pb::response::Res::Ack(pb::Ack {
+                    ok: !missing,
+                    ip: Some(ip),
+                    error: if missing {
+                        Some("missing ip".into())
+                    } else {
+                        None
+                    },
+                    code_success: None,
+                })
+            }
+        }
+    }
+
+    /// Loopback stub of the backend contract server: decodes the prost
+    /// `Request`, answers canned replies per registry key, mirrors
+    /// `dispatch_device`'s `ip` keying on the typed Connect/Disconnect
+    /// arms, and reports every other channel unhandled — exactly the
+    /// behaviour mix the hybrid dispatcher must survive. Canned keys keep
+    /// addressing the two daemon registries like the pre-frame stub:
+    /// vendor renderer channels under `via:<channel>` (the `ipc_invoke`
+    /// registry), managed cmds under their bare name.
     pub(crate) fn stub_backend(replies: Vec<(&'static str, Value)>) -> SocketAddr {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         std::thread::spawn(move || {
+            let canned = |key: &str| {
+                replies
+                    .iter()
+                    .find(|(c, _)| *c == key)
+                    .map(|(_, v)| v.clone())
+            };
             loop {
                 let Ok((mut stream, _)) = l.accept() else {
                     break;
                 };
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line);
-                let mut len = 0usize;
-                loop {
-                    let mut h = String::new();
-                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
-                        break;
-                    }
-                    if let Some(v) = h.strip_prefix("Content-Length: ") {
-                        len = v.trim().parse().unwrap_or(0);
-                    }
+                let mut head = [0u8; 4];
+                if reader.read_exact(&mut head).is_err() {
+                    continue;
                 }
-                let mut body = vec![0u8; len];
-                let _ = reader.read_exact(&mut body);
-                let parsed = serde_json::from_slice::<Value>(&body).ok();
-                let cmd = parsed
-                    .as_ref()
-                    .and_then(|v| v.get("cmd").and_then(Value::as_str).map(str::to_string))
-                    .unwrap_or_default();
-                // Mirror the backend's two registries: top-level managed cmds
-                // and the `ipc_invoke` vendor-channel registry.
-                let key = if cmd == "ipc_invoke" {
-                    let inner = parsed
-                        .as_ref()
-                        .and_then(|v| v.get("args")?.get("channel")?.as_str().map(str::to_string))
-                        .unwrap_or_default();
-                    format!("via:{inner}")
-                } else {
-                    cmd
-                };
-                // Mirror the backend's `dispatch_device` exactly: vendor
-                // Connect/Disconnect key on payload.ip and ack as queued.
-                let reply = match key.as_str() {
-                    "via:connect_device" | "via:disconnect_device" => {
-                        let ip = parsed
-                            .as_ref()
-                            .and_then(|v| {
-                                v.get("args")?
-                                    .get("payload")?
-                                    .get("ip")?
-                                    .as_str()
-                                    .map(str::to_string)
-                            })
-                            .unwrap_or_default();
-                        json!({
-                            "ok": !ip.is_empty(),
-                            "ip": ip,
-                            "error": if ip.is_empty() { json!("missing ip") } else { Value::Null },
-                        })
+                let mut body = vec![0u8; u32::from_be_bytes(head) as usize];
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let res = match pb::Request::decode(&body[..]).ok().and_then(|r| r.call) {
+                    Some(pb::request::Call::Connect(c)) => {
+                        keyed_action(canned("connect_device"), c.ip)
                     }
-                    _ => replies
-                        .iter()
-                        .find(|(c, _)| *c == key)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_else(|| json!({ "ok": false, "__unhandled": key })),
+                    Some(pb::request::Call::Disconnect(c)) => {
+                        keyed_action(canned("disconnect_device"), c.ip)
+                    }
+                    Some(pb::request::Call::RemoveDevice(_)) => {
+                        canned("generic_agent_settings_remove_device")
+                            .map(invoke_result)
+                            .unwrap_or_else(|| {
+                                unhandled_reply("generic_agent_settings_remove_device")
+                            })
+                    }
+                    // The click push lane is daemon→ui; the stub just acks.
+                    Some(pb::request::Call::Click(_)) => pb::response::Res::Ack(pb::Ack {
+                        ok: true,
+                        ip: None,
+                        error: None,
+                        code_success: None,
+                    }),
+                    Some(pb::request::Call::PollClicks(_)) => {
+                        pb::response::Res::Clicks(pb::Clicks { ids: Vec::new() })
+                    }
+                    Some(pb::request::Call::Invoke(call)) => {
+                        let via = format!("via:{}", call.method);
+                        canned(&via)
+                            .or_else(|| canned(&call.method))
+                            .map(invoke_result)
+                            .unwrap_or_else(|| unhandled_reply(&call.method))
+                    }
+                    None => pb::response::Res::Error(pb::Error {
+                        message: "empty request".into(),
+                    }),
                 };
-                let payload = serde_json::to_vec(&reply).unwrap();
-                let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                                Connection: close\r\n\r\n"
-                    .to_vec();
-                out.extend(payload);
+                let payload = pb::Response { res: Some(res) }.encode_to_vec();
+                let mut out = Vec::with_capacity(4 + payload.len());
+                out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                out.extend_from_slice(&payload);
                 let _ = stream.write_all(&out);
             }
         });
@@ -1386,7 +1428,7 @@ pub(crate) mod http_tests {
             "lplus_status",
             json!({ "ok": true, "backend_up": true, "real": true }),
         )]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         let v = ipc.invoke(Channel::LplusStatus, Value::Null);
         assert_eq!(v["real"], json!(true), "must come from the backend");
         assert!(
@@ -1400,7 +1442,7 @@ pub(crate) mod http_tests {
     #[test]
     fn connect_device_keys_on_ip_like_the_backend_contract() {
         let addr = stub_backend(vec![]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         // Vendor Connect/Disconnect are handled by the backend, so the
         // "missing ip" failure must surface from the backend, not be
         // papered over by the mock.
@@ -1422,7 +1464,7 @@ pub(crate) mod http_tests {
             "via:device_found_list",
             json!({ "ok": true, "devices": [{ "deviceName": "RealPhone" }] }),
         )]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         let v = ipc.invoke(Channel::DeviceFoundList, Value::Null);
         assert_eq!(v["devices"][0]["deviceName"], json!("RealPhone"));
         assert!(
@@ -1435,7 +1477,7 @@ pub(crate) mod http_tests {
     #[test]
     fn unhandled_on_backend_falls_back_to_mock() {
         let addr = stub_backend(vec![]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         let v = ipc.invoke(Channel::DeviceFoundList, Value::Null);
         assert_eq!(v["devices"].as_array().unwrap().len(), 2, "mock filler");
         assert!(
@@ -1452,7 +1494,7 @@ pub(crate) mod http_tests {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap()
         };
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         let v = ipc.invoke(Channel::LplusStatus, Value::Null);
         assert_eq!(v["ok"], json!(true), "mock answers after the failure");
         assert!(ipc.audit().iter().any(|e| e.starts_with("backend-down:")));
@@ -1466,7 +1508,7 @@ pub(crate) mod http_tests {
             "get_current_connected_device_info_list",
             json!([{ "deviceId": "p1", "deviceName": "OnePlus 15", "isConnected": true }]),
         )]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         let d = ipc.connected_devices().expect("bare vendor array parses");
         assert_eq!(d[0].device_name, "OnePlus 15");
         assert!(d[0].is_connected);
@@ -1475,7 +1517,7 @@ pub(crate) mod http_tests {
             "generic_agent_get_paired_devices",
             json!({ "ok": true, "devices": [{ "deviceId": "m1" }] }),
         )]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         assert_eq!(ipc.paired_devices().map(|d| d.len()), Some(1));
     }
 
@@ -1484,14 +1526,14 @@ pub(crate) mod http_tests {
         // Neither lane serves cross_file_list: the typed parse refuses the
         // unhandled shape (ok=false), so the caller keeps its fallback.
         let addr = stub_backend(vec![]);
-        let mut ipc = Ipc::http(addr);
+        let mut ipc = Ipc::served(addr);
         assert!(ipc.crossfile("image").is_none());
     }
 
     #[test]
-    fn http_post_roundtrips_json() {
+    fn rpc_frame_roundtrips_json() {
         let addr = stub_backend(vec![("probe", json!({ "ok": true, "n": 7 }))]);
-        let b = HttpBackend { addr };
+        let b = RpcBackend { addr };
         let v = b.post("probe", &json!({ "x": 1 })).unwrap();
         assert_eq!(v["n"], json!(7));
     }

@@ -67,7 +67,6 @@ pub fn ksc_store_path() -> PathBuf {
     state_file("ksc.json", "ksc.json")
 }
 
-#[cfg(test)]
 /// Serializes process-env mutations across ALL test modules (edition-2024
 /// `set_var` is unsafe precisely because of concurrent env access; ksc
 /// tests in sdpd share this lock with the state tests).
@@ -75,17 +74,14 @@ pub fn ksc_store_path() -> PathBuf {
 pub(crate) static ENV_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(std::sync::Mutex::default);
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Serializes process-env mutations in this module (edition-2024
-    /// `set_var` is unsafe precisely because of concurrent env access).
-    // (shared lock lives at crate root as ENV_TEST_LOCK)
-
     #[expect(unsafe_code, reason = "serialized test-local env mutation")]
     fn set_env(key: &str, val: &str) {
-        // SAFETY: all writers of these keys hold ENV; no concurrent
-        // env mutation while this runs.
+        // SAFETY: all writers of these keys hold ENV_TEST_LOCK; no
+        // concurrent env mutation while this runs.
         unsafe { std::env::set_var(key, val) };
     }
 
