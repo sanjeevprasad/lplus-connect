@@ -9,7 +9,7 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
 use proto::rtsp::{
-    H264Depacketizer, PT_H264, RtspExt, RtspMethod, parse_rtp, parse_sdp, read_msg, request,
+    H264Depacketizer, PT_H264, RtpPacket, RtspExt, RtspMethod, parse_sdp, read_msg, request,
 };
 
 /// RTP data port the lane advertises when none is configured.
@@ -191,18 +191,22 @@ pub fn pump_rtp(
             }
         }
         let Ok(n) = udp.recv(&mut buf) else { continue };
-        let Some(hdr) = parse_rtp(&buf[..n]) else {
+        let Ok(hdr) = RtpPacket::parse(&buf[..n]) else {
             continue;
         };
-        if hdr.pt != PT_H264 {
+        if hdr.payload_type() != PT_H264 {
             continue;
         }
         st.pkts += 1;
-        if last_seq.is_some_and(|s| hdr.seq.wrapping_sub(s) > 100) {
-            tracing::info!("[rtp] seq jump {}→{}", last_seq.unwrap(), hdr.seq);
+        if last_seq.is_some_and(|s| hdr.sequence_number().wrapping_sub(s) > 100) {
+            tracing::info!(
+                "[rtp] seq jump {}→{}",
+                last_seq.unwrap(),
+                hdr.sequence_number()
+            );
         }
-        last_seq = Some(hdr.seq);
-        for au in dep.push(hdr.payload) {
+        last_seq = Some(hdr.sequence_number());
+        for au in dep.push(hdr.payload()) {
             st.nals += 1;
             st.bytes += au.len() as u64;
             for w in writers.iter_mut() {
@@ -216,8 +220,8 @@ pub fn pump_rtp(
                 st.pkts,
                 st.nals,
                 st.bytes,
-                hdr.seq,
-                hdr.pt
+                hdr.sequence_number(),
+                hdr.payload_type()
             );
             for w in writers.iter_mut() {
                 let _ = w.flush();

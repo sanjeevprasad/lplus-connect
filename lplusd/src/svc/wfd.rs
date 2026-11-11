@@ -926,7 +926,7 @@ impl H265Depacketizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::rtsp::{parse_rtp, request, request_with_body};
+    use proto::rtsp::{RtpPacket, request, request_with_body};
 
     /// Regression: reproduce Java `BtIdentityAuthHelper` (odmfi/odmfg::odmfb)
     /// exactly — raw 65-B uncompressed peer point, raw ECDH X as AES-256 key,
@@ -1322,6 +1322,6 @@ mod tests {
         assert!(rs[0].header("RTP-Info").unwrap().contains("seq=1"));
         // rtp payload helper sanity
         let p = rtp_payload(&[0x26, 0x01]);
-        assert_eq!(parse_rtp(&p).unwrap().pt, 96);
+        assert_eq!(RtpPacket::parse(&p).unwrap().payload_type(), 96);
     }
 }

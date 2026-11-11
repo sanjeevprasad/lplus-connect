@@ -27,6 +27,9 @@ prost       = { version = "0.14", default-features = false, features = ["derive"
 prost-build = { version = "0.14", default-features = false }
 prost-types = { version = "0.14", default-features = false, features = ["std"] }
 rtsp-types  = { version = "0.1", default-features = false }
+# RTP fixed-header codec (RFC 3550 §5.1): same author as rtsp-types;
+# OSV-clean, deps only smallvec + thiserror.
+rtp-types   = { version = "0.1", default-features = false }
 serde       = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json  = { version = "1", default-features = false, features = ["std"] }
 strum       = { version = "0.28", default-features = false, features = ["std", "derive"] }

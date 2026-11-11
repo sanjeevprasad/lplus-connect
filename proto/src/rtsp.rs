@@ -335,7 +335,8 @@ pub fn wfd_client_rtp_ports(rtp_port: u16) -> String {
     format!("RTP/AVP/UDP;unicast {rtp_port} 0 mode=play")
 }
 
-/// Fields parsed out of a `wfd_client_rtp_ports:` value.
+/// Fields parsed out of a `wfd_client_rtp_ports:` value; surfaced via
+/// [`SdpInfo::client_rtp_ports`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct RtpPorts {
     pub transport: String, // e.g. RTP/AVP/UDP
@@ -344,7 +345,7 @@ pub struct RtpPorts {
     pub mode: String,
 }
 
-pub fn parse_wfd_client_rtp_ports(v: &str) -> Result<RtpPorts> {
+fn parse_wfd_client_rtp_ports(v: &str) -> Result<RtpPorts> {
     // "RTP/AVP/UDP;unicast 15550 0 mode=play"
     let mut it = v.split_whitespace();
     let transport = it.next().unwrap_or_default().to_string();
@@ -414,54 +415,10 @@ pub fn parse_sdp(body: &str) -> SdpInfo {
 
 // ----------------------------------------------------------------- RTP ----
 
-/// Minimal fixed-header view of an RTP packet.
-#[derive(Debug, PartialEq, Eq)]
-pub struct RtpHdr<'a> {
-    pub pt: u8,
-    pub seq: u16,
-    pub ts: u32,
-    pub ssrc: u32,
-    pub payload: &'a [u8],
-}
-
-pub fn parse_rtp(buf: &[u8]) -> Option<RtpHdr<'_>> {
-    if buf.len() < 12 || buf[0] >> 6 != 2 {
-        return None;
-    }
-    let has_x = buf[0] & 0x10 != 0;
-    let has_p = buf[0] & 0x20 != 0;
-    let cc = (buf[0] & 0x0F) as usize;
-    let pt = buf[1] & 0x7F;
-    let seq = u16::from_be_bytes([buf[2], buf[3]]);
-    let ts = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    let mut off = 12 + 4 * cc;
-    if has_x {
-        if buf.len() < off + 4 {
-            return None;
-        }
-        let ext_len = u16::from_be_bytes([buf[off + 2], buf[off + 3]]) as usize * 4;
-        off += 4 + ext_len;
-    }
-    if off > buf.len() {
-        return None;
-    }
-    let mut end = buf.len();
-    if has_p {
-        let pad = *buf.last()? as usize;
-        if pad == 0 || off + pad > buf.len() {
-            return None;
-        }
-        end -= pad;
-    }
-    Some(RtpHdr {
-        pt,
-        seq,
-        ts,
-        ssrc,
-        payload: &buf[off..end],
-    })
-}
+/// RTP fixed-header codec (RFC 3550 §5.1): [`RtpPacket::parse`] validates
+/// the version, walks CSRC/extension and strips padding; the depacketizers
+/// below consume [`RtpPacket::payload`].
+pub use rtp_types::RtpPacket;
 
 /// H.264 RTP payload depacketizer (RFC 6184): single NAL, FU-A reassembly,
 /// STAP-A split. Emits Annex-B access units (start-code prefixed).
@@ -600,21 +557,22 @@ mod tests {
             0x80, PT_H264, 0x12, 0x34, 0, 0, 0x2c, 0, 0xde, 0xad, 0xbe, 0xef,
         ];
         pkt.extend_from_slice(&nalu(0x61, b"hi"));
-        let h = parse_rtp(&pkt).unwrap();
-        assert_eq!(h.seq, 0x1234);
-        assert_eq!(h.ssrc, 0xdead_beef);
-        assert_eq!(h.payload, &[0x61, b'h', b'i']);
+        let h = RtpPacket::parse(&pkt).unwrap();
+        assert_eq!(h.sequence_number(), 0x1234);
+        assert_eq!(h.ssrc(), 0xdead_beef);
+        assert_eq!(h.payload(), &[0x61, b'h', b'i']);
 
         // With extension + padding (CC=0; padding = 3 octets, count last).
+        // The payload boundary past both is what the depacketizer eats.
         let mut pkt = vec![0xB0, 96, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
         pkt.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x02]); // ext, 2 words
         pkt.extend_from_slice(&[0u8; 8]);
         pkt.extend_from_slice(&nalu(0x61, b"x"));
         pkt.extend_from_slice(&[0x00, 0x00, 3]); // padding: 3 octets, last = count
-        let h = parse_rtp(&pkt).unwrap();
-        assert_eq!(h.pt, 96);
-        assert_eq!(h.payload, &[0x61, b'x']);
-        assert_eq!(h.seq, 1);
+        let h = RtpPacket::parse(&pkt).unwrap();
+        assert_eq!(h.payload_type(), 96);
+        assert_eq!(h.payload(), &[0x61, b'x']);
+        assert_eq!(h.sequence_number(), 1);
     }
 
     #[test]
