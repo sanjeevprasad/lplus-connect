@@ -1,0 +1,122 @@
+// L+ Connect — agent-service and discovery messages from Oplus's private
+// Rust repo `connect-protocols` (checkout a94f9359f2272de4 rev c7a96db),
+// statically linked into both PC engines.
+//
+// Recovered 2026-11-10 from the Rust `Debug`/serde string pools the
+// binaries embed (field-name runs sit next to each message name):
+//
+// - `mac/O+Connect.app/Contents/Resources/daemon/O+Connect Service`
+//   (38,033,712 B)
+//   * ConnectionAgent{device_id,ksc,ksc_alias,connector_type,phy_address,
+//     device_type,active_trigger_mode,link_type,agent_info} at
+//     21,259,900..21,260,440 (adjacent `[smart_networking] …
+//     connection::connector::smart_networking`).
+//   * AgentOnline{device_name,device_type,protocol_device_id,service_name,
+//     connect_port,account_digest,is_same_account} at 21,349,800..21,349,994
+//     (next to `discovery::adapter::adaptive_network`); `agent_ip` /
+//     `is_senseless_ack` appear at 21,353,768.
+//   * AgentFound{device_name,device_type,protcol_device_id,connect_address,
+//     account_digest,is_same_account} at 20,946,290 (the vendor typo
+//     `protcol_device_id` is verbatim).
+//   * PhyLinkInfo{active_links,current_phy_link,concurrent_state} at
+//     20,935,008..20,935,231.
+//   * UsbDeviceInfo{device_id,serial,tun_ip,account_hash,info_data,
+//     friendly_name,is_device_supported_usb_capability,on_connected_time}
+//     at 20,912,484..20,914,644 (inside the prost decode-error string
+//     region `Varint … SixtyFourBit … ThirtyTwoBit`).
+//   * VirtualDevice{uid,virtual_ip} at 21,272,685..21,272,880 (next to
+//     `ServerStatus`).
+// - `winzip/daemon/devicespace.exe` (22,556,184 B) confirms independent
+//   copies: ConnectionAgent{connector_type,phy_address,agent_info} at
+//   16,165,104; AgentOnline{service_name,connect_port,agent_ip,
+//   is_senseless_ack,is_same_account} at 16,584,384 (immediately followed
+//   by `connect-protocols-a94f9359f2272de4\c7a96db\discovery\src\core\
+//   monitor.rs`); ConnectionResponse{connection_agent,connection_mode,
+//   is_reconnect} at 16,356,872..16,357,076 (next to `ACCEPT`/`REJECT`);
+//   PhyLinkInfo{active_links,current_phy_link,concurrent_state} at
+//   16,322,104..16,322,633; AgentFound{protcol_device_id,connect_address}
+//   at 16,354,688.
+//
+// Field NAMES are verbatim; declaration ORDER (hence the prost numbers we
+// assign from 1) is the recovered pool order and is NOT wire-verified —
+// same [pool-order inference] convention as RpcFrame in `connect.proto`.
+// Scalar TYPES are our client-side typing choice; varint widths are
+// wire-compatible for the values exchanged. `agent_info` and `info_data`
+// are `bytes` because the nested shape is not recovered. No PC-side tonic
+// paths exist for these (`/pkg.Service/Method` regex found nothing in
+// either engine), so they travel on the connect-protocols framed lanes.
+
+syntax = "proto3";
+
+package agentwire;
+
+// connect-protocols connection::connector::smart_networking agent record.
+message ConnectionAgent {
+  optional string device_id = 1;
+  optional bytes ksc = 2;
+  optional bytes ksc_alias = 3;
+  optional int32 connector_type = 4;
+  optional string phy_address = 5;
+  optional int32 device_type = 6;
+  optional int32 active_trigger_mode = 7;
+  optional int32 link_type = 8;
+  optional bytes agent_info = 9;
+}
+
+// Agent-service reply carrying a ConnectionAgent (devicespace:16,356,872).
+message ConnectionResponse {
+  ConnectionAgent connection_agent = 1;
+  optional int32 connection_mode = 2;
+  optional bool is_reconnect = 3;
+}
+
+// discovery sdp publish record (`discovery::adapter::adaptive_network`;
+// the required-field guard strings `Please, set protocol_device_id` /
+// `Please, set account` sit at 21,349,995 in the mac service).
+message AgentOnline {
+  optional string device_name = 1;
+  optional int32 device_type = 2;
+  optional string protocol_device_id = 3;
+  optional string service_name = 4;
+  optional int32 connect_port = 5;
+  optional bytes account_digest = 6;
+  optional bool is_same_account = 7;
+  optional string agent_ip = 8;
+  optional bool is_senseless_ack = 9;
+}
+
+// discovery monitor found-event (discovery/src/core/monitor.rs; vendor
+// typo `protcol_device_id` preserved).
+message AgentFound {
+  optional string device_name = 1;
+  optional int32 device_type = 2;
+  optional string protcol_device_id = 3;
+  optional string connect_address = 4;
+  optional bytes account_digest = 5;
+  optional bool is_same_account = 6;
+}
+
+// QoS/link-switch peer-track record.
+message PhyLinkInfo {
+  repeated int32 active_links = 1;
+  optional int32 current_phy_link = 2;
+  optional bool concurrent_state = 3;
+}
+
+// USB link bookkeeping (adapter crate).
+message UsbDeviceInfo {
+  optional string device_id = 1;
+  optional string serial = 2;
+  optional string tun_ip = 3;
+  optional string account_hash = 4;
+  optional bytes info_data = 5;
+  optional string friendly_name = 6;
+  optional bool is_device_supported_usb_capability = 7;
+  optional int64 on_connected_time = 8;
+}
+
+// pgy virtual-gateway device entry (next to the ServerStatus enum).
+message VirtualDevice {
+  optional string uid = 1;
+  optional string virtual_ip = 2;
+}

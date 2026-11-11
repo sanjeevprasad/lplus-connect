@@ -1,0 +1,137 @@
+// L+ Connect — cpbus RPC request/response protos for the PC-originated
+// connect lane (vendor-parity, no adb).
+//
+// Recovered 2026-11-10 from GeneratedMessageLite classes in the decompiled
+// vendor sources (`com.oplus.pantaconnect.sdk.internal.scpCompat.
+// CompatScpConnectionClientsImpl.requestCompatScpConnect` calls
+// `AppIpc.remoteRequest(CONNECTION, "requestCompatScpConnect", null,
+// CompatScpConnectParam.toByteArray())` and parses `SealedResult`). Field
+// numbers are the classes' own `*_FIELD_NUMBER` constants; enums match the
+// authoritative decompiled `ConnectType`/`ResultCode` (PROTOCOL.md §5.3).
+// Only messages we actually send/parse are declared.
+
+syntax = "proto3";
+
+package connectwire;
+
+// com.oplus.pantaconnect.agents.ConnectType (PROTOCOL.md §5.3).
+enum ConnectType {
+  CONNECT_TYPE_GATT = 0;
+  CONNECT_TYPE_SPP = 1;
+  CONNECT_TYPE_SPP_INSECURE = 2;
+  CONNECT_TYPE_P2P = 3;
+  CONNECT_TYPE_WLAN = 4;
+  CONNECT_TYPE_USB = 5;
+  CONNECT_TYPE_RTC_CONNECT = 6;
+  CONNECT_TYPE_NONE = 7;
+  CONNECT_TYPE_NETWORK_SETUP = 8;
+  CONNECT_TYPE_TV_WLAN_P2P = 9;
+  CONNECT_TYPE_CLOUD = 10;
+}
+
+// com.oplus.pantaconnect.sdk.ResultCode.
+enum ResultCode {
+  RESULT_CODE_UNKNOWN = 0;
+  RESULT_CODE_SUCCESS = 1;
+  RESULT_CODE_ERROR = 2;
+  RESULT_CODE_CANCELLED = 3;
+}
+
+// com.oplus.pantaconnect.agents.CompatScpConnectParam — body of the
+// "requestCompatScpConnect" RPC. agent_address is the serialized
+// SystemAgentAddress of the peer whose SCP connection is requested.
+message CompatScpConnectParam {
+  string address = 1;
+  int32 device_type = 2;
+  bytes agent_address = 3;
+  ConnectType connect_type = 4;
+  int32 port = 5;
+}
+
+// com.oplus.pantaconnect.sdk.SealedResult — RPC reply envelope.
+message SealedResult {
+  ResultCode result_code = 1;
+  bytes data = 2;
+  int32 error_code = 3;
+  string message = 4;
+}
+
+// com.oplus.interconnect.proto.ConnectionOptions/ConnectRequest/
+// ConnectResponse (connect.proto, recovered from ConnectProto.java).
+// NOTE: the recovery dropped repeated/map fields elsewhere in that file;
+// these three messages declare only singular fields corroborated by
+// *_FIELD_NUMBER constants. Unused until the connectDevice RPC is wired.
+message ConnectionOptions {
+  string device_id = 1;
+  int32 connection_type = 2;
+  string direct_info = 3;
+  int32 scp_key_type = 4;
+  bool auto_pair = 5;
+  bool show_pin_code = 6;
+}
+
+message ConnectRequest {
+  ConnectionOptions options = 1;
+}
+
+message ConnectResponse {
+  int32 result = 1;
+  string error = 2;
+  int64 connection_handle = 3;
+}
+
+// ---- interconnect-framework/core/rpc-core (prost wire envelope) ----
+// Recovered from the ORIGINAL Rust crate embedded in
+// `lib/arm64-v8a/libinterconnect_ipc_client.so` (/tmp/linker.apk): prost
+// descriptor-pool strings
+// `RpcFrame:frame_type,request_id,service_name,method_name,payload,status,
+//  trace_id_hi,trace_id_lo,parent_span_id,deadline_ms,stream_sequence,
+//  end_of_stream,caller_uid,caller_pid` and `RpcStatus:message,detail,
+//  timeout` fix declaration order; prost numbers them from 1 in that
+// order. Varint fields typed uint64 (wire-compatible with narrower uintN
+// for the small values we send).
+//
+// Re-verified 2026-11-10 (vendor sweep): the same .so ships inside
+// `apks/com.oplus.linker/OPSynergy.apk` @ lib/arm64-v8a/
+// libinterconnect_ipc_client.so, byte-IDENTICAL to the /tmp/liic copy
+// (sha256 2061d82feeafdc7670f2f7438be94f50443b93261aa0e17090978fda618ce6ef);
+// the pool sits at file offsets 89,554..90,062 there, and the crate source
+// path `interconnect-framework/core/rpc-core/src/resilience/
+// {circuit_breaker,policy}.rs` is embedded at 78,814..81,741. PC-side
+// search for RpcFrame/RpcStatus/trace_id_hi over devicespace.exe,
+// datatrans.dll, slsdk.dll, oplus_remote_service.exe, mac O+Connect
+// Service, slsdk.framework, libOshareLib.dylib, neon-bridge/index.node,
+// O+Connect.exe and app.asar found NOTHING: the envelope is phone-side
+// only — the PC daemons speak the JSON databus/agent bridges instead
+// (see databus.proto/agent.proto). The three ConnectionOptions /
+// ConnectRequest / ConnectResponse numbers above are additionally
+// CONFIRMED against the authoritative lite class
+// `com.oplus.interconnect.proto.ConnectProto$ConnectionOptions`
+// (OPSynergy.apk, jadx ConnectProto.java:3049): DEVICE_ID=1,
+// CONNECTION_TYPE=2, DIRECT_INFO=3, SCP_KEY_TYPE=4, AUTO_PAIR=5,
+// SHOW_PIN_CODE=6 with getters String/int/String/int/boolean/boolean;
+// ConnectResponse RESULT=1(int) ERROR=2(String) CONNECTION_HANDLE=3(long);
+// ConnectRequest OPTIONS=1.
+
+message RpcStatus {
+  string message = 1;
+  string detail = 2;
+  uint64 timeout = 3;
+}
+
+message RpcFrame {
+  int32 frame_type = 1;
+  uint64 request_id = 2;
+  string service_name = 3;
+  string method_name = 4;
+  bytes payload = 5;
+  RpcStatus status = 6;
+  uint64 trace_id_hi = 7;
+  uint64 trace_id_lo = 8;
+  uint64 parent_span_id = 9;
+  uint64 deadline_ms = 10;
+  uint32 stream_sequence = 11;
+  bool end_of_stream = 12;
+  uint32 caller_uid = 13;
+  uint32 caller_pid = 14;
+}

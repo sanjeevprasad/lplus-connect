@@ -67,6 +67,7 @@ pub struct AppState {
     pub ga_bound: Option<bool>,
     ga_loaded: bool,
     transfer_task: Option<Task<()>>,
+    presence_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -98,6 +99,7 @@ impl AppState {
             ga_bound: None,
             ga_loaded: false,
             transfer_task: None,
+            presence_task: None,
         }
     }
 
@@ -140,6 +142,7 @@ impl AppState {
         if let Some(devices) = self.ipc.found_devices() {
             self.connection.set_found(devices);
         }
+        self.connection.reconcile_with_rows();
     }
 
     /// Fetch the assistant page facts once: daemon status, this PC's agent
@@ -371,6 +374,7 @@ impl AppState {
     }
 
     pub fn set_quality(&mut self, q: Quality) {
+        tracing::info!("[ui] quality {q:?}");
         self.mirroring.quality = q;
     }
 
@@ -504,6 +508,89 @@ impl AppState {
 
     pub fn clear_finished_transfers(&mut self) {
         self.transfer.clear_finished();
+    }
+
+    /// Invoke one named GUI element action queued by the REPL
+    /// (`click <id>`); ids are the same the GPUI tree stamps
+    /// (`views::element`).
+    pub fn handle_ui_click(&mut self, id: &str) {
+        use crate::ui::views::element::{self, Click, Target};
+        tracing::info!("[ui] click {id:?} (repl)");
+        let resolve = |app: &Self, t: &Target| -> Option<(usize, Device)> {
+            let wall = app.connection.wall();
+            match t {
+                Target::Index(i) => wall.into_iter().nth(*i).map(|d| (*i, d)),
+                Target::Id(want) => wall
+                    .into_iter()
+                    .enumerate()
+                    .find(|(_, d)| &d.device_id == want),
+            }
+        };
+        let parsed = element::parse(id);
+        match parsed {
+            Some(Click::Connect(t)) if resolve(self, &t).is_some() => {
+                let (_, d) = resolve(self, &t).expect("checked");
+                self.request_connect(&d);
+            }
+            Some(Click::Disconnect(t)) if resolve(self, &t).is_some() => {
+                let (_, d) = resolve(self, &t).expect("checked");
+                self.request_disconnect(&d);
+            }
+            Some(Click::Delete(t)) if resolve(self, &t).is_some() => {
+                let (_, d) = resolve(self, &t).expect("checked");
+                self.request_remove_device(&d);
+            }
+            Some(Click::More(t)) => {
+                if let Some((i, _)) = resolve(self, &t) {
+                    self.toggle_more_menu(i);
+                }
+            }
+            Some(Click::Confirm) => {
+                if self.ui.connect_conflict.is_some() {
+                    self.confirm_connect_conflict();
+                } else if self.ui.delete_pending.is_some() {
+                    self.confirm_remove_device();
+                } else if self.ui.disconnect_pending.is_some() {
+                    self.confirm_disconnect();
+                }
+            }
+            Some(Click::Cancel) => {
+                self.cancel_connect_conflict();
+                self.cancel_remove_device();
+                self.cancel_disconnect();
+            }
+            _ => tracing::warn!("[ui] click: unknown element {id:?}"),
+        }
+    }
+
+    /// Drain REPL-queued clicks (see `handle_ui_click`). Called from the
+    /// presence tick so clicks land within one poll on any page.
+    pub fn drain_ui_clicks(&mut self) {
+        for id in crate::sdpd::take_ui_clicks() {
+            self.handle_ui_click(&id);
+        }
+    }
+
+    /// Presence poll: the wall mirrors the daemon's row model — presence
+    /// truth lives there (and when attached, only there), so the window
+    /// must re-pull periodically. A phone-initiated connect, a disconnect
+    /// on the phone, or a stale-marked session all settle within one tick.
+    pub fn start_presence_ticks(&mut self, cx: &mut Context<Self>) {
+        if self.presence_task.is_some() {
+            return;
+        }
+        self.presence_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(2500))
+                    .await;
+                let _ = this.update(cx, |app, cx| {
+                    app.drain_ui_clicks();
+                    app.refresh_devices();
+                    cx.notify();
+                });
+            }
+        }));
     }
 
     pub fn audit(&self) -> Vec<String> {
@@ -952,6 +1039,113 @@ mod tests {
         assert!(a.connection.is_connected("usb-FAKESERIAL000001"));
         assert_eq!(a.connection.wall()[0].device_name, "OnePlus 15");
         assert_eq!(a.connection.wall()[0].connect_type, 128);
+    }
+
+    #[test]
+    fn phone_initiated_connect_settles_waiting_permission_via_poll() {
+        // Connect acked as queued (phone still holds the permission step);
+        // the daemon's row later reports the phone-initiated session up.
+        // A presence poll must settle the card to Connected — the wall is
+        // daemon truth, not the one-shot ack.
+        use crate::ui::ipc::http_tests::stub_backend;
+        let addr = stub_backend(vec![(
+            "via:get_current_connected_device_info_list",
+            json!([{ "deviceId": "192-0-2-100",
+                     "deviceName": "OnePlus15",
+                     "ip": "192.0.2.100",
+                     "isConnected": true,
+                     "isPaired": true,
+                     "connectType": 16,
+                     "deviceType": 8 }]),
+        )]);
+        let mut a = AppState::new();
+        a.ipc = Ipc::http(addr);
+        a.connection.state = ConnectState::WaitingPermission("192-0-2-100".into());
+        a.refresh_devices();
+        assert!(a.connection.is_connected("192-0-2-100"));
+        assert_eq!(
+            a.connection.state,
+            ConnectState::Connected(vec!["192-0-2-100".into()])
+        );
+    }
+
+    #[test]
+    fn element_ids_round_trip_through_the_click_parser() {
+        use crate::ui::views::element::{self, Click, Target};
+        assert_eq!(
+            element::parse(&element::connect(2)),
+            Some(Click::Connect(Target::Index(2)))
+        );
+        assert_eq!(
+            element::parse(&element::disconnect(0)),
+            Some(Click::Disconnect(Target::Index(0)))
+        );
+        assert_eq!(
+            element::parse(&element::delete(1)),
+            Some(Click::Delete(Target::Index(1)))
+        );
+        assert_eq!(
+            element::parse(&element::more(3)),
+            Some(Click::More(Target::Index(3)))
+        );
+        // Device-id selectors address the same actions without wall math.
+        assert_eq!(
+            element::parse("card-disconnect:192-0-2-100"),
+            Some(Click::Disconnect(Target::Id("192-0-2-100".into())))
+        );
+        assert_eq!(element::parse(element::CONFIRM), Some(Click::Confirm));
+        // Dialog buttons stamp "{kind}-confirm"; both must map to Confirm.
+        assert_eq!(element::parse("disconnect-confirm"), Some(Click::Confirm));
+        assert_eq!(element::parse("delete-cancel"), Some(Click::Cancel));
+        assert_eq!(element::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn repl_click_drives_disconnect_dialog_and_backend() {
+        use crate::ui::ipc::http_tests::stub_backend;
+        let addr = stub_backend(vec![
+            (
+                "generic_agent_get_paired_devices",
+                json!({ "ok": true,
+                        "entries": [{ "deviceId": "192-0-2-100", "displayName": "OnePlus15" }],
+                        "devices": [{ "deviceId": "192-0-2-100",
+                                      "deviceName": "OnePlus15",
+                                      "ip": "192.0.2.100",
+                                      "isConnected": true,
+                                      "isPaired": true,
+                                      "connectType": 16,
+                                      "deviceType": 8 }] }),
+            ),
+            (
+                "disconnect_device",
+                json!({ "ok": true, "ip": "192.0.2.100" }),
+            ),
+        ]);
+        let mut a = AppState::new();
+        a.ipc = Ipc::http(addr);
+        a.refresh_devices();
+        a.handle_ui_click("card-disconnect:192-0-2-100");
+        assert_eq!(a.ui.disconnect_pending.as_deref(), Some("192-0-2-100"));
+        a.handle_ui_click("confirm");
+        assert!(a.ui.disconnect_pending.is_none());
+        // The disconnect reached the real backend (found-list polls may
+        // still be mock-served; the audit records who answered per call).
+        assert!(
+            a.ipc
+                .audit()
+                .iter()
+                .any(|e| e.contains("backend-invoke:disconnect_device")),
+            "audit: {:?}",
+            a.ipc.audit()
+        );
+    }
+
+    #[test]
+    fn repl_click_unknown_element_is_inert() {
+        let mut a = device_app();
+        a.handle_ui_click("definitely-not-an-element");
+        assert!(a.ui.disconnect_pending.is_none());
+        assert!(a.ui.delete_pending.is_none());
     }
 
     fn device_app() -> AppState {

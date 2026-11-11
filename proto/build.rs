@@ -18,6 +18,10 @@ fn main() {
                 "protos/oplus.proto",
                 "protos/card.proto",
                 "protos/scp.proto",
+                "protos/connect.proto",
+                "protos/databus.proto",
+                "protos/agent.proto",
+                "protos/ndsf.proto",
             ],
             &["protos"],
         )

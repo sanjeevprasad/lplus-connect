@@ -299,7 +299,29 @@ wall 9/9 PASS against vendor references.
   predate the swap and were measured against the vendor originals.
 - Text entry (settings host name, aiSearch query) uses preset chips; a
   `TextInput` pass is pending.
-- The merged window refreshes on a 2 s timer; event-push refresh through
-  the sdpd broadcast is the follow-up (see §6.3).
+- The window polls the daemon's row model every 2.5 s while the devices
+  page is rendered (`AppState::start_presence_ticks`), reconciling
+  `ConnectState` against authoritative rows (`ConnectionStore::
+  reconcile_with_rows`): a phone-initiated connect or a stale-marked
+  session settles on-screen within one poll, in Direct and Attach modes.
 - The QR pairing payload awaits the real pairing lane (`get_pairing_qr_code`
   is mock-filled and audited).
+
+## 11. REPL element-click driver
+
+Every user-facing button shares one stable id (`src/ui/views.rs::element`)
+between the real GPUI tree (`.id(...)`) and the line REPL:
+
+```
+$ echo 'click card-disconnect:192-168-0-100' | nc 127.0.0.1 14321
+$ echo 'click confirm'                    | nc 127.0.0.1 14321
+```
+
+Ids: `device-connect:<wall-index-or-device-id>`, `card-disconnect:…`,
+`menu-delete:…`, `card-more:…`, plus `confirm`/`cancel` (also the dialog's
+`{kind}-confirm`/`{kind}-cancel` forms). Clicks queue in sdpd
+(`Command::UiClick`) and drain on the presence tick
+(`AppState::drain_ui_clicks`), invoking the very handlers the on-screen
+buttons call — `request_connect`, `request_disconnect` (+ vendor confirm
+dialog), `request_remove_device`, `toggle_more_menu`. Log lines:
+`[cmd] ui click queued …` then `[ui] click … (repl)`.

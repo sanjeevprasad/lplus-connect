@@ -143,6 +143,31 @@ impl ConnectionStore {
         self.connected.iter().any(|d| d.device_id == device_id)
     }
 
+    /// Reconcile the connect lifecycle with an authoritative row refresh:
+    /// daemon rows outrank optimistic UI state, so a phone-initiated (or
+    /// post-ack completed) connection lands on `Connected` and a vanished
+    /// row drops back to `Idle`. `Searching`/`Connecting` stay untouched —
+    /// they are transient user actions, not stale truth.
+    pub fn reconcile_with_rows(&mut self) {
+        match self.state.clone() {
+            ConnectState::WaitingPermission(id) | ConnectState::Failed(id, _) => {
+                if self.is_connected(&id) {
+                    self.state = ConnectState::Connected(vec![id]);
+                }
+            }
+            ConnectState::Connected(ids) => {
+                let live: Vec<String> =
+                    ids.into_iter().filter(|id| self.is_connected(id)).collect();
+                self.state = if live.is_empty() {
+                    ConnectState::Idle
+                } else {
+                    ConnectState::Connected(live)
+                };
+            }
+            _ => {}
+        }
+    }
+
     pub fn begin_connect(&mut self, device_id: &str) {
         self.state = ConnectState::Connecting(device_id.to_string());
     }
@@ -268,6 +293,38 @@ mod tests {
         assert_eq!(bonded, ["a", "b"]);
         let wall: Vec<String> = s.wall().iter().map(|d| d.device_id.clone()).collect();
         assert_eq!(wall, ["a", "b"]);
+    }
+
+    #[test]
+    fn reconcile_settles_waiting_and_stale_states_on_rows() {
+        // Phone-initiated connect: rows say connected while the UI still
+        // waits for the on-device permission.
+        let mut s = ConnectionStore::new();
+        s.state = ConnectState::WaitingPermission("a".into());
+        s.set_connected(vec![dev("a", true)]);
+        s.reconcile_with_rows();
+        assert_eq!(s.state, ConnectState::Connected(vec!["a".into()]));
+        // Row vanishes (daemon stale-marked it): Connected must not linger.
+        s.set_connected(vec![]);
+        s.reconcile_with_rows();
+        assert_eq!(s.state, ConnectState::Idle);
+        // A resolved failure clears on row truth.
+        s.state = ConnectState::Failed("a".into(), "phone unreachable".into());
+        s.set_connected(vec![dev("a", true)]);
+        s.reconcile_with_rows();
+        assert_eq!(s.state, ConnectState::Connected(vec!["a".into()]));
+    }
+
+    #[test]
+    fn reconcile_leaves_transient_user_states_alone() {
+        let mut s = ConnectionStore::new();
+        s.set_connected(vec![dev("a", true)]);
+        s.state = ConnectState::Connecting("b".into());
+        s.reconcile_with_rows();
+        assert_eq!(s.state, ConnectState::Connecting("b".into()));
+        s.state = ConnectState::Searching;
+        s.reconcile_with_rows();
+        assert_eq!(s.state, ConnectState::Searching);
     }
 
     #[test]

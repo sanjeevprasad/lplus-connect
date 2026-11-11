@@ -18,6 +18,9 @@ headers intact:
 | `oplus.proto` | ours — the phone-forked `Ukey2ClientFinished.iv_spec`, decode-only; mirrors Oplus's own `{public_key=1, ivSpec=2}` |
 | `card.proto` | `cdf931e136f97e6a…ef0f` — recovered (below), proto2 |
 | `scp.proto` | `c41e9def1392a999…d88b` — hand-tagged mirror of the phone lite classes (header), proto3 |
+| `databus.proto` | recovered — `DataSyncMessage` databus envelope, from the PC engines' connect-protocols Rust string pools (header), proto3 |
+| `agent.proto` | recovered — agent-service/discovery records (`ConnectionAgent`, `AgentOnline/Found`, `PhyLinkInfo`, `UsbDeviceInfo`, `VirtualDevice`), same pool method (header), proto3 |
+| `ndsf.proto` | recovered — NDSF account/cert + pgy `NetRegisterPacket` cloud payloads (HTTPS JSON lane), same pool method (header), proto3 |
 
 Full digests: `cargo run`-independent; regenerate with
 `sha256sum proto/protos/*.proto` (from `linux-client/`).
@@ -79,6 +82,20 @@ plus its prost field-name pools, which give the original definitions:
 
 If `connect-protocols` ever surfaces publicly, re-vendor from it and
 replace `scp.proto`/`oplus.proto` with the authoritative files.
+
+2026-11-10 vendor sweep: the same binaries' string pools were mined for
+every remaining message and `databus.proto`/`agent.proto`/`ndsf.proto`
+now vendor the DataBus envelope, the agent-service/discovery records and
+the NDSF account/cert payloads (offsets in each header). The
+`pantaChannelService.exe` C++ descriptor blobs were re-carved and parse
+as complete `FileDescriptorProto`s at 0x29c0a0 (`securemessage.proto`,
+package `securemessage`) and 0x29c710 (`ukey.proto`, package `securegcm`)
+— still the only embedded descriptors in that binary besides
+`google/protobuf/descriptor.proto` @0x28c3b0; findings above stand. No
+tonic-style `/pkg.Service/Method` strings exist in any PC engine (the
+lanes are connect-protocols framed sockets plus JSON bridges); the PC
+side carries no `RpcFrame` either, so the cpbus RPC envelope stays
+phone-only (connect.proto header).
 
 ### Extracted descriptors (oracle, not build input)
 

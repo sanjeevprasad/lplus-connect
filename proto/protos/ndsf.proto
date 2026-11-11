@@ -1,0 +1,88 @@
+// L+ Connect — NDSF (network data sync framework) account/cert and pgy
+// network-registration payloads from Oplus's private Rust repo
+// `connect-protocols`, statically linked into the PC engines.
+//
+// Recovered 2026-11-10 from the Rust Debug/serde string pools:
+//
+// - `mac/O+Connect.app/Contents/Resources/daemon/O+Connect Service`
+//   (38,033,712 B)
+//   * `ndsf::account::account_core` region 20,896,170..20,897,171 carries
+//     `UpgradeCertResponse` `Failed` `SameAccount` `InvalidAccount` then
+//     `UpgradeCertResponseData` `version` `cert_for_verification`
+//     `cert_for_encryption` (the `ndsf::cloud::cert` / `ndsf::cloud::oipc`
+//     client logs `get cert response is:` / `upgradeCertificate success`
+//     around it; a 2048-bit RSA PUBLIC KEY PEM is embedded at 21,262,349
+//     for the `ndsf::cloud::cipher` response decryption).
+//   * Account-comparison enum `ndsf::core::ndsf` +
+//     `SameGroup Account DifferentAccount` at 20,893,552, and the fuller
+//     NDSF-Core run `SameAccount SameGroup Account DifferentAccount
+//     InvalidAccount` at 21,379,443..21,379,555.
+//   * `AccountPayload` `mAccountMatchLevel` `mSessionId` at
+//     20,909,308..20,910,076; the serde label `struct AccountPayload with
+//     3 elements` (20,960,430..20,960,797) shows one further field we
+//     could not recover a name for — proto3 unknown-field tolerance lets
+//     the two recovered fields ride.
+//   * `NetRegisterPacket` {push_to_client, support_pgy, user_id,
+//     register_id, pgy_network_id, pgy_network_member,
+//     pgy_member_password, region, update_time_stamp, business_type} at
+//     20,912,484..20,914,644 (pgy = the Oplus cloud network layer).
+// - `winzip/daemon/devicespace.exe` (22,556,184 B) carries the same pools
+//   (e.g. `UpgradeCertResponse` 8×, `NetRegisterPacket` at 16,425,208),
+//   confirming they are shared connect-protocols types, not mac-only.
+//
+// CAUTION: these ride the NDSF HTTPS/JSON cloud lane (`Response body is
+// not JSON`, `get cert response is:`), NOT the protobuf phone lane; they
+// are declared proto3 so prost can carry them where we mirror the PC
+// engine's account logic. Field names are verbatim (including the
+// `m`-prefixed member names); numbers are [pool-order inference] and
+// scalar types are our client-side choice — same convention as
+// `databus.proto`.
+
+syntax = "proto3";
+
+package ndsfwire;
+
+// ndsf::core::ndsf account comparison (mac service 21,379,443).
+enum AccountMatch {
+  ACCOUNT_MATCH_SAME_ACCOUNT = 0;
+  ACCOUNT_MATCH_SAME_GROUP = 1;
+  ACCOUNT_MATCH_ACCOUNT = 2;
+  ACCOUNT_MATCH_DIFFERENT_ACCOUNT = 3;
+  ACCOUNT_MATCH_INVALID_ACCOUNT = 4;
+}
+
+// ndsf::account::account_core upgradeCertificate outcome
+// (mac service 20,896,170).
+enum UpgradeCertOutcome {
+  UPGRADE_CERT_OUTCOME_FAILED = 0;
+  UPGRADE_CERT_OUTCOME_SAME_ACCOUNT = 1;
+  UPGRADE_CERT_OUTCOME_INVALID_ACCOUNT = 2;
+}
+
+// UpgradeCertResponseData: the cert pair the ndsf::cloud::cert client
+// saves after `upgradeCertificate success`.
+message UpgradeCertResponseData {
+  optional string version = 1;
+  optional string cert_for_verification = 2;
+  optional string cert_for_encryption = 3;
+}
+
+// AccountPayload — recovered members only (see header; a third exists).
+message AccountPayload {
+  optional int32 mAccountMatchLevel = 1;
+  optional string mSessionId = 2;
+}
+
+// NetRegisterPacket — pgy cloud network registration record.
+message NetRegisterPacket {
+  optional bool push_to_client = 1;
+  optional bool support_pgy = 2;
+  optional string user_id = 3;
+  optional string register_id = 4;
+  optional string pgy_network_id = 5;
+  optional string pgy_network_member = 6;
+  optional string pgy_member_password = 7;
+  optional string region = 8;
+  optional int64 update_time_stamp = 9;
+  optional int32 business_type = 10;
+}

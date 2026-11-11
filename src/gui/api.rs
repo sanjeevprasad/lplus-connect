@@ -420,10 +420,24 @@ pub struct FeatureEnable {
 }
 
 /// `settings.json` (state dir) — the persisted panel settings blob.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Single identity source: `name` is what the beacon announces (SDP `DN`,
+/// the phone's panel row key) and what the panel shows as the host name;
+/// `hostName` mirrors it for the renderer. Pairing material and any
+/// keys this version does not know round-trip so a rewrite (e.g. a GUI
+/// rename) can never silently drop them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SettingsFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
     pub host_name: String,
+    #[serde(rename = "scpKsc", default, skip_serializing_if = "Option::is_none")]
+    pub scp_ks_c: Option<String>,
+    #[serde(rename = "linkKpd", default, skip_serializing_if = "Option::is_none")]
+    pub link_kpd: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ------------------------------------------------------------ functions --
@@ -562,7 +576,7 @@ pub fn sidecar_status() -> SidecarStatus {
 }
 
 /// Connect/Disconnect button lane: queue a `sdpd::Command` for the
-/// in-process backend (adb-side steering + EPI sink push run there).
+/// in-process backend (LAN SCP dial + EPI sink push run there).
 pub fn device_action(connect: bool, ip: &str) -> DeviceAction {
     use crate::sdpd::{Command, send_command};
     if ip.is_empty() {

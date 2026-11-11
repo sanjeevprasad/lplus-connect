@@ -1,6 +1,7 @@
 #!/bin/sh
-# check.sh — repo gate: gitleaks on commit history, staged index, and
-# unstaged worktree changes (.gitleaks.toml rules), plus cargo deny.
+# check.sh — repo gate: rustfmt dry-run, gitleaks on commit history, staged
+# index, and unstaged worktree changes (.gitleaks.toml rules), plus cargo
+# deny.
 # Usage: ./check.sh   (any failing check sets exit 1)
 set -eu
 
@@ -18,6 +19,7 @@ check() {
     fi
 }
 
+check "cargo fmt" cargo fmt --all --check
 check "gitleaks history" gitleaks detect --redact --no-banner
 check "gitleaks staged" gitleaks protect --staged --redact --no-banner
 check "gitleaks unstaged" gitleaks protect --redact --no-banner
@@ -27,4 +29,4 @@ if [ "$rc" -ne 0 ]; then
     echo "checks FAILED" >&2
     exit 1
 fi
-echo "checks: gitleaks (history, staged, unstaged) + cargo deny all clean"
+echo "checks: cargo fmt + gitleaks (history, staged, unstaged) + cargo deny all clean"

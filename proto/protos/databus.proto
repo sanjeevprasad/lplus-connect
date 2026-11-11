@@ -1,0 +1,54 @@
+// L+ Connect — DataBus/datatrans envelopes from Oplus's private Rust repo
+// `connect-protocols` (git checkout a94f9359f2272de4 rev c7a96db), the
+// crate family the PC engines statically link.
+//
+// Recovered 2026-11-10 by mining the PC-side binaries (the phone has no
+// `data_sync_msg` strings, so this envelope is Rust↔Rust on the PC lanes
+// driven by `datatrans/src/databus/databus_service.rs` — cargo path
+// string at `winzip/daemon/datatrans.dll`:392032):
+//
+// - `winzip/daemon/devicespace.exe` (22,556,184 B): serde pool
+//   `struct DataSyncMessage with 6 elements` at 16,483,240..16,483,285 and
+//   the field-name run `data_sync_msg_encrypt data_sync_msg_id
+//   data_sync_msg_module data_sync_msg_payload data_sync_msg_priority
+//   data_sync_msg_type` at 16,483,304..16,483,457.
+// - `mac/O+Connect.app/Contents/Resources/daemon/O+Connect Service`
+//   (38,033,712 B): same pool at 20,960,043..20,960,427 (adjacent
+//   `struct DataSyncMessage with 6 elements`) and the Debug-style run
+//   `…UsbError data_sync_msg_encrypt data_sync_msg_module
+//   data_sync_msg_payload data_sync_msg_priority data_sync_msg_type
+//   DataSyncMessage …` at 20,909,308..20,910,076; the string
+//   `data_sync_msg_id` also appears at 20,893,455 ([usb_sesion_mgr] log).
+//
+// Field NAMES are verbatim from the vendor pools. The pool orders are not
+// authoritative for wire numbers (the serde run is alphabetical), so
+// numbers are assigned from 1 in the declared order below — same
+// [pool-order inference] convention as the RpcFrame block in
+// `connect.proto`, and only safe until a captured frame pins them.
+// Scalar TYPES are our choice for our client: varint widths are
+// wire-compatible across the intN/uintN/bool family for the values we
+// exchange; `payload` is `bytes` because it carries the serialized
+// business payload.
+//
+// Databus event callbacks (device→PC result handlers) recovered from the
+// devicespace.exe pool at 16,322,104..16,322,633:
+// `on_register_app_result`, `on_dbs_status_result`,
+// `on_unregister_app_result`, `on_topic_received`,
+// `on_create_publish_result`, `on_remove_publish_result`,
+// `on_create_subscribe_result`, `on_remove_subscribe_result`,
+// `on_publish_message_result` (bridged as JSON: `[databus_bridge]
+// databus_event_call: res_json` at mac service 20,951,758).
+
+syntax = "proto3";
+
+package databuswire;
+
+// connect-protocols datatrans DataBus envelope (see header for offsets).
+message DataSyncMessage {
+  optional string data_sync_msg_id = 1;
+  optional int32 data_sync_msg_encrypt = 2;
+  optional string data_sync_msg_module = 3;
+  optional bytes data_sync_msg_payload = 4;
+  optional int32 data_sync_msg_priority = 5;
+  optional int32 data_sync_msg_type = 6;
+}

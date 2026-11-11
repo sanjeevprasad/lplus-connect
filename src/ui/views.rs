@@ -34,6 +34,70 @@ enum ConfirmKind {
     ConnectConflict,
 }
 
+/// Single source of truth for user-facing element ids: the real GPUI tree
+/// stamps these via `.id(...)` and the REPL `click <id>` driver parses the
+/// same strings back into actions (`AppState::handle_ui_click`).
+pub(crate) mod element {
+    /// A device wall entry, addressed by position or by device id.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Target {
+        Index(usize),
+        Id(String),
+    }
+
+    impl Target {
+        fn parse(s: &str) -> Self {
+            match s.parse::<usize>() {
+                Ok(i) => Target::Index(i),
+                Err(_) => Target::Id(s.to_string()),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Click {
+        Connect(Target),
+        Disconnect(Target),
+        Delete(Target),
+        More(Target),
+        Confirm,
+        Cancel,
+    }
+
+    pub fn connect(i: usize) -> String {
+        format!("device-connect:{i}")
+    }
+    pub fn disconnect(i: usize) -> String {
+        format!("card-disconnect:{i}")
+    }
+    pub fn delete(i: usize) -> String {
+        format!("menu-delete:{i}")
+    }
+    pub fn more(i: usize) -> String {
+        format!("card-more:{i}")
+    }
+    pub const CONFIRM: &str = "confirm";
+    pub const CANCEL: &str = "cancel";
+
+    pub fn parse(id: &str) -> Option<Click> {
+        if let Some(s) = id.strip_prefix("device-connect:") {
+            Some(Click::Connect(Target::parse(s)))
+        } else if let Some(s) = id.strip_prefix("card-disconnect:") {
+            Some(Click::Disconnect(Target::parse(s)))
+        } else if let Some(s) = id.strip_prefix("menu-delete:") {
+            Some(Click::Delete(Target::parse(s)))
+        } else if let Some(s) = id.strip_prefix("card-more:") {
+            Some(Click::More(Target::parse(s)))
+        } else if id == CONFIRM || id.ends_with("-confirm") {
+            Some(Click::Confirm)
+        } else if id == CANCEL || id.ends_with("-cancel") {
+            Some(Click::Cancel)
+        } else {
+            None
+        }
+    }
+}
+
 impl ConfirmKind {
     fn labels(
         self,
@@ -209,6 +273,7 @@ impl AppState {
                             .child("Search"),
                     )
                     .on_click(cx.listener(|app, _e, _w, cx| {
+                        tracing::info!("[ui] tap Search (sidebar)");
                         app.navigate(Route::AiSearch);
                         cx.notify();
                     })),
@@ -251,6 +316,7 @@ impl AppState {
                                 .child(label),
                         )
                         .on_click(cx.listener(move |app, _e, _w, cx| {
+                            tracing::info!("[ui] nav {label}");
                             app.navigate(target.clone());
                             cx.notify();
                         })),
@@ -301,6 +367,7 @@ impl AppState {
                                     .child(label),
                             )
                             .on_click(cx.listener(move |app, _e, _w, cx| {
+                                tracing::info!("[ui] nav {label}");
                                 app.navigate(target.clone());
                                 cx.notify();
                             })),
@@ -335,6 +402,7 @@ impl AppState {
                                 .text_color(h(TEXT)),
                         )
                         .on_click(cx.listener(|app, _e, _w, cx| {
+                            tracing::info!("[ui] tap Settings (sidebar)");
                             app.navigate(Route::Settings);
                             cx.notify();
                         })),
@@ -418,6 +486,7 @@ impl AppState {
                                 .child("‹"),
                         )
                         .on_click(cx.listener(|app, _e, _w, cx| {
+                            tracing::info!("[ui] tap back");
                             app.go_back();
                             cx.notify();
                         })),
@@ -457,6 +526,7 @@ impl AppState {
                                 .child("⇅ transferring"),
                         )
                         .on_click(cx.listener(|app, _e, _w, cx| {
+                            tracing::info!("[ui] tap Transfers (sidebar)");
                             app.navigate(Route::UploadDownload);
                             cx.notify();
                         })),
@@ -467,6 +537,7 @@ impl AppState {
 
     // ----------------------------------------------------- devices (home)
     fn render_devices(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.start_presence_ticks(cx);
         let wall = self.connection.wall();
         if wall.is_empty() {
             return self.render_wall(cx);
@@ -527,6 +598,7 @@ impl AppState {
                                 .child("Add device"),
                         )
                         .on_click(cx.listener(|app, _e, _w, cx| {
+                            tracing::info!("[ui] tap Add device (wall)");
                             app.open_connect_dialog();
                             cx.notify();
                         })),
@@ -591,7 +663,7 @@ impl AppState {
                             .when(connected, |row| {
                                 row.child(
                                     div()
-                                        .id(("card-disconnect", idx))
+                                        .id(element::disconnect(idx))
                                         .size(px(24.))
                                         .rounded(px(12.))
                                         .flex()
@@ -613,7 +685,7 @@ impl AppState {
                             })
                             .child(
                                 div()
-                                    .id(("card-more", idx))
+                                    .id(element::more(idx))
                                     .size(px(24.))
                                     .rounded(px(12.))
                                     .flex()
@@ -632,6 +704,7 @@ impl AppState {
                                         // root click-away handler would
                                         // close the menu we just opened.
                                         cx.stop_propagation();
+                                        tracing::info!("[ui] tap \u{22ee} (card {idx})");
                                         app.toggle_more_menu(idx);
                                         cx.notify();
                                     })),
@@ -710,6 +783,16 @@ impl AppState {
                                     app.navigate(Route::Screen {
                                         device_id: Some(screen_id.clone()),
                                     });
+                                    // Vendor parity: the connected-card
+                                    // Screencast entry starts mirroring
+                                    // immediately (odmf_start pushes
+                                    // `cast_ability_sync`; the phone dials
+                                    // the :7236 sink). Start-only — an
+                                    // active session is never stopped by
+                                    // re-entering the panel.
+                                    if app.mirroring.active_listen.is_none() {
+                                        app.toggle_mirroring();
+                                    }
                                 },
                             ));
                         }
@@ -741,7 +824,7 @@ impl AppState {
                     .when(!connected, |card| {
                         card.child(
                             div()
-                                .id(("device-connect", idx))
+                                .id(element::connect(idx))
                                 .h(px(32.))
                                 .rounded(px(PILL_R))
                                 .flex()
@@ -757,6 +840,7 @@ impl AppState {
                                         .child("Connect"),
                                 )
                                 .on_click(cx.listener(move |app, _e, _w, cx| {
+                                    tracing::info!("[ui] tap Connect (card {idx})");
                                     app.request_connect(&connect_target);
                                     cx.notify();
                                 })),
@@ -794,6 +878,10 @@ impl AppState {
                                             )
                                             .on_click(cx.listener(move |app, _e, _w, cx| {
                                                 cx.stop_propagation();
+                                                tracing::info!(
+                                                    "[ui] tap menu: Disconnect {}",
+                                                    menu_disconnect_target.device_name
+                                                );
                                                 app.close_more_menu();
                                                 app.request_disconnect(&menu_disconnect_target);
                                                 cx.notify();
@@ -802,7 +890,7 @@ impl AppState {
                                 })
                                 .child(
                                     div()
-                                        .id(("menu-delete", idx))
+                                        .id(element::delete(idx))
                                         .px(px(12.))
                                         .py(px(6.))
                                         .cursor_pointer()
@@ -815,6 +903,10 @@ impl AppState {
                                         )
                                         .on_click(cx.listener(move |app, _e, _w, cx| {
                                             cx.stop_propagation();
+                                            tracing::info!(
+                                                "[ui] tap menu: Delete {}",
+                                                menu_delete_target.device_name
+                                            );
                                             app.close_more_menu();
                                             app.request_remove_device(&menu_delete_target);
                                             cx.notify();
@@ -930,6 +1022,7 @@ impl AppState {
             )
             .when(enabled, move |d| {
                 d.on_click(cx.listener(move |app, _e, _w, cx| {
+                    tracing::info!("[ui] tap {label}");
                     go(app);
                     cx.notify();
                 }))
@@ -1091,6 +1184,7 @@ impl AppState {
                                     .child("Add device"),
                             )
                             .on_click(cx.listener(|app, _e, _w, cx| {
+                                tracing::info!("[ui] tap Add device");
                                 app.open_connect_dialog();
                                 cx.notify();
                             })),
@@ -1125,6 +1219,7 @@ impl AppState {
                                     .cursor_pointer()
                                     .hover(|d| d.bg(h(HOVER_BG)))
                                     .on_click(cx.listener(|app, _e, _w, cx| {
+                                        tracing::info!("[ui] tap wall-clear");
                                         app.connection.reset();
                                         cx.notify();
                                     })),
@@ -1151,6 +1246,7 @@ impl AppState {
                                             .child("Connect"),
                                     )
                                     .on_click(cx.listener(|app, _e, _w, cx| {
+                                        tracing::info!("[ui] tap Connect (wall banner)");
                                         app.open_connect_dialog();
                                         cx.notify();
                                     })),
@@ -1205,7 +1301,7 @@ impl AppState {
                             .gap(px(10.))
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("{kind}-cancel")))
+                                    .id(SharedString::from(format!("{kind}-{}", element::CANCEL)))
                                     .h(px(32.))
                                     .px(px(14.))
                                     .rounded(px(PILL_R))
@@ -1223,13 +1319,14 @@ impl AppState {
                                             .child(cancel),
                                     )
                                     .on_click(cx.listener(move |app, _e, _w, cx| {
+                                        tracing::info!("[ui] tap {kind}-cancel (dialog)");
                                         kind.cancel(app);
                                         cx.notify();
                                     })),
                             )
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("{kind}-confirm")))
+                                    .id(SharedString::from(format!("{kind}-{}", element::CONFIRM)))
                                     .h(px(32.))
                                     .px(px(14.))
                                     .rounded(px(PILL_R))
@@ -1246,6 +1343,7 @@ impl AppState {
                                             .child(confirm),
                                     )
                                     .on_click(cx.listener(move |app, _e, _w, cx| {
+                                        tracing::info!("[ui] tap {kind}-confirm (dialog)");
                                         kind.confirm(app);
                                         cx.notify();
                                     })),
@@ -1302,6 +1400,7 @@ impl AppState {
                         h(GLASS)
                     }))
                     .on_click(cx.listener(move |app, _e, _w, cx| {
+                        tracing::info!("[ui] tap qr-tab {label}");
                         app.ui.qr_tab = idx;
                         cx.notify();
                     })),
@@ -1337,6 +1436,7 @@ impl AppState {
                             .text_color(h(TEXT)),
                     )
                     .on_click(cx.listener(|app, _e, _w, cx| {
+                        tracing::info!("[ui] tap qr-close");
                         app.ui.close_connect_dialog();
                         cx.notify();
                     })),
@@ -1376,6 +1476,7 @@ impl AppState {
                             .child(bg_btn),
                     )
                     .on_click(cx.listener(|app, _e, _w, cx| {
+                        tracing::info!("[ui] tap Connect in background (qr dialog)");
                         app.ui.close_connect_dialog();
                         app.toast.push("Connecting in background", ToastKind::Info);
                         cx.notify();
@@ -1655,6 +1756,7 @@ impl AppState {
                             .child(label),
                     )
                     .on_click(cx.listener(move |app, _e, _w, cx| {
+                        tracing::info!("[ui] tap {label} (mirroring)");
                         if idx == 0 {
                             app.toggle_muted();
                         } else {
@@ -2329,6 +2431,7 @@ fn pill_button(
     cx: &mut Context<AppState>,
     on: impl Fn(&mut AppState, &mut Context<AppState>) + 'static,
 ) -> AnyElement {
+    let label = label.to_string();
     div()
         .id(id)
         .h(px(43.))
@@ -2354,6 +2457,7 @@ fn pill_button(
                 .child(label.to_string()),
         )
         .on_click(cx.listener(move |app, _e, _w, cx| {
+            tracing::info!("[ui] tap {label} ({id})");
             on(app, cx);
             cx.notify();
         }))

@@ -31,24 +31,29 @@
 #![warn(clippy::all)]
 
 mod ble;
-#[allow(dead_code)] // dev/CI surface kept for wire-capture work (was lib-public)
+// dev/CI surface kept for wire-capture work (was lib-public)
+#[allow(dead_code)]
 mod d2d;
 mod gui;
-#[allow(dead_code)] // dev/CI surface kept for wire-capture work (was lib-public)
+// dev/CI surface kept for wire-capture work (was lib-public)
+#[allow(dead_code)]
 mod kms;
 mod logging;
 mod odmf_pc;
 #[allow(dead_code)] // opt-in video lane (RTSP=1); lane entry via sdpd
 mod rtsp;
-#[allow(dead_code)] // dev/CI surface kept for wire-capture work (was lib-public)
+// dev/CI surface kept for wire-capture work (was lib-public)
+#[allow(dead_code)]
 mod scp;
 #[cfg(feature = "gui")]
 mod ui;
 
+mod rpc;
+// dev/CI surface kept for wire-capture work (was lib-public)
+#[allow(dead_code)]
+mod scpc;
 mod sdpd;
 mod state;
-#[allow(dead_code)] // dev/CI surface kept for wire-capture work (was lib-public)
-mod steer;
 #[allow(dead_code)] // test helpers + Error state used by module tests/CI only
 mod ukey2;
 #[allow(dead_code)] // ODMF sink lane; armed via ODMF_SINK=1
@@ -124,6 +129,12 @@ enum Cmd {
     },
     /// Connect out to a peer TCP address.
     Connect { addr: String },
+    /// PC-originated vendor-parity connect: SCP client pump to the phone's
+    /// LAN server (`addr` = `IP`, port via `SCP_DIAL_PORT`, default 10152).
+    Dial { addr: String },
+    /// PC-originated connect trigger on the EPI plane (`addr` = `IP`,
+    /// port via `EPI_DIAL_PORT`, default 46888).
+    Epi { addr: String },
     /// pantaconnect LAN SDP responder headless (dev/CI lane; the default
     /// command embeds the same backend inside the GUI).
     Sdpd {
@@ -183,9 +194,10 @@ const DAEMON_ENV: &[(&str, &str)] = &[
 
 /// Per-pairing material persisted in `settings.json` (state dir) and
 /// seeded into the environment before the generic defaults: the values
-/// the live phone was paired with never live in the tree. Without them,
-/// `SCP_KSC` falls back to the deterministic per-pdid derivation and the
-/// LINK knobs to their synthetic env defaults.
+/// the live phone was paired with never live in the tree. `SCP_KSC` acts
+/// as the KSC pin for restored bonds (see `sdpd::issue_ksc`); with no
+/// pin and no bond in `ksc.json`, a fresh random bond is minted per peer
+/// on next pairing. LINK knobs fall back to their synthetic env defaults.
 const SETTINGS_ENV: &[(&str, &str)] = &[("scpKsc", "SCP_KSC"), ("linkKpd", "LINK_KPD")];
 
 /// `(env key, value)` pairs from `settings` whose env key is unset
@@ -381,6 +393,25 @@ fn main() -> Result<()> {
                 .with_context(|| format!("connect {addr}"))?;
             let (mut rd, mut wr) = sock.into_split();
             run_handshake(Role::Initiator, &mut rd, &mut wr).await
+        }),
+        Some(Cmd::Dial { addr }) => runtime()?.block_on(async move {
+            let name = pc_beacon_name();
+            match scpc::dial_connect(&addr, &name).await {
+                Ok(summary) => {
+                    tracing::info!("[scpc] {addr} connect OK — {summary}");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }),
+        Some(Cmd::Epi { addr }) => runtime()?.block_on(async move {
+            match scpc::epi_trigger(&addr).await {
+                Ok(summary) => {
+                    tracing::info!("[epic] {addr} trigger OK — {summary}");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }),
         Some(Cmd::Sdpd {
             ns,

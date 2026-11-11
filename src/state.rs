@@ -60,14 +60,27 @@ pub fn panel_settings_path() -> PathBuf {
     state_file("settings.json", "panel-settings.json")
 }
 
+/// Per-peer KSC bonds — our counterpart of the vendor PC store
+/// (`ksc_<HEX(deviceId)>` inside `cpbus_ksc_storage_<alias>`): JSON map
+/// peer key → {deviceId, alias, ksc} hex.
+pub fn ksc_store_path() -> PathBuf {
+    state_file("ksc.json", "ksc.json")
+}
+
 #[cfg(test)]
+/// Serializes process-env mutations across ALL test modules (edition-2024
+/// `set_var` is unsafe precisely because of concurrent env access; ksc
+/// tests in sdpd share this lock with the state tests).
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
 
     /// Serializes process-env mutations in this module (edition-2024
     /// `set_var` is unsafe precisely because of concurrent env access).
-    static ENV: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
+    // (shared lock lives at crate root as ENV_TEST_LOCK)
 
     #[expect(unsafe_code, reason = "serialized test-local env mutation")]
     fn set_env(key: &str, val: &str) {
@@ -84,7 +97,7 @@ mod tests {
 
     #[test]
     fn state_dir_override_wins_and_is_created() {
-        let _g = ENV.lock().expect("env lock");
+        let _g = crate::state::ENV_TEST_LOCK.lock().expect("env lock");
         let dir = std::env::temp_dir().join(format!("lplus-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         set_env("LPLUS_STATE_DIR", &dir.to_string_lossy());
@@ -96,7 +109,7 @@ mod tests {
 
     #[test]
     fn legacy_file_is_copied_once() {
-        let _g = ENV.lock().expect("env lock");
+        let _g = crate::state::ENV_TEST_LOCK.lock().expect("env lock");
         let root = std::env::temp_dir().join(format!("lplus-state-mig-{}", std::process::id()));
         let state = root.join("state");
         let capture = root.join("capture");

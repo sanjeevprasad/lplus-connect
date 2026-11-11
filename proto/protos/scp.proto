@@ -14,6 +14,22 @@
 // `lplus` bin. If Oplus's private `connect-protocols` repo ever surfaces
 // publicly, re-vendor from it and retire this hand-tagged mirror
 // (protos/README.md).
+//
+// PC-side corroboration 2026-11-10 (connect-protocols Rust pools, same
+// field sets — numbers stay phone-authoritative because the Rust Debug
+// pool order follows struct declaration, not wire tags):
+// `winzip/daemon/devicespace.exe` 16,453,360..16,453,666 and
+// `mac/…/daemon/O+Connect Service` 20,912,484..20,914,644 carry
+// `ScpSyncData`+{custom_data,key_type,link_type,active_trigger_mode,
+// model_id}, `ScpWrapData`+{msg_type}, `ScpHelloData`+{sequence_no,
+// namespace[,channel,service_name]}, `ScpSyncSecure`+{ksc_alias,ksc},
+// `ScpDisconnectData`+{disconnect_code,disconnect_reason}. Their
+// ScpMessageType pool adds a ninth value `Disconnect` after
+// `OobkeyFinished` (phone side only sends 0..7 today), and the
+// ScpSyncData-side `LinkType` used by the Rust engine is the
+// WlanSta/WlanP2pGo/WlanP2pGc/WlanSap/WlanNan/BT/Uwb/Usb/Cloud/Other/
+// Unavailable link-switch enum — a DIFFERENT axis from the P2P/WLAN/
+// CLOUD/USB/SPP enum pinned above; do not merge them.
 
 syntax = "proto3";
 

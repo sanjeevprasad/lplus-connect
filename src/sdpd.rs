@@ -155,19 +155,115 @@ pub fn reply_variants(verb: &str) -> Vec<(String, Vec<(&'static str, &'static st
     out
 }
 
-/// The 16-byte ksc the phone persists in `ksc_info` and authenticates the
-/// datatrans channel lane against. Must be stable across daemon restarts
-/// (the phone keeps the first stored row); `SCP_KSC` hex overrides,
-/// otherwise deterministically derived from our pdid.
-fn stable_ksc(_ek: &[u8], pdid: &str) -> Vec<u8> {
-    if let Ok(h) = std::env::var("SCP_KSC")
-        && let Ok(v) = hex::decode(h.trim().replace(":", ""))
-        && v.len() == 16
-    {
-        return v;
+/// Per-peer KSC bond, vendor parity. The PC generates `ksc` (16 B) and
+/// `kscAlias` (6 B) once per pairing (`SecureRandom`, vendor
+/// `pair/scp/b.java:271-295`), persists them (`ksc_<HEX(deviceId)>` in
+/// `cpbus_ksc_storage_*`), and replays both **verbatim** on every later
+/// connection: the phone only writes its `KscRepository` row inside a
+/// user-confirmed pairing (`ScpLanConnectionCallback.persistKscAfterUserConfirm`)
+/// and authenticates the channel lane against the stored copy, so any key
+/// rotation outside a fresh pairing is a self-inflicted
+/// `Session KSC not match` / AUTH `mac check: false`.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct KscRecord {
+    pub device_id: String,
+    pub alias: String,
+    pub ksc: String,
+}
+
+fn ksc_store() -> std::collections::HashMap<String, KscRecord> {
+    std::fs::read(crate::state::ksc_store_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn ksc_stored(peer_key: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let r = ksc_store().remove(peer_key)?;
+    let ksc = hex::decode(&r.ksc).ok()?;
+    let alias = hex::decode(&r.alias).ok()?;
+    (ksc.len() == 16 && alias.len() == 6).then_some((ksc, alias))
+}
+
+fn ksc_store_put(peer_key: &str, device_id: &str, ksc: &[u8], alias: &[u8]) {
+    tracing::info!(
+        "[ksc] bond {peer_key} dev={device_id} ksc={} alias={}",
+        hex::encode(ksc),
+        hex::encode(alias)
+    );
+    let mut store = ksc_store();
+    store.insert(
+        peer_key.to_string(),
+        KscRecord {
+            device_id: device_id.to_string(),
+            alias: hex::encode(alias),
+            ksc: hex::encode(ksc),
+        },
+    );
+    if let Ok(json) = serde_json::to_vec_pretty(&store) {
+        let _ = std::fs::write(crate::state::ksc_store_path(), json);
     }
-    use sha2::{Digest, Sha256};
-    Sha256::digest(format!("lplus-ksc:{pdid}").as_bytes())[..16].to_vec()
+}
+
+fn ksc_rand(n: usize) -> Vec<u8> {
+    use rand::Rng;
+    let mut v = vec![0u8; n];
+    rand::rng().fill_bytes(&mut v);
+    v
+}
+
+/// Operator pin: `SCP_KSC` hex forces the key for every peer (pairing
+/// material restored from `settings.json` arrives here via the seed).
+fn ksc_pin() -> Option<Vec<u8>> {
+    std::env::var("SCP_KSC")
+        .ok()
+        .and_then(|h| hex::decode(h.trim().replace(':', "")).ok())
+        .filter(|v| v.len() == 16)
+}
+
+/// The key pair to present to (and verify against) `peer_key`. Stored
+/// bond wins so resumption always replays what the phone persisted; a
+/// first pairing mints the random pair and persists it (vendor `b.java`
+/// behavior). `SCP_KSC` pins over everything for restored bonds.
+pub(crate) fn issue_ksc(peer_key: &str, device_id: &str) -> (Vec<u8>, Vec<u8>) {
+    if let Some(pair) = ksc_stored(peer_key) {
+        return pair;
+    }
+    let ksc = ksc_pin().unwrap_or_else(|| ksc_rand(16));
+    let alias = ksc_rand(6);
+    ksc_store_put(peer_key, device_id, &ksc, &alias);
+    (ksc, alias)
+}
+
+/// Persist an accepted verification key under `peer_key`, keeping the
+/// alias already bonded to it (AUTH proves possession of the bond, so
+/// adopting the peer's claimed device id here is safe and self-heals the
+/// store on first successful auth).
+pub(crate) fn remember_ksc(peer_key: &str, device_id: &str, ksc: &[u8]) {
+    let alias = ksc_stored(peer_key).map_or_else(|| ksc_rand(6), |(_, a)| a);
+    ksc_store_put(peer_key, device_id, ksc, &alias);
+}
+
+/// Keys we may have bonded with this peer, in trust order: the bond
+/// stored for the peer socket, then the bond stored under the device id
+/// it claims. AUTH succeeds only against a bond we handed out — an
+/// unpaired peer gets no response and the phone surfaces `KSC_ERROR`,
+/// which is the correct nudge to re-pair.
+pub(crate) fn ksc_candidates(peer_key: &str, dev_key: &str) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for key in [peer_key, dev_key] {
+        if let Some((ksc, _)) = ksc_stored(key)
+            && !out.contains(&ksc)
+        {
+            out.push(ksc);
+        }
+    }
+    // The settings-restored pin (main.rs seeds SCP_KSC from settings.json)
+    // must keep verifying until a successful AUTH promotes it into a bond.
+    if let Some(k) = ksc_pin() {
+        out.push(k);
+    }
+    out
 }
 
 /// `datatrans/security/a.d`: `HmacSHA512(ksc, data)[0..8]` (the truncated
@@ -191,7 +287,7 @@ fn be8(v: u64) -> [u8; 8] {
 /// iff queryType==3) | recordNum u8 | recordNum x (profileId UTF-8 + 0x3B)`.
 /// Mirrors `wf/i.d(3, 0, list)` + `datatrans/service/f.y()` composer; the
 /// phone parses it in `datatrans/service/f.k` via `security.d`.
-fn capex_query(profiles: &[&str]) -> Vec<u8> {
+pub(crate) fn capex_query(profiles: &[&str]) -> Vec<u8> {
     let mut q: Vec<u8> = vec![0x01, 0x03, 0, 0, 0, 0, profiles.len() as u8];
     for p in profiles {
         q.extend_from_slice(p.as_bytes());
@@ -202,7 +298,7 @@ fn capex_query(profiles: &[&str]) -> Vec<u8> {
 
 /// Capability-exchange CONFIRM: `04 | accessoryId u16be | statusCode u8`.
 /// Phone (`f.i`) only enforces statusCode == 0.
-fn capex_confirm(accessory_id: u16, status: u8) -> Vec<u8> {
+pub(crate) fn capex_confirm(accessory_id: u16, status: u8) -> Vec<u8> {
     vec![0x04, (accessory_id >> 8) as u8, accessory_id as u8, status]
 }
 
@@ -291,7 +387,7 @@ fn sess_frame(payload: &[u8], session_id: u16) -> Vec<u8> {
 }
 
 /// Capex frames ride the session lane unless `EPI_CAPEX_FRAME=bare`.
-fn capex_frame(payload: &[u8]) -> Vec<u8> {
+pub(crate) fn capex_frame(payload: &[u8]) -> Vec<u8> {
     if std::env::var("EPI_CAPEX_FRAME").as_deref() == Ok("bare") {
         dt_frame(payload)
     } else {
@@ -356,7 +452,7 @@ fn capex_checksum(profiles: &[&str]) -> u32 {
 ///  (pkg+0x3B)(name+0x3B)(count u16be x (version u16be, profileId+0x3B,
 ///  m u16be, flags u8, f u16be))...` — layout verified byte-for-byte
 /// against the phone's own response 2026-11-09 15:49.
-fn capex_response(profiles: &[&str]) -> Vec<u8> {
+pub(crate) fn capex_response(profiles: &[&str]) -> Vec<u8> {
     let mut v: Vec<u8> = vec![0x02, 0x03, 0, 0, 0, 0];
     v.extend_from_slice(&1u16.to_be_bytes());
     v.extend_from_slice(CAPEX_PKG.as_bytes());
@@ -406,7 +502,7 @@ fn dt_frame(payload: &[u8]) -> Vec<u8> {
 /// datatrans/security/b.s: mac over `challengeCode || time u64 LE`.
 /// (Wire `n()` writes time BE, but the mix loops in `s`/`t` shift by
 /// `v*8` with v ascending — LE; pinned by the live AUTH_REQUEST vector.)
-fn ksc_s(ksc: &[u8], code: &[u8], ts: u64) -> [u8; 8] {
+pub(crate) fn ksc_s(ksc: &[u8], code: &[u8], ts: u64) -> [u8; 8] {
     let mut d = code.to_vec();
     d.extend_from_slice(&ts.to_le_bytes());
     ksc_mac8(ksc, &d)
@@ -415,7 +511,7 @@ fn ksc_s(ksc: &[u8], code: &[u8], ts: u64) -> [u8; 8] {
 /// datatrans/security/b.t: server proof over `qc || qs || time u64 LE`.
 /// (Caller stores 16B "sessionKey" as `Rs || zeros8` — Arrays.copyOfRange
 /// pads the 8-byte MAC, mirroring the phone.)
-fn ksc_t(ksc: &[u8], qc: &[u8], qs: &[u8], ts: u64) -> [u8; 8] {
+pub(crate) fn ksc_t(ksc: &[u8], qc: &[u8], qs: &[u8], ts: u64) -> [u8; 8] {
     let mut d = qc.to_vec();
     d.extend_from_slice(qs);
     d.extend_from_slice(&ts.to_le_bytes());
@@ -498,6 +594,18 @@ pub(crate) static EPI_SINKS: std::sync::LazyLock<
     tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
 > = std::sync::LazyLock::new(tokio::sync::Mutex::default);
 
+/// Abort handles for the live session pump tasks, per peer IP: a GUI/REPL
+/// Disconnect must close our side of the vendor session (FIN/RST), not
+/// just push a DISCONNECT frame the phone may ignore.
+pub(crate) static SESSION_KILLERS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Vec<tokio::task::AbortHandle>>>,
+> = std::sync::LazyLock::new(std::sync::Mutex::default);
+
+/// Last LAN peer that probed the SDP planes (the phone). Used to resolve
+/// the REPL's `connect phone` shorthand.
+pub(crate) static PHONE_IP: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
 /// Presence events for in-process consumers (the product embeds the daemon;
 /// headless users can subscribe over the NDJSON port `LPLUS_EVENTS_PORT`).
 #[derive(Clone, Debug, serde::Serialize)]
@@ -517,8 +625,9 @@ pub fn subscribe_devices() -> tokio::sync::broadcast::Receiver<DeviceEvent> {
     DEVICE_TX.subscribe()
 }
 
-/// UI/headless control plane: the single-binary GUI (and dev tools) steer
-/// the phone through the backend instead of driving adb themselves.
+/// UI/headless control plane: the single-binary GUI (and dev tools) drive
+/// the phone through the backend (LAN SCP dial, EPI sink push) instead of
+/// touching the transport themselves.
 #[derive(Debug, Clone)]
 pub enum Command {
     /// Drive the phone's PC-panel row for our advertised name (AppFunction).
@@ -533,11 +642,34 @@ pub enum Command {
     KmsBootstrap {
         ip: String,
     },
+    /// Inject the RpcFrame candidate set (compat-scp + cpbus.networking
+    /// connect/acceptConnection) onto every live :46888 session.
+    RpcConnect {
+        ip: String,
+    },
     /// Inject raw hex onto every EPI sink whose key contains the substring.
     SendFrame {
         key_substr: String,
         hex: String,
     },
+    /// Invoke a named GUI element action (REPL `click <id>`), executed by
+    /// the window's own handlers — see `AppState::handle_ui_click`.
+    UiClick {
+        id: String,
+    },
+}
+
+/// Clicks queued by the REPL for the GUI lane to drain (element ids like
+/// `connect:0`, `disconnect:0`, `confirm`). Only meaningful in the unified
+/// process that hosts the window.
+static UI_CLICKS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
+pub fn take_ui_clicks() -> Vec<String> {
+    UI_CLICKS
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
 }
 
 static CMD_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<Command>> =
@@ -553,7 +685,7 @@ pub fn subscribe_commands() -> tokio::sync::broadcast::Receiver<Command> {
 
 /// CastMessage msg_type=61 wrapped in the proven DbsMessage/DataBus frame
 /// (PROTOCOL.md §7.2). `from` is our peer id, `to` the phone PDID.
-fn kms_bootstrap_frame(
+pub(crate) fn kms_bootstrap_frame(
     kms_port: u16,
     pwd: &str,
     local_ip: &str,
@@ -586,44 +718,20 @@ fn kms_bootstrap_frame(
     ))
 }
 
-/// Drive the phone's PC-panel row with retries: the AppFunction gate only
-/// accepts a transition while the accessory engine's list is fresh, and
-/// that window lasts seconds (one discovery cycle). The phone re-discovers
-/// our PC every `announce_secs`, so retry the set on a short cadence to
-/// land inside the next window; the linker-panel poke (a full app start,
-/// ~1 s of adb) runs once, before the tight loop.
-async fn drive_panel_state(ip: &str, dev_name: &str, connect: bool) {
-    use crate::steer::SetState;
-    let verb = if connect { "connect" } else { "disconnect" };
-    const ATTEMPTS: u8 = 12;
-    crate::steer::poke_linker_panel().await;
-    for attempt in 0..ATTEMPTS {
-        let Ok(out) = crate::steer::set_connected_state(dev_name, connect).await else {
-            tracing::warn!("[cmd] {verb} {ip} FAILED (adb)");
-            return;
-        };
-        match crate::steer::parse_set_state(&out) {
-            SetState::Success => {
-                tracing::info!(
-                    "[cmd] {verb} {ip} via app_function (attempt {})",
-                    attempt + 1
-                );
-                return;
-            }
-            SetState::Retryable(reason) if attempt < ATTEMPTS - 1 && attempt % 4 == 3 => {
-                // Same verdict every window: nudge the engine to rescan.
-                tracing::info!("[cmd] {verb} {ip}: panel stale ({reason}); rescanning phone");
-                crate::steer::refresh_panel_snapshot().await;
-            }
-            SetState::Retryable(_) => {}
-            SetState::Failed(reason) => {
-                tracing::warn!("[cmd] {verb} {ip} rejected: {reason}");
-                return;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+/// Resolve the REPL/GUI `"phone"` shorthand to the last LAN peer seen on
+/// the SDP planes; anything else is already an address.
+fn resolve_phone_ip(ip: &str) -> String {
+    if ip != "phone" {
+        return ip.to_string();
     }
-    tracing::warn!("[cmd] {verb} {ip} rejected: panel row never fresh in {ATTEMPTS} attempts");
+    PHONE_IP
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| {
+            tracing::warn!("[cmd] no phone seen yet on the SDP planes; using 127.0.0.1");
+            "127.0.0.1".into()
+        })
 }
 
 fn spawn_command_runner(dev_name: String, kms_pwd: String, local_ip: String, kms_port: u16) {
@@ -632,10 +740,70 @@ fn spawn_command_runner(dev_name: String, kms_pwd: String, local_ip: String, kms
         while let Ok(cmd) = rx.recv().await {
             match cmd {
                 Command::Connect { ip } => {
-                    drive_panel_state(&ip, &dev_name, true).await;
+                    let ip = resolve_phone_ip(&ip);
+                    crate::scpc::spawn_dial(ip.clone(), dev_name.clone());
+                    // Session lane (proven): KMS bootstrap DataBus push is
+                    // the trigger the phone's engine acts on (it dialed our
+                    // :10152 with a completed handshake after this frame,
+                    // PROTOCOL §7.2), and the RpcFrame candidate set rides
+                    // the same live :46888 session (§7.10). Both no-op with
+                    // no live session; the direct dial above covers that.
+                    let _ = send_command(Command::KmsBootstrap { ip: ip.clone() });
+                    let _ = send_command(Command::RpcConnect { ip });
                 }
                 Command::Disconnect { ip } => {
-                    drive_panel_state(&ip, &dev_name, false).await;
+                    let ip = resolve_phone_ip(&ip);
+                    // Vendor disconnect = cpbus DISCONNECT (msgType 65535)
+                    // on the live session lanes; no live lane → no-op.
+                    let frame = crate::scp::msg_frame(65535, Vec::new());
+                    let mut sent = 0usize;
+                    {
+                        let mut sinks = EPI_SINKS.lock().await;
+                        for (k, tx) in sinks.iter() {
+                            if k.contains(&ip) && tx.send(frame.clone()).is_ok() {
+                                sent += 1;
+                            }
+                        }
+                        // Drop our injection handles for this peer; lanes
+                        // that observe the closed channel end themselves.
+                        sinks.retain(|k, _| !k.contains(&ip));
+                    }
+                    // Close our side of every live session with this peer so
+                    // the phone sees the link actually go down (a DISCONNECT
+                    // frame alone leaves the vendor UI at "Connected").
+                    let killers = SESSION_KILLERS
+                        .lock()
+                        .map(|m| m.get(&ip).cloned().unwrap_or_default())
+                        .unwrap_or_default();
+                    let mut closed = 0usize;
+                    for h in killers {
+                        if !h.is_finished() {
+                            h.abort();
+                            closed += 1;
+                        }
+                    }
+                    emit_device("epi", ip.clone(), None, false);
+                    tracing::info!(
+                        "[cmd] disconnect {ip}: DISCONNECT pushed to {sent} sink(s), {closed} session(s) closed"
+                    );
+                }
+                Command::RpcConnect { ip } => {
+                    let ip = resolve_phone_ip(&ip);
+                    tokio::spawn(async move {
+                        for (label, wire) in crate::scpc::rpc_frames(&ip) {
+                            let mut sent = 0usize;
+                            for (k, tx) in EPI_SINKS.lock().await.iter() {
+                                if k.contains("46888") && tx.send(wire.clone()).is_ok() {
+                                    sent += 1;
+                                }
+                            }
+                            tracing::info!("[cmd] rpc {label}: pushed to {sent} sink(s)");
+                            if sent == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                        }
+                    });
                 }
                 Command::KmsBootstrap { ip } => {
                     let from =
@@ -687,6 +855,12 @@ fn spawn_command_runner(dev_name: String, kms_pwd: String, local_ip: String, kms
                     }
                     Err(e) => tracing::info!("[cmd] send {key_substr:?} bad hex: {e}"),
                 },
+                Command::UiClick { id } => {
+                    tracing::info!("[cmd] ui click queued {id:?}");
+                    if let Ok(mut q) = UI_CLICKS.lock() {
+                        q.push(id);
+                    }
+                }
             }
         }
     });
@@ -760,6 +934,7 @@ enum ReplCmd {
     Connect,
     Disconnect,
     Kms,
+    Rpc,
 }
 
 /// Loopback line REPL to probe open pipes without redoing handshakes:
@@ -827,6 +1002,7 @@ pub fn spawn_repl() {
                         .strip_prefix("connect ")
                         .or_else(|| t.strip_prefix("disconnect "))
                         .or_else(|| t.strip_prefix("kms "))
+                        .or_else(|| t.strip_prefix("rpc "))
                     {
                         let ip = rest.trim().to_string();
                         let ip = if ip.is_empty() {
@@ -838,20 +1014,31 @@ pub fn spawn_repl() {
                             Command::Connect { ip }
                         } else if t.starts_with("disconnect") {
                             Command::Disconnect { ip }
+                        } else if t.starts_with("rpc") {
+                            Command::RpcConnect { ip }
                         } else {
                             Command::KmsBootstrap { ip }
                         };
                         out = format!("queued {}\n", send_command(cmd));
+                    } else if let Some(id) = t.strip_prefix("click ") {
+                        let id = id.trim().to_string();
+                        if id.is_empty() {
+                            out = "usage: click <element-id> (device-connect:<i>|card-disconnect:<i>|menu-delete:<i>|card-more:<i>|confirm|cancel)\n"
+                                .into();
+                        } else {
+                            out = format!("queued {}\n", send_command(Command::UiClick { id }));
+                        }
                     } else if let Ok(repl) = ReplCmd::from_str(t.as_str()) {
                         let cmd = match repl {
                             ReplCmd::Connect => Command::Connect { ip: "phone".into() },
                             ReplCmd::Disconnect => Command::Disconnect { ip: "phone".into() },
                             ReplCmd::Kms => Command::KmsBootstrap { ip: "phone".into() },
+                            ReplCmd::Rpc => Command::RpcConnect { ip: "phone".into() },
                         };
                         out = format!("queued {}\n", send_command(cmd));
                     } else {
                         out =
-                            "commands: list | send <substr> <hex> | connect|disconnect|kms [ip]\n"
+                            "commands: list | send <substr> <hex> | connect|disconnect|kms|rpc [ip] | click <element-id>\n"
                                 .into();
                     }
                     let _ = rd.get_mut().write_all(out.as_bytes()).await;
@@ -1342,7 +1529,8 @@ fn spawn_session_logger(
     epi_port: u16,
 ) {
     tracing::info!("[tcp] connection from {peer}");
-    tokio::spawn(async move {
+    let session_ip = peer.ip().to_string();
+    let task = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         if epi {
             // EPI PD OFFER over the datatrans channel (jf/b.java writer,
@@ -1415,25 +1603,17 @@ fn spawn_session_logger(
             // CONFIRM msgType 4 [4][proto u16be][status=1]. Accept both the
             // connector 2B header [00][len][payload] and the legacy 3B form.
             let peer_id2 = peer_id.clone();
-            tokio::spawn(async move {
+            let epi_session = tokio::spawn(async move {
                 let mut acc: Vec<u8> = Vec::new();
                 let mut tmp = [0u8; 4096];
                 let mut confirmed = false;
                 // Late-PROBE state (PROBE after auth).
                 let mut probe_pending = false;
                 let mut probe_peer: Vec<u8> = Vec::new();
-                // datatrans/security lane: ksc we published in sync-secure
-                // (phone stored it under (deviceId, kscAlias)).
-                let ksc: Option<Vec<u8>> = std::env::var("EPI_KSC")
-                    .ok()
-                    .and_then(|s| hex::decode(s.trim().replace(":", "")).ok())
-                    .or_else(|| std::fs::read(format!("{path}.ksc")).ok())
-                    .filter(|v| v.len() == 16);
-                tracing::info!(
-                    "[epi] :{epi_port} ksc ready={} {}",
-                    ksc.is_some(),
-                    ksc.as_deref().map(hex::encode).unwrap_or_default(),
-                );
+                // datatrans/security lane session key: set only when an
+                // AUTH MAC matches a bond in the per-peer KSC store
+                // (`ksc.json`) — unpaired peers get no AUTH response.
+                let mut ksc: Option<Vec<u8>> = None;
                 // Manual-injection sink: REPL `send` bytes are written onto
                 // this live socket from the read loop's select, no
                 // re-handshake needed. Key: "{port} {peer}".
@@ -1526,6 +1706,10 @@ fn spawn_session_logger(
                             }
                         }
                     } else {
+                        // Idle guard: a peer that vanishes without a FIN
+                        // must not pin the row's connected flag — silence
+                        // for `EPI_IDLE` is treated as a closed link.
+                        const EPI_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
                         match &mut repl_rx {
                             Some(rx) => {
                                 tokio::select! {
@@ -1546,9 +1730,12 @@ fn spawn_session_logger(
                                         }
                                         continue;
                                     }
+                                    _ = tokio::time::sleep(EPI_IDLE) => Ok(0),
                                 }
                             }
-                            None => sock.read(&mut tmp).await,
+                            None => tokio::time::timeout(EPI_IDLE, sock.read(&mut tmp))
+                                .await
+                                .unwrap_or(Ok(0)),
                         }
                     };
                     match rd {
@@ -1832,14 +2019,29 @@ fn spawn_session_logger(
                                     hex::encode(dev),
                                     hex::encode(alias),
                                 );
-                                let Some(ksc) = ksc.as_deref() else {
+                                // The phone keys this MAC on the row its
+                                // KscRepository persisted for us
+                                // (SecurityClientFsm → getKscKey(deviceId,
+                                // alias)). Accept any key we ever bonded
+                                // with this peer; the matching key becomes
+                                // the session key for the s/t proofs.
+                                let peer_ip = peer.ip().to_string();
+                                let mac8 = <[u8; 8]>::try_from(mac).unwrap_or([0; 8]);
+                                let accepted = ksc_candidates(&peer_ip, &hex::encode(dev))
+                                    .into_iter()
+                                    .find(|c| ksc_s(c, qc, ts) == mac8);
+                                if let Some(k) = accepted {
+                                    ksc = Some(k.clone());
+                                    remember_ksc(&peer_ip, &hex::encode(dev), &k);
+                                    remember_ksc(&hex::encode(dev), &hex::encode(dev), &k);
+                                }
+                                let Some(ksc) = ksc.clone() else {
                                     tracing::info!(
                                         "[epi] :{epi_port} AUTH_REQUEST but no ksc; skipping response"
                                     );
                                     continue;
                                 };
-                                let mac_ok = ksc_s(ksc, qc, ts)
-                                    == <[u8; 8]>::try_from(mac).unwrap_or([0; 8]);
+                                let mac_ok = ksc_s(&ksc, qc, ts) == mac8;
                                 tracing::info!("[epi] :{epi_port} client mac check: {mac_ok}");
                                 let mut qs = [0u8; 8];
                                 use rand::Rng;
@@ -1848,13 +2050,13 @@ fn spawn_session_logger(
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(1);
-                                let rs = ksc_t(ksc, qc, &qs, ts2);
+                                let rs = ksc_t(&ksc, qc, &qs, ts2);
                                 // Client computes rc_2 = s(ksc, qs, ts) with
                                 // ts = ITS OWN request time (checkResponseParams
                                 // copies uf/a.c into vf/b.e); qs (our server
                                 // challenge) is the code. Pinned by live
                                 // confirm 12 02 00 cf.. on 2026-11-09.
-                                expect_rc2 = Some(ksc_s(ksc, &qs, ts));
+                                expect_rc2 = Some(ksc_s(&ksc, &qs, ts));
                                 let mut resp: Vec<u8> = vec![resp_type, ver, 0x00];
                                 resp.extend_from_slice(&qs);
                                 resp.extend_from_slice(&be8(ts2));
@@ -2017,6 +2219,15 @@ fn spawn_session_logger(
                 }
                 tracing::info!("[epi] :{epi_port} closed {peer} confirmed={confirmed}");
             });
+            // Without this registration a `disconnect` aborts nothing and
+            // the phone keeps the :46888 link half-open — PTC then refuses
+            // new connects ("device Connected, Scan results are not
+            // processed") while our panel already shows disconnected.
+            if let Ok(mut m) = SESSION_KILLERS.lock() {
+                let v = m.entry(event_host(&peer)).or_default();
+                v.retain(|h| !h.is_finished());
+                v.push(epi_session.abort_handle());
+            }
             return;
         }
         let mut buf = vec![0u8; 8192];
@@ -2300,10 +2511,9 @@ fn spawn_session_logger(
                                                         "[scp] {peer} ukey2 handshake complete"
                                                     );
                                                     // Their client waits (5 s) for our
-                                                    // SYNC_SECURE after ukey2; ksc = first
-                                                    // half of our server-side session key
-                                                    // (mirrors `um.a`'s copyOfRange of the
-                                                    // SecretKeySpec in Ukey2ClientImpl).
+                                                    // SYNC_SECURE after ukey2; it carries
+                                                    // our per-peer bond (`issue_ksc`), not
+                                                    // session key material.
                                                     if std::env::var("SCP_SS_SEND").is_ok()
                                                         && mt == 4
                                                         && ss_send.is_none()
@@ -2328,43 +2538,27 @@ fn spawn_session_logger(
                                                                 ),
                                                             );
                                                             ss_iv = h.peer_iv().map(|v| v.to_vec());
-                                                            let ek = ctx.encode_key().to_vec();
                                                             let pdid = std::env::var("SCP_PDID")
                                                                 .unwrap_or_else(|_| {
                                                                     "A1B2C3D4E5F6".into()
                                                                 });
-                                                            // ksc must be STABLE across
-                                                            // daemon restarts: the phone
-                                                            // persists it under
-                                                            // (deviceId, alias) and authenticates
-                                                            // the channel lane against the
-                                                            // stored copy (KscRepositoryImpl
-                                                            // .loadKsc, "SELECT * FROM ksc_info
-                                                            // WHERE deviceId = ? AND alias = ?").
-                                                            let ksc = stable_ksc(&ek, &pdid);
+                                                            // Present our BOND for this
+                                                            // peer, never a fresh key: the
+                                                            // phone persists ksc only in a
+                                                            // user-confirmed pairing and
+                                                            // AUTH-keys on the stored row
+                                                            // (KscRepositoryImpl.loadKsc,
+                                                            // "SELECT * FROM ksc_info WHERE
+                                                            // deviceId = ? AND alias = ?").
+                                                            let peer_ip = peer.ip().to_string();
+                                                            let (ksc, alias) =
+                                                                issue_ksc(&peer_ip, &pdid);
                                                             ss_send = Some(ksc.clone());
-                                                            // ksc_alias must be non-empty:
-                                                            // loadKsc short-circuits on an
-                                                            // empty alias ("alias is empty,
-                                                            // so return empty ksc") and the
-                                                            // phone's SecurityClientFsm then
-                                                            // self-kills into KSC_ERROR.
-                                                            let alias =
-                                                                hex::decode(pdid.as_bytes())
-                                                                    .unwrap_or_else(|_| {
-                                                                        pdid.as_bytes()
-                                                                            [..pdid.len().min(6)]
-                                                                            .to_vec()
-                                                                    });
                                                             let ss = crate::scp::SyncSecure {
                                                                 device_id: Some(pdid.clone()),
                                                                 ksc: Some(ksc.clone()),
                                                                 ksc_alias: Some(alias),
                                                             };
-                                                            let _ = std::fs::write(
-                                                                format!("{path}.ksc"),
-                                                                &ksc,
-                                                            );
                                                             let f = if std::env::var("SCP_SS_ENC")
                                                                 .is_ok()
                                                             {
@@ -3179,6 +3373,15 @@ fn spawn_session_logger(
             }
         }
     });
+    if let Ok(mut m) = SESSION_KILLERS.lock() {
+        let v = m.entry(session_ip.clone()).or_default();
+        v.retain(|h| !h.is_finished());
+        v.push(task.abort_handle());
+        tracing::info!(
+            "[tcp] session pump registered for {session_ip} (n={})",
+            v.len()
+        );
+    }
 }
 
 // SDP response context: config, sockets, and per-request SDP fields —
@@ -3205,6 +3408,9 @@ async fn handle(
         data,
     );
     *last_phone = Some(from);
+    if let Ok(mut g) = PHONE_IP.lock() {
+        *g = Some(from.ip().to_string());
+    }
     let verb = line.split(' ').next().unwrap_or("").to_string();
     if verb != "QUERY" && !line.starts_with("SENSELESS ") {
         return;
@@ -3296,6 +3502,65 @@ fn link_info_payload(mac: &str, ip: &str, gw: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // (ksc tests share the crate-wide ENV_TEST_LOCK: env mutation is process-global)
+
+    #[expect(unsafe_code, reason = "std::env::set_var is unsafe in edition 2024")]
+    fn ksc_env_isolate(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lplus-ksc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("LPLUS_STATE_DIR", &dir);
+            std::env::remove_var("SCP_KSC");
+        }
+        dir
+    }
+
+    #[test]
+    fn ksc_bond_is_minted_once_and_replayed_across_restarts() {
+        let _guard = crate::state::ENV_TEST_LOCK.lock().expect("ksc test lock");
+        let dir = ksc_env_isolate("mint");
+        let (k1, a1) = issue_ksc("192.0.2.102", "A1B2C3D4E5F6");
+        assert_eq!(k1.len(), 16);
+        assert_eq!(a1.len(), 6);
+        // "Restart" = fresh process view; the store file is re-read each call.
+        let (k2, a2) = issue_ksc("192.0.2.102", "A1B2C3D4E5F6");
+        assert_eq!(k1, k2, "resumption must replay the bonded ksc verbatim");
+        assert_eq!(a1, a2, "alias must be stable too (loadKsc keys on it)");
+        let stored = std::fs::read_to_string(crate::state::ksc_store_path()).expect("store");
+        assert!(
+            stored.contains(&hex::encode(&k1)),
+            "bond not persisted: {stored}"
+        );
+        // A different peer gets its own key, not a reuse of the first.
+        let (k3, _) = issue_ksc("192.0.2.103", "A1B2C3D4E5F6");
+        assert_ne!(k1, k3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_mac_accepted_only_for_bonded_key_and_promoted_to_dev_id() {
+        let _guard = crate::state::ENV_TEST_LOCK.lock().expect("ksc test lock");
+        let dir = ksc_env_isolate("auth");
+        let qc = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let ts = 45608u64;
+        let bonded = [0xabu8; 16];
+        let mac = ksc_s(&bonded, &qc, ts);
+        let dev_hex = "bcc5b323465c";
+        // No bond yet: nothing to verify against (phone would re-pair).
+        assert!(ksc_candidates("192.0.2.102", dev_hex).is_empty());
+        // Bond issued via sync-secure to the peer IP.
+        let (_, alias) = issue_ksc("192.0.2.102", "A1B2C3D4E5F6");
+        ksc_store_put("192.0.2.102", "A1B2C3D4E5F6", &bonded, &alias);
+        let cands = ksc_candidates("192.0.2.102", dev_hex);
+        assert_eq!(cands, vec![bonded.to_vec()]);
+        assert!(cands.iter().any(|c| ksc_s(c, &qc, ts) == mac));
+        // Success promotes the bond under the claimed device id, so the
+        // next AUTH resolves even from a different socket/port.
+        remember_ksc(dev_hex, dev_hex, &bonded);
+        assert_eq!(ksc_candidates("192.0.2.9", dev_hex), vec![bonded.to_vec()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn dbs_payload_json_accepts_our_frame_and_rejects_bad_msgtype() {
