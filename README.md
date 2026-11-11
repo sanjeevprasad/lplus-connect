@@ -14,7 +14,7 @@ own renderer. See the [disclaimer](#disclaimer) before connecting a device.
 ## Use it
 
 ```sh
-cargo run                     # daemon + desktop window
+cargo run                     # daemon + gRPC contract server (:1421)
 cargo run -- daemon           # headless, logs to stdout
 ```
 

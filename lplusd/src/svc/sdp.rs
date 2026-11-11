@@ -16,9 +16,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use strum::{Display, EnumString};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
+
+use crate::svc::{epi, scp_server};
 
 /// Configuration for one responder instance.
 pub struct SdpdConfig {
@@ -576,21 +578,6 @@ pub(crate) fn record(log_path: &str, tag: &str, bytes: &[u8]) {
     let _ = f.flush();
 }
 
-/// Live TCP sink registry: every accepted EPI session registers an
-/// injection handle so command frames (DISCONNECT, KMS bootstrap,
-/// RpcFrame) can be written onto the open socket without a re-handshake.
-/// Key: `"{epi_port} {peer}"`; consumers unregister on socket death.
-pub(crate) static EPI_SINKS: std::sync::LazyLock<
-    tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
-> = std::sync::LazyLock::new(tokio::sync::Mutex::default);
-
-/// Abort handles for the live session pump tasks, per peer IP: a GUI
-/// Disconnect must close our side of the vendor session (FIN/RST), not
-/// just push a DISCONNECT frame the phone may ignore.
-pub(crate) static SESSION_KILLERS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<String, Vec<tokio::task::AbortHandle>>>,
-> = std::sync::LazyLock::new(std::sync::Mutex::default);
-
 /// Last LAN peer that probed the SDP planes (the phone). Used to resolve
 /// the `connect phone` shorthand in device actions.
 pub(crate) static PHONE_IP: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
@@ -615,47 +602,6 @@ pub fn subscribe_devices() -> tokio::sync::broadcast::Receiver<DeviceEvent> {
     DEVICE_TX.subscribe()
 }
 
-/// UI/headless control plane: the single-binary GUI (and dev tools) drive
-/// the phone through the backend (LAN SCP dial, EPI sink push) instead of
-/// touching the transport themselves.
-#[derive(Debug, Clone)]
-pub enum Command {
-    /// Drive the phone's PC-panel row for our advertised name (AppFunction).
-    Connect {
-        ip: String,
-    },
-    Disconnect {
-        ip: String,
-    },
-    /// Push the CastMessage msg_type=61 DataBus bootstrap on the live
-    /// :46888 session so the phone dials our KMS server.
-    KmsBootstrap {
-        ip: String,
-    },
-    /// Inject the RpcFrame candidate set (compat-scp + cpbus.networking
-    /// connect/acceptConnection) onto every live :46888 session.
-    RpcConnect {
-        ip: String,
-    },
-    /// Inject raw hex onto every EPI sink whose key contains the substring
-    /// (the DataBus cast lane pushes its DbsMessage frames this way).
-    SendFrame {
-        key_substr: String,
-        hex: String,
-    },
-}
-
-static CMD_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<Command>> =
-    std::sync::LazyLock::new(|| tokio::sync::broadcast::channel(32).0);
-
-pub fn send_command(cmd: Command) -> bool {
-    CMD_TX.send(cmd).is_ok()
-}
-
-pub fn subscribe_commands() -> tokio::sync::broadcast::Receiver<Command> {
-    CMD_TX.subscribe()
-}
-
 /// CastMessage msg_type=61 wrapped in the proven DbsMessage/DataBus frame
 /// (PROTOCOL.md §7.2). `from` is our peer id, `to` the phone PDID.
 pub(crate) fn kms_bootstrap_frame(
@@ -665,7 +611,7 @@ pub(crate) fn kms_bootstrap_frame(
     from_hex: &str,
     to_hex: &str,
 ) -> Result<Vec<u8>> {
-    let td = crate::kms::make_test_data(pwd)?;
+    let td = crate::svc::kms::make_test_data(pwd)?;
     let body = format!(
         "{{\"kms_socket_port\":{kms_port},\"local_ip\":\"{local_ip}\",\"display_id\":0,\
          \"randomPwd\":\"{pwd}\",\"testData\":\"{td}\",\"event_type\":\"connect\"}}"
@@ -678,11 +624,17 @@ pub(crate) fn kms_bootstrap_frame(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(1);
-    let json =
-        crate::kms::dbs_message_json("Oplus_Cast", from_hex, to_hex, "input_service", &cast, seq);
+    let json = crate::svc::kms::dbs_message_json(
+        "Oplus_Cast",
+        from_hex,
+        to_hex,
+        "input_service",
+        &cast,
+        seq,
+    );
     let from6: [u8; 6] = hex::decode(from_hex)?.as_slice().try_into()?;
     let to6: [u8; 6] = hex::decode(to_hex)?.as_slice().try_into()?;
-    Ok(crate::kms::dbs_data_frame(
+    Ok(crate::svc::kms::dbs_data_frame(
         &from6,
         &to6,
         seq,
@@ -693,7 +645,7 @@ pub(crate) fn kms_bootstrap_frame(
 
 /// Resolve the `"phone"` shorthand device-action target to the last LAN peer seen on
 /// the SDP planes; anything else is already an address.
-fn resolve_phone_ip(ip: &str) -> String {
+pub(crate) fn resolve_phone_ip(ip: &str) -> String {
     if ip != "phone" {
         return ip.to_string();
     }
@@ -705,132 +657,6 @@ fn resolve_phone_ip(ip: &str) -> String {
             tracing::warn!("[cmd] no phone seen yet on the SDP planes; using 127.0.0.1");
             "127.0.0.1".into()
         })
-}
-
-fn spawn_command_runner(dev_name: String, kms_pwd: String, local_ip: String, kms_port: u16) {
-    tokio::spawn(async move {
-        let mut rx = subscribe_commands();
-        while let Ok(cmd) = rx.recv().await {
-            match cmd {
-                Command::Connect { ip } => {
-                    let ip = resolve_phone_ip(&ip);
-                    crate::scpc::spawn_dial(ip.clone(), dev_name.clone());
-                    // Session lane (proven): KMS bootstrap DataBus push is
-                    // the trigger the phone's engine acts on (it dialed our
-                    // :10152 with a completed handshake after this frame,
-                    // PROTOCOL §7.2), and the RpcFrame candidate set rides
-                    // the same live :46888 session (§7.10). Both no-op with
-                    // no live session; the direct dial above covers that.
-                    let _ = send_command(Command::KmsBootstrap { ip: ip.clone() });
-                    let _ = send_command(Command::RpcConnect { ip });
-                }
-                Command::Disconnect { ip } => {
-                    let ip = resolve_phone_ip(&ip);
-                    // Vendor disconnect = cpbus DISCONNECT (msgType 65535)
-                    // on the live session lanes; no live lane → no-op.
-                    let frame = crate::scp::msg_frame(65535, Vec::new());
-                    let mut sent = 0usize;
-                    {
-                        let mut sinks = EPI_SINKS.lock().await;
-                        for (k, tx) in sinks.iter() {
-                            if k.contains(&ip) && tx.send(frame.clone()).is_ok() {
-                                sent += 1;
-                            }
-                        }
-                        // Drop our injection handles for this peer; lanes
-                        // that observe the closed channel end themselves.
-                        sinks.retain(|k, _| !k.contains(&ip));
-                    }
-                    // Close our side of every live session with this peer so
-                    // the phone sees the link actually go down (a DISCONNECT
-                    // frame alone leaves the vendor UI at "Connected").
-                    let killers = SESSION_KILLERS
-                        .lock()
-                        .map(|m| m.get(&ip).cloned().unwrap_or_default())
-                        .unwrap_or_default();
-                    let mut closed = 0usize;
-                    for h in killers {
-                        if !h.is_finished() {
-                            h.abort();
-                            closed += 1;
-                        }
-                    }
-                    emit_device("epi", ip.clone(), None, false);
-                    tracing::info!(
-                        "[cmd] disconnect {ip}: DISCONNECT pushed to {sent} sink(s), {closed} session(s) closed"
-                    );
-                }
-                Command::RpcConnect { ip } => {
-                    let ip = resolve_phone_ip(&ip);
-                    tokio::spawn(async move {
-                        for (label, wire) in crate::scpc::rpc_frames(&ip) {
-                            let mut sent = 0usize;
-                            for (k, tx) in EPI_SINKS.lock().await.iter() {
-                                if k.contains("46888") && tx.send(wire.clone()).is_ok() {
-                                    sent += 1;
-                                }
-                            }
-                            tracing::info!("[cmd] rpc {label}: pushed to {sent} sink(s)");
-                            if sent == 0 {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                        }
-                    });
-                }
-                Command::KmsBootstrap { ip } => {
-                    let from =
-                        std::env::var("LINK_DET_PEER").unwrap_or_else(|_| "A1B2C3D4E5F6".into());
-                    let to = std::env::var("LINK_KPD")
-                        .ok()
-                        .and_then(|s| s.split(',').next().map(str::to_string))
-                        .unwrap_or_else(|| "0123456789AB".into());
-                    match kms_bootstrap_frame(kms_port, &kms_pwd, &local_ip, &from, &to) {
-                        Ok(frame) => {
-                            let mut sent = 0usize;
-                            for (k, tx) in EPI_SINKS.lock().await.iter() {
-                                if k.contains("46888") && tx.send(frame.clone()).is_ok() {
-                                    sent += 1;
-                                }
-                            }
-                            if sent == 0 {
-                                tracing::info!(
-                                    "[cmd] kms bootstrap {ip}: no live :46888 sink (frame {}B dropped)",
-                                    frame.len()
-                                );
-                            } else {
-                                record(
-                                    &std::env::var("LPLUS_LOG").unwrap_or_default(),
-                                    "cmd-kms-bootstrap",
-                                    &frame,
-                                );
-                                tracing::info!(
-                                    "[cmd] kms bootstrap {ip}: pushed {}B to {sent} sink(s)",
-                                    frame.len()
-                                );
-                            }
-                        }
-                        Err(e) => tracing::warn!("[cmd] kms bootstrap {ip} build FAILED: {e:#}"),
-                    }
-                }
-                Command::SendFrame { key_substr, hex } => match hex::decode(hex.trim()) {
-                    Ok(bytes) => {
-                        let mut sent = 0usize;
-                        for (k, tx) in EPI_SINKS.lock().await.iter() {
-                            if k.contains(&key_substr) && tx.send(bytes.clone()).is_ok() {
-                                sent += 1;
-                            }
-                        }
-                        tracing::info!(
-                            "[cmd] send {key_substr:?}: {sent} sink(s) {}B",
-                            bytes.len()
-                        );
-                    }
-                    Err(e) => tracing::info!("[cmd] send {key_substr:?} bad hex: {e}"),
-                },
-            }
-        }
-    });
 }
 
 /// "ip:port" Display value -> host part.
@@ -851,46 +677,6 @@ pub(crate) fn emit_device(kind: &'static str, ip: String, name: Option<String>, 
         name,
         connected,
         ts_ms,
-    });
-}
-
-/// NDJSON bridge for `LPLUS_EVENTS_PORT`: one DeviceEvent JSON per line to
-/// every loopback subscriber. Lets a sidecar (not just in-proc) consume.
-pub fn spawn_events_bridge() {
-    let Ok(ps) = std::env::var("LPLUS_EVENTS_PORT") else {
-        return;
-    };
-    let Ok(port) = ps.parse::<u16>() else {
-        tracing::info!("[events] bad LPLUS_EVENTS_PORT={ps}");
-        return;
-    };
-    tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await else {
-            tracing::warn!("[events] bind :{port} failed");
-            return;
-        };
-        tracing::info!("[events] NDJSON bridge :{port}");
-        loop {
-            let Ok((mut sock, _)) = l.accept().await else {
-                continue;
-            };
-            let mut rx = subscribe_devices();
-            tokio::spawn(async move {
-                while let Ok(ev) = rx.recv().await {
-                    let Ok(line) = serde_json::to_string(&ev) else {
-                        continue;
-                    };
-                    if sock
-                        .write_all(format!("{line}\n").as_bytes())
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-        }
     });
 }
 
@@ -916,7 +702,7 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
     // The engine dials the announced port *and* port+1 (TcpManager connects
     // socketPort+1 after the SCP channel request), plus probes the SDP port
     // itself; listen on all of them and log every session.
-    let mut tcp_ports: Vec<u16> = Vec::new();
+    let mut scp_ports: Vec<u16> = Vec::new();
     for p in [
         cfg.csp,
         cfg.csp.wrapping_add(1),
@@ -924,78 +710,34 @@ pub async fn run(mut cfg: SdpdConfig) -> Result<()> {
         cfg.uni_port.wrapping_add(1),
         cfg.sdp_port,
         cfg.sdp_port.wrapping_add(1),
-        // datatrans channel dial list, ee.a.f6613c: the phone's
-        // TcpSocketConnectionImpl connects here after SCP; refusal → -1110.
-        46888u16,
-        47888,
-        48888,
     ] {
-        if !tcp_ports.contains(&p) {
-            tcp_ports.push(p);
+        if !scp_ports.contains(&p) {
+            scp_ports.push(p);
         }
     }
     let log_path = cfg.log_path.clone();
-    spawn_events_bridge();
-    {
-        let kms_port = std::env::var("KMS_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(36863u16);
-        let kms_pwd = std::env::var("KMS_PWD").unwrap_or_else(|_| "lplus-kms-pw".into());
-        spawn_command_runner(cfg.name.clone(), kms_pwd, cfg.vip.clone(), kms_port);
-    }
-    if std::env::var("KMS").is_ok() {
-        let port = std::env::var("KMS_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(36863u16);
-        let pwd = std::env::var("KMS_PWD").unwrap_or_else(|_| "lplus-kms-pw".into());
-        crate::kms::spawn_server(port, pwd, log_path.clone());
-    }
-    if std::env::var("ODMF_SINK").is_ok() {
-        let listen: std::net::SocketAddr = std::env::var("ODMF_LISTEN")
-            .unwrap_or_else(|_| "0.0.0.0:7236".into())
-            .parse()
-            .unwrap_or(([0, 0, 0, 0], 7236).into());
-        let out = std::env::var("ODMF_OUT").unwrap_or_else(|_| "../capture".into());
-        let respond = std::env::var("ODMF_RESPOND")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        crate::wfd_sink::spawn(listen, out, respond);
-    }
     let probe_reg = std::sync::Arc::new(render("REGISTER * HTTP/1.1", &cfg, &[]).into_bytes());
     let dev_name = cfg.name.clone();
-    for &p in &tcp_ports {
-        let listener = TcpListener::bind(("0.0.0.0", p))
-            .await
-            .with_context(|| format!("tcp bind :{p}"))?;
-        let log_path = log_path.clone();
-        let dev_name = dev_name.clone();
-        let probe_reg = probe_reg.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((sock, peer)) = listener.accept().await {
-                    tracing::info!("[tcp] accept :{p} <- {peer}");
-                    let epi = std::env::var("EPI").is_ok() && matches!(p, 46888 | 47888 | 48888);
-                    spawn_session_logger(
-                        sock,
-                        peer,
-                        log_path.clone(),
-                        dev_name.clone(),
-                        probe_reg.as_ref().clone(),
-                        epi,
-                        p,
-                    );
-                }
-            }
-        });
-    }
+    scp_server::bind_sessions(
+        &scp_ports,
+        log_path.clone(),
+        dev_name.clone(),
+        probe_reg.clone(),
+    )
+    .await?;
+    epi::bind_sessions(
+        &[46888u16, 47888, 48888],
+        log_path.clone(),
+        dev_name.clone(),
+        probe_reg,
+    )
+    .await?;
     tracing::info!(
-        "sdpd up: :{} (mcast {}) :{} (uni) tcp{:?}",
+        "sdp up: :{} (mcast {}) :{} (uni) tcp{:?} epi[46888,47888,48888]",
         cfg.sdp_port,
         cfg.group,
         cfg.uni_port,
-        tcp_ports
+        scp_ports
     );
 
     let cfg = std::sync::Arc::new(cfg);
@@ -1350,7 +1092,7 @@ enum RespVariant {
     Other(String),
 }
 
-fn spawn_session_logger(
+pub(crate) fn spawn_session_logger(
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
     path: String,
@@ -1456,7 +1198,10 @@ fn spawn_session_logger(
                 let mut last_ev = tokio::time::Instant::now();
                 emit_device("epi", event_host(&peer), None, true);
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                EPI_SINKS.lock().await.insert(inject_key.clone(), tx);
+                crate::svc::epi::EPI_SINKS
+                    .lock()
+                    .await
+                    .insert(inject_key.clone(), tx);
                 let mut inject_rx = Some(rx);
                 // Expected rc_2 = s(ksc, qc, ts) for the pending AUTH_CONFIRM.
                 let mut expect_rc2: Option<[u8; 8]> = None;
@@ -1568,7 +1313,7 @@ fn spawn_session_logger(
                     };
                     match rd {
                         Ok(0) | Err(_) => {
-                            EPI_SINKS.lock().await.remove(&inject_key);
+                            crate::svc::epi::EPI_SINKS.lock().await.remove(&inject_key);
                             emit_device("epi", event_host(&peer), None, false);
                             break;
                         }
@@ -1708,13 +1453,13 @@ fn spawn_session_logger(
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_millis() as u64)
                                         .unwrap_or(1);
-                                    let json = crate::kms::dbs_topic_sync_json(
+                                    let json = crate::svc::kms::dbs_topic_sync_json(
                                         &hex::encode(ours6),
                                         &hex::encode(phone6),
                                         &["Oplus_PcConnect"],
                                         seq,
                                     );
-                                    let f = crate::kms::dbs_data_frame(
+                                    let f = crate::svc::kms::dbs_data_frame(
                                         &ours6,
                                         &phone6,
                                         seq,
@@ -2049,7 +1794,7 @@ fn spawn_session_logger(
             // the phone keeps the :46888 link half-open — PTC then refuses
             // new connects ("device Connected, Scan results are not
             // processed") while our panel already shows disconnected.
-            if let Ok(mut m) = SESSION_KILLERS.lock() {
+            if let Ok(mut m) = crate::svc::epi::SESSION_KILLERS.lock() {
                 let v = m.entry(event_host(&peer)).or_default();
                 v.retain(|h| !h.is_finished());
                 v.push(epi_session.abort_handle());
@@ -3199,7 +2944,7 @@ fn spawn_session_logger(
             }
         }
     });
-    if let Ok(mut m) = SESSION_KILLERS.lock() {
+    if let Ok(mut m) = crate::svc::epi::SESSION_KILLERS.lock() {
         let v = m.entry(session_ip.clone()).or_default();
         v.retain(|h| !h.is_finished());
         v.push(task.abort_handle());
@@ -3417,7 +3162,7 @@ mod tests {
         let from = [1u8, 2, 3, 4, 5, 6];
         let to = [7u8, 8, 9, 10, 11, 12];
         let json = "{\"dbs_msg_type\":\"msg_topic_sync\",\"dbs_msg_id\":\"x\"}";
-        let frame = crate::kms::dbs_data_frame(&from, &to, 7, 0x1001, json.as_bytes());
+        let frame = crate::svc::kms::dbs_data_frame(&from, &to, 7, 0x1001, json.as_bytes());
         let payload = &frame[4..];
         let v = dbs_payload_json(payload).expect("our own frame parses");
         assert_eq!(v["dbs_msg_type"], "msg_topic_sync");
@@ -3429,7 +3174,7 @@ mod tests {
 
     #[test]
     fn topic_sync_json_carries_sub_list_and_type() {
-        let j = crate::kms::dbs_topic_sync_json("aabb", "ccdd", &["Oplus_PcConnect"], 5);
+        let j = crate::svc::kms::dbs_topic_sync_json("aabb", "ccdd", &["Oplus_PcConnect"], 5);
         assert!(j.contains(r#""dbs_msg_type":"msg_topic_sync""#));
         assert!(j.contains(r#""sub":["Oplus_PcConnect"]"#));
         assert!(j.contains(r#""dbs_msg_from_device":"aabb""#));

@@ -33,7 +33,7 @@ fn load_host_name() -> String {
             .ok()
             .and_then(|raw| parse_host_name(&raw));
         pinned
-            .or_else(crate::sdpd::system_hostname)
+            .or_else(crate::svc::sdp::system_hostname)
             .unwrap_or_else(|| "L+ PC".into())
     }
     #[cfg(test)]

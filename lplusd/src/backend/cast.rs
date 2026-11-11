@@ -106,8 +106,8 @@ pub fn dbs_frame(key: &str, value_json: &str, seq: u64) -> Vec<u8> {
     let from_hex = hex::encode_upper(from6);
     let to_hex = hex::encode_upper(to6);
     let jsons =
-        crate::kms::dbs_message_json("Oplus_Cast", &from_hex, &to_hex, key, value_json, seq);
-    crate::kms::dbs_data_frame(&from6, &to6, seq, TID, jsons.as_bytes())
+        crate::svc::kms::dbs_message_json("Oplus_Cast", &from_hex, &to_hex, key, value_json, seq);
+    crate::svc::kms::dbs_data_frame(&from6, &to6, seq, TID, jsons.as_bytes())
 }
 
 fn now_ms() -> u64 {
@@ -136,11 +136,11 @@ fn next_seq() -> u64 {
 }
 
 /// Push one DbsMessage key/value onto the live :46888 session through the
-/// backend's [`crate::sdpd::Command::SendFrame`] broadcast. Returns the
+/// backend's [`crate::svc::epi::Command::SendFrame`] broadcast. Returns the
 /// frame bytes and whether the command was accepted by the backend channel.
 pub fn push_value(key: &str, value_json: &str) -> (Vec<u8>, bool) {
     let frame = dbs_frame(key, value_json, next_seq());
-    let queued = crate::sdpd::send_command(crate::sdpd::Command::SendFrame {
+    let queued = crate::svc::epi::send_command(crate::svc::epi::Command::SendFrame {
         key_substr: CAST_SINK_SUBSTR.to_string(),
         hex: hex::encode(&frame),
     });
@@ -197,7 +197,7 @@ pub fn odmf_start() -> OdmfStartResult {
     };
     let n = next_seq();
     let id = general_purpose::STANDARD.encode(format!("lplus-pc-{n}"));
-    let server_ip = crate::sdpd::default_vip();
+    let server_ip = crate::svc::sdp::default_vip();
     let auth = json!({ "id": id, "public_key": raw.trim(), "auth_version": 1 }).to_string();
     // The sink must echo exactly this id (the phone compares raw bytes in
     // SigIdentityAuthHelper), so persist it for OdmfAuth::load()'s per-auth
@@ -214,7 +214,7 @@ pub fn odmf_start() -> OdmfStartResult {
         id: Some(id),
         pushes: Some(2),
         queued: vec![q1, q2],
-        // The sink the phone will dial (what the GUI shows under the
+        // The sink the phone will dial (what clients show under the
         // mirroring toggle; `env_or` mirrors the sink's own defaults).
         listen: Some(env_or("ODMF_LISTEN", "0.0.0.0:7236")),
         rtp_port: Some(env_or("ODMF_RTP_PORT", "15550")),
@@ -270,7 +270,7 @@ pub fn status() -> LplusStatus {
     let out = out_dir();
     LplusStatus {
         ok: true,
-        backend_up: crate::gui::backend_up(),
+        backend_up: crate::backend::backend_up(),
         kms_listening: tcp_probe(kms_port()),
         odmf: Some(OdmfInfo {
             enabled: env_flag("ODMF_SINK"),

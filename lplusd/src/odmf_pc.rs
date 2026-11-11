@@ -11,7 +11,7 @@
 //! answers and pushes RTP. We play that PC role with `str0m` (pure-Rust
 //! ICE/DTLS/SRTP), sealing frames exactly like the phone seals under the
 //! media key adopted from our `AuthSuccess`
-//! ([`crate::wfd_sink::encrypt_frame`]).
+//! ([`crate::svc::wfd::encrypt_frame`]).
 //!
 //! Topology: sink sessions own the TCP signaling sockets; this task owns
 //! one UDP socket (the advertised RTP port) for ICE/DTLS/SRTP and drives
@@ -117,7 +117,7 @@ fn ensure_task() {
         let (tx, rx) = unbounded_channel::<PcEvent>();
         let _ = PC_CTL.set(tx);
         let rtp_port: u16 = env_or("ODMF_RTP_PORT", "15550").parse().unwrap_or(15550);
-        let pc_ip: IpAddr = crate::sdpd::default_vip()
+        let pc_ip: IpAddr = crate::svc::sdp::default_vip()
             .parse()
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let out_path = env_or("ODMF_VIDEO_OUT", "../../capture/video_odmf.h265");
@@ -204,7 +204,7 @@ async fn run(mut rx: UnboundedReceiver<PcEvent>, pc_ip: IpAddr, rtp_port: u16, o
     let mut consult_tx: u32 = 0;
     let mut rebuilds: u32 = 0;
     let mut connected_at: Option<tokio::time::Instant> = None;
-    let mut depkt = crate::wfd_sink::H265Depacketizer::default();
+    let mut depkt = crate::svc::wfd::H265Depacketizer::default();
     let mut out: Option<FrameSink> = None;
     let mut rtp_count: u64 = 0;
     let mut buf = vec![0u8; 2048];
@@ -246,7 +246,7 @@ async fn run(mut rx: UnboundedReceiver<PcEvent>, pc_ip: IpAddr, rtp_port: u16, o
             consult_tx = 0;
             connected_at = None;
             out = None;
-            depkt = crate::wfd_sink::H265Depacketizer::default();
+            depkt = crate::svc::wfd::H265Depacketizer::default();
             last_offer = tokio::time::Instant::now() - tokio::time::Duration::from_secs(9);
         }};
     }
@@ -399,7 +399,7 @@ async fn run(mut rx: UnboundedReceiver<PcEvent>, pc_ip: IpAddr, rtp_port: u16, o
 struct DrainCtx<'a> {
     udp: &'a Arc<tokio::net::UdpSocket>,
     next_timeout: &'a mut tokio::time::Instant,
-    depkt: &'a mut crate::wfd_sink::H265Depacketizer,
+    depkt: &'a mut crate::svc::wfd::H265Depacketizer,
     out: &'a mut Option<FrameSink>,
     rtp_count: &'a mut u64,
     out_path: &'a str,

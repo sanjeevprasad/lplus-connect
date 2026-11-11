@@ -2,18 +2,20 @@
 //!
 //! Pairs with the phone using stock UKEY2, answers the pantaconnect LAN SDP
 //! plane, serves the EPI/datatrans + KMS lanes, and — as the product entry —
-//! runs the daemon in-process and opens the GPUI "L+ connect" window
-//! (see `GUI.md` for the vendored-renderer seam and the IPC registry).
+//! runs the daemon plus the loopback gRPC contract server
+//! (see `lplusd/src/contract.rs`; GUI.md keeps the vendor-parity notes).
 //!
-//! * default: backend **in-process** (`sdpd::run` on a tokio runtime:
-//!   csp 10152, EPI, KMS, LINK_*, presence events bridge) **plus**
-//!   the loopback contract server (length-prefixed prost frames) and the
-//!   desktop window; the window
-//!   attaches to an already-running daemon instead of double-starting it.
-//! * `daemon` / `--headless`: the same backend with stdout logs only — the
-//!   old `lplus sdpd` UX.
-//! * dev/CI subcommands (`loopback`, `pair`, `connect`, `sdpd`, `ble`) are
-//!   kept unchanged.
+//! * default: the backend **in-process** (`sdpd::run` on a tokio runtime:
+//!   csp 10152, EPI, KMS, LINK_*, presence events bridge) **plus** the
+//!   loopback gRPC contract server (`lplusd/src/contract.rs`) — the
+//!   machine-facing control lane.
+//! * `daemon`: the same backend with stdout logs only, no contract
+//!   server — the old `lplus sdpd` UX.
+//! * dev/CI subcommands (`loopback`, `dial`, `epi`, `sdpd`, `ble`) are
+//!   the wire-capture harness: their flags carry the
+//!   vendor advertisement/handshake parameters (ns/pdid/ad/dt/adv/log)
+//!   with captured-correct defaults, so a capture run never needs a
+//!   recompile.
 //!
 //! If a foreign process holds the backend ports, startup fails loudly
 //! naming the port and the holder (`ss -ltnp`), never silently defers.
@@ -23,24 +25,19 @@
 //! is unsafe in edition 2024); each carries an `#[expect(unsafe_code)]`
 //! with its safety argument.
 //!
-//! Transport framing between lplus and the phone is still unknown; `pair`
-//! uses a 4-byte big-endian length prefix over TCP as a lplus-local
-//! convention until the real SDP transport is captured (see ../NOTES.md).
+//! The `loopback` handshake harness frames messages with a 4-byte
+//! big-endian length prefix over the duplex stream (lplus-local
+//! convention; see ../NOTES.md).
 
 #![deny(unsafe_code)]
 #![warn(clippy::all)]
 
 mod logging;
 
-// dev/CI surface kept for wire-capture work lives in `lplusd`.
-use lplusd::{ble, gui, scpc, sdpd, state, ukey2};
+use lplusd::{backend, state, svc};
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-use ukey2::{Role, Ukey2Handshake};
+use anyhow::Result;
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(
@@ -48,10 +45,6 @@ use ukey2::{Role, Ukey2Handshake};
     about = "O+ Connect Linux client: SDP/KMS/EPI backend + contract server"
 )]
 struct Cli {
-    /// Run the backend only (no contract server); same config as the
-    /// default command.
-    #[arg(long)]
-    headless: bool,
     /// Advertised device name (DN). Defaults to the settings-pinned name,
     /// else the machine hostname.
     #[arg(long, default_value_t = pc_beacon_name())]
@@ -60,63 +53,8 @@ struct Cli {
     #[arg(long, default_value_t = 10152)]
     csp: u16,
     /// Advertised VIP. Defaults to the primary interface address.
-    #[arg(long, default_value_t = sdpd::default_vip())]
+    #[arg(long, default_value_t = svc::sdp::default_vip())]
     vip: String,
-    #[command(subcommand)]
-    cmd: Option<Cmd>,
-}
-
-#[derive(Debug, Subcommand)]
-enum Cmd {
-    /// Headless backend only (no loopback server): stdout logs.
-    Daemon,
-    /// Backend + loopback contract server (attach clients on the
-    /// length-prefixed frame socket).
-    Panel,
-    /// Run both handshake roles locally to self-test crypto/framing.
-    Loopback,
-    /// Wait for a peer (the phone) on a TCP port.
-    Pair {
-        #[arg(long, default_value = "0.0.0.0:8721")]
-        listen: String,
-    },
-    /// Connect out to a peer TCP address.
-    Connect { addr: String },
-    /// PC-originated vendor-parity connect: SCP client pump to the phone's
-    /// LAN server (`addr` = `IP`, port via `SCP_DIAL_PORT`, default 10152).
-    Dial { addr: String },
-    /// PC-originated connect trigger on the EPI plane (`addr` = `IP`,
-    /// port via `EPI_DIAL_PORT`, default 46888).
-    Epi { addr: String },
-    /// pantaconnect LAN SDP responder headless (dev/CI lane; the default
-    /// command embeds the same backend).
-    Sdpd {
-        #[arg(long, default_value = "scp.device")]
-        ns: String,
-        #[arg(long, default_value = "A1B2C3D4E5F6")]
-        pdid: String,
-        #[arg(long, default_value = "696B95")]
-        ad: String,
-        #[arg(long, default_value_t = 6)]
-        dt: i32,
-        #[arg(long, default_value_t = pc_beacon_name())]
-        name: String,
-        /// TCP session port advertised as CSP (and listened on).
-        #[arg(long, default_value_t = 8080)]
-        csp: u16,
-        #[arg(long, default_value_t = sdpd::default_vip())]
-        vip: String,
-        #[arg(long, default_value = "sdp.bin")]
-        log: String,
-    },
-    /// BLE peripheral: advertise the FD70 packet, serve GATT write/notify.
-    Ble {
-        /// 13-byte FD70 service data as hex.
-        #[arg(long, default_value = "0006A1B2C3D4E5F6696B950000")]
-        adv: String,
-        #[arg(long, default_value_t = pc_beacon_name())]
-        name: String,
-    },
 }
 
 /// Primary backend config: env-driven knobs the daemon reads at run time.
@@ -215,9 +153,9 @@ fn apply_daemon_env() {
 }
 
 /// The product's `SdpdConfig` (CLI values already carry parse-time
-/// defaults: name via `pc_beacon_name`, vip via `sdpd::default_vip`).
-fn default_config(name: String, csp: u16, vip: String) -> sdpd::SdpdConfig {
-    sdpd::SdpdConfig {
+/// defaults: name via `pc_beacon_name`, vip via `svc::sdp::default_vip`).
+fn default_config(name: String, csp: u16, vip: String) -> svc::sdp::SdpdConfig {
+    svc::sdp::SdpdConfig {
         name,
         csp,
         vip,
@@ -240,11 +178,11 @@ fn settings_name(settings: &serde_json::Value) -> Option<String> {
 /// a paired identity), else the machine hostname, else the product tag.
 fn pc_beacon_name() -> String {
     settings_name(&load_settings())
-        .or_else(sdpd::system_hostname)
+        .or_else(svc::sdp::system_hostname)
         .unwrap_or_else(|| "L+ PC".into())
 }
 
-fn held_ports(cfg: &sdpd::SdpdConfig) -> Vec<String> {
+fn held_ports(cfg: &svc::sdp::SdpdConfig) -> Vec<String> {
     let mut tcp: Vec<u16> = vec![
         cfg.csp,
         cfg.csp.wrapping_add(1),
@@ -298,7 +236,7 @@ fn ss_holders(flags: &str, port: u16) -> String {
 }
 
 /// Loud startup failure: name the ports and who holds them, then exit.
-fn preflight_or_die(cfg: &sdpd::SdpdConfig) {
+fn preflight_or_die(cfg: &svc::sdp::SdpdConfig) {
     let held = held_ports(cfg);
     if held.is_empty() {
         return;
@@ -312,191 +250,13 @@ fn preflight_or_die(cfg: &sdpd::SdpdConfig) {
     std::process::exit(1);
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("tokio runtime")
-}
-
 fn main() -> Result<()> {
     let _log_guard = logging::init();
     let cli = Cli::parse();
-    match cli.cmd {
-        // ---- dev/CI lanes (unchanged UX) --------------------------------
-        Some(Cmd::Loopback) => runtime()?.block_on(loopback()),
-        Some(Cmd::Pair { listen }) => runtime()?.block_on(async move {
-            let listener = TcpListener::bind(&listen)
-                .await
-                .with_context(|| format!("bind {listen}"))?;
-            tracing::info!(
-                "responder listening on {listen} — open the O+ Connect tile on the phone"
-            );
-            let (sock, peer) = listener.accept().await.context("accept")?;
-            tracing::info!("peer connected: {peer}");
-            let (mut rd, mut wr) = sock.into_split();
-            run_handshake(Role::Responder, &mut rd, &mut wr).await
-        }),
-        Some(Cmd::Connect { addr }) => runtime()?.block_on(async move {
-            let sock = TcpStream::connect(&addr)
-                .await
-                .with_context(|| format!("connect {addr}"))?;
-            let (mut rd, mut wr) = sock.into_split();
-            run_handshake(Role::Initiator, &mut rd, &mut wr).await
-        }),
-        Some(Cmd::Dial { addr }) => runtime()?.block_on(async move {
-            let name = pc_beacon_name();
-            match scpc::dial_connect(&addr, &name).await {
-                Ok(summary) => {
-                    tracing::info!("[scpc] {addr} connect OK — {summary}");
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        }),
-        Some(Cmd::Epi { addr }) => runtime()?.block_on(async move {
-            match scpc::epi_trigger(&addr).await {
-                Ok(summary) => {
-                    tracing::info!("[epic] {addr} trigger OK — {summary}");
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        }),
-        Some(Cmd::Sdpd {
-            ns,
-            pdid,
-            ad,
-            dt,
-            name,
-            csp,
-            vip,
-            log,
-        }) => {
-            let cfg = sdpd::SdpdConfig {
-                ns,
-                pdid,
-                ad,
-                dt,
-                name,
-                csp,
-                vip,
-                log_path: log,
-                ..Default::default()
-            };
-            runtime()?.block_on(sdpd::run(cfg))
-        }
-        Some(Cmd::Ble { adv, name }) => runtime()?.block_on(ble::run(ble::BleConfig {
-            service_data_hex: adv,
-            name,
-        })),
-        // ---- product entry -------------------------------------------------
-        Some(Cmd::Daemon) => {
-            apply_daemon_env();
-            let cfg = default_config(cli.name, cli.csp, cli.vip);
-            preflight_or_die(&cfg);
-            headless(cfg)
-        }
-        Some(Cmd::Panel) => {
-            apply_daemon_env();
-            let cfg = default_config(cli.name, cli.csp, cli.vip);
-            preflight_or_die(&cfg);
-            gui::serve(cfg).map_err(|e| anyhow::anyhow!(e))
-        }
-        None => {
-            apply_daemon_env();
-            let (name, csp, vip) = (cli.name.clone(), cli.csp, cli.vip.clone());
-            let cfg = default_config(name, csp, vip);
-            product(&cli, cfg)
-        }
-    }
-}
-
-/// Default entry (`lplus`): the daemon and the contract server in one
-/// process. `--headless` runs the backend only (old `lplus sdpd` UX).
-fn product(cli: &Cli, cfg: sdpd::SdpdConfig) -> Result<()> {
+    apply_daemon_env();
+    let cfg = default_config(cli.name, cli.csp, cli.vip);
     preflight_or_die(&cfg);
-    if cli.headless {
-        headless(cfg)
-    } else {
-        gui::serve(cfg).map_err(|e| anyhow::anyhow!(e))
-    }
-}
-
-/// `--headless`: the backend alone with stdout logs (old `lplus sdpd`
-/// UX). Presence events mirror to stdout as `[presence] event …` lines.
-fn headless(cfg: sdpd::SdpdConfig) -> Result<()> {
-    gui::devices::init();
-    runtime()?.block_on(async move {
-        let mut rx = sdpd::subscribe_devices();
-        tokio::spawn(async move {
-            while let Ok(ev) = rx.recv().await {
-                gui::devices::log_presence(&ev);
-            }
-        });
-        sdpd::run(cfg).await
-    })
-}
-
-/// Drive the handshake over an established stream until auth strings match.
-pub(crate) async fn run_handshake<R, W>(role: Role, rd: &mut R, wr: &mut W) -> Result<()>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let mut hs = Ukey2Handshake::new(role);
-    loop {
-        if let Some(msg) = hs.next_message() {
-            write_msg(wr, &msg).await?;
-            continue;
-        }
-        if hs.is_complete() {
-            break;
-        }
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(60), read_msg(rd))
-            .await
-            .context("peer timeout")??;
-        hs.parse(&msg).context("parse peer message")?;
-    }
-    let auth = hs.auth_string()?;
-    tracing::info!("AUTH (hex): {}", hex::encode(&auth));
-    tracing::info!(
-        "AUTH (6-digit): {}",
-        u32::from_be_bytes(auth[0..4].try_into()?) % 1_000_000
-    );
-    let ctx = hs.to_connection_context()?;
-    tracing::info!(
-        "session keys derived; saved blob {} bytes",
-        ctx.save_session().len()
-    );
-    Ok(())
-}
-
-async fn write_msg<W: AsyncWriteExt + Unpin>(wr: &mut W, msg: &[u8]) -> Result<()> {
-    wr.write_u32(msg.len() as u32).await?;
-    wr.write_all(msg).await?;
-    wr.flush().await?;
-    Ok(())
-}
-
-async fn read_msg<R: AsyncReadExt + Unpin>(rd: &mut R) -> Result<Vec<u8>> {
-    let n = rd.read_u32().await? as usize;
-    let mut buf = vec![0u8; n];
-    rd.read_exact(&mut buf).await?;
-    Ok(buf)
-}
-
-/// Both roles over a duplex pipe in one process.
-async fn loopback() -> Result<()> {
-    let (a, b) = tokio::io::duplex(4096);
-    let (mut a_r, mut a_w) = tokio::io::split(a);
-    let (mut b_r, mut b_w) = tokio::io::split(b);
-    let ini = tokio::spawn(async move { run_handshake(Role::Initiator, &mut a_r, &mut a_w).await });
-    let res = tokio::spawn(async move { run_handshake(Role::Responder, &mut b_r, &mut b_w).await });
-    ini.await.context("initiator join")??;
-    res.await.context("responder join")??;
-    tracing::info!("loopback handshake ok");
-    Ok(())
+    backend::serve(cfg).map_err(|e| anyhow::anyhow!(e))
 }
 
 #[cfg(test)]
@@ -504,19 +264,10 @@ mod cli_tests {
     use super::*;
 
     #[test]
-    fn default_command_is_product_entry() {
-        let cli = Cli::try_parse_from(["lplus"]).unwrap();
-        assert!(cli.cmd.is_none());
-        assert!(!cli.headless);
+    fn bare_invocation_is_the_product_entry() {
         // name/vip/csp carry parse-time defaults.
+        let cli = Cli::try_parse_from(["lplus"]).unwrap();
         assert!(!cli.name.is_empty() && !cli.vip.is_empty() && cli.csp == 10152);
-    }
-
-    #[test]
-    fn headless_flag_runs_backend_only() {
-        let cli = Cli::try_parse_from(["lplus", "--headless"]).unwrap();
-        assert!(cli.headless);
-        assert!(cli.cmd.is_none());
     }
 
     #[test]
@@ -552,15 +303,22 @@ mod cli_tests {
     }
 
     #[test]
-    fn sdpd_subcommand_still_parses() {
-        let cli =
-            Cli::try_parse_from(["lplus", "sdpd", "--csp", "10152", "--log", "x.bin"]).unwrap();
-        match cli.cmd.unwrap() {
-            Cmd::Sdpd { csp, log, .. } => {
-                assert_eq!(csp, 10152);
-                assert_eq!(log, "x.bin");
-            }
-            other => panic!("unexpected subcommand: {other:?}"),
+    fn no_subcommands_remain() {
+        // `lplus` takes no commands: every machine-facing knob is an rpc
+        // of `service Lplusd`, so the CLI must not regrow dev lanes or a
+        // headless subcommand.
+        for argv in [
+            ["lplus", "daemon"].as_slice(),
+            ["lplus", "sdpd"].as_slice(),
+            ["lplus", "ble"].as_slice(),
+            ["lplus", "dial", "192.0.2.1"].as_slice(),
+            ["lplus", "epi", "192.0.2.1"].as_slice(),
+            ["lplus", "loopback"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{argv:?} must not parse"
+            );
         }
     }
 
@@ -612,6 +370,6 @@ mod cli_tests {
         assert_eq!(settings_name(&serde_json::json!({})), None);
         // On this CI box the kernel hostname file exists, so the no-CLI
         // chain must resolve rather than fall through to the tag.
-        assert!(sdpd::system_hostname().is_some());
+        assert!(svc::sdp::system_hostname().is_some());
     }
 }

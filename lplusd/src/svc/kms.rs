@@ -300,7 +300,7 @@ pub fn dbs_data_frame(from6: &[u8; 6], to6: &[u8; 6], seq: u64, tid: u16, json: 
 /// bootstrap (`kms_socket_port`). Frames: 24 B header + body; encrypted
 /// bodies decrypt under `password`. Answers HEARTBEAT_REQ with RESP. Each
 /// session registers an injection sink under `"{port} {peer}"`, so
-/// [`crate::sdpd::Command::SendFrame`] can write sealed frames (e.g.
+/// [`crate::svc::epi::Command::SendFrame`] can write sealed frames (e.g.
 /// event-3 INJECT_REQ via [`seal_frame`]) without a reconnect.
 pub fn spawn_server(port: u16, password: String, log_path: String) {
     tokio::spawn(async move {
@@ -319,14 +319,14 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                 continue;
             };
             tracing::info!("[kms] phone connected {peer}");
-            crate::sdpd::emit_device("kms", peer.ip().to_string(), None, true);
+            crate::svc::sdp::emit_device("kms", peer.ip().to_string(), None, true);
             let pw = password.clone();
             let lp = log_path.clone();
             tokio::spawn(async move {
                 let mut seq = 1i32;
                 let inject_key = format!("{port} {peer}");
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                crate::sdpd::EPI_SINKS
+                crate::svc::epi::EPI_SINKS
                     .lock()
                     .await
                     .insert(inject_key.clone(), tx);
@@ -346,7 +346,7 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                                 match b {
                                     Some(bytes) => {
                                         let _ = sock.write_all(&bytes).await;
-                                        crate::sdpd::record(&lp, &format!("inject-sent {inject_key}"), &bytes);
+                                        crate::svc::sdp::record(&lp, &format!("inject-sent {inject_key}"), &bytes);
                                         tracing::info!(
                                             "[inject] -> {inject_key} {}B {}",
                                             bytes.len(),
@@ -369,7 +369,12 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                             acc.extend_from_slice(&tmp[..n]);
                             if last_ev.elapsed() >= std::time::Duration::from_secs(60) {
                                 last_ev = tokio::time::Instant::now();
-                                crate::sdpd::emit_device("kms", peer.ip().to_string(), None, true);
+                                crate::svc::sdp::emit_device(
+                                    "kms",
+                                    peer.ip().to_string(),
+                                    None,
+                                    true,
+                                );
                             }
                         }
                     }
@@ -380,7 +385,7 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                         }
                         let Ok(hdr) = KmsHeader::decode(&<[u8; 24]>::try_from(&acc[..24]).unwrap())
                         else {
-                            crate::sdpd::record(&lp, &format!("kms-badhdr {peer}"), &acc[..24]);
+                            crate::svc::sdp::record(&lp, &format!("kms-badhdr {peer}"), &acc[..24]);
                             tracing::info!("[kms] {peer} bad header {}", hex::encode(&acc[..24]));
                             acc.clear();
                             break 'read;
@@ -396,7 +401,7 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                         }
                         let body = acc[24..24 + want].to_vec();
                         acc.drain(..24 + want);
-                        crate::sdpd::record(
+                        crate::svc::sdp::record(
                             &lp,
                             &format!("kms-recv {peer} ev{}", hdr.event_type),
                             &body,
@@ -435,14 +440,18 @@ pub fn spawn_server(port: u16, password: String, log_path: String) {
                             )
                             .unwrap_or_else(|_| Vec::new());
                             if !wire.is_empty() {
-                                crate::sdpd::record(&lp, &format!("kms-send {peer} ev5"), &wire);
+                                crate::svc::sdp::record(
+                                    &lp,
+                                    &format!("kms-send {peer} ev5"),
+                                    &wire,
+                                );
                                 let _ = sock.write_all(&wire).await;
                             }
                         }
                     }
                 }
-                crate::sdpd::EPI_SINKS.lock().await.remove(&inject_key);
-                crate::sdpd::emit_device("kms", peer.ip().to_string(), None, false);
+                crate::svc::epi::EPI_SINKS.lock().await.remove(&inject_key);
+                crate::svc::sdp::emit_device("kms", peer.ip().to_string(), None, false);
                 tracing::info!("[kms] {peer} closed");
             });
         }

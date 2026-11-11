@@ -31,7 +31,7 @@ use strum::EnumString;
 
 use serde::Deserialize;
 
-use crate::sdpd::DeviceEvent;
+use crate::svc::sdp::DeviceEvent;
 
 /// Rows with no event for this long are dropped.
 const ROW_TTL_SECS: u64 = 5 * 60;
@@ -42,7 +42,7 @@ const DISCOVERED_WINDOW_SECS: u64 = 120;
 /// events update `last_seen` alone, so accessory chatter can no longer
 /// keep a dead session looking alive). Silence beyond this clears the flag.
 /// Phones that vanish without a TCP FIN never deliver the close event, so
-/// without this the GUI keeps claiming Connected forever.
+/// without this clients keep claiming Connected forever.
 const CONN_STALE_SECS: u64 = 120;
 const BRIDGE_RETRY: Duration = Duration::from_secs(2);
 
@@ -51,7 +51,7 @@ const BRIDGE_RETRY: Duration = Duration::from_secs(2);
 fn local_ips() -> &'static std::collections::HashSet<String> {
     static LOCALS: LazyLock<std::collections::HashSet<String>> = LazyLock::new(|| {
         let mut set = std::collections::HashSet::new();
-        set.insert(crate::sdpd::default_vip());
+        set.insert(crate::svc::sdp::default_vip());
         if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
             && sock.connect(("8.8.8.8", 80)).is_ok()
             && let Ok(addr) = sock.local_addr()
@@ -70,10 +70,10 @@ fn is_local(ip: &str) -> bool {
 /// One card row, shaped to what mydevice/`devicesList` consumers read —
 /// the generated contract type (`lplus_ipc::pb::Device`, from
 /// `protos/lplus.proto`), re-exported so in-crate callers keep saying
-/// `crate::gui::devices::Device`.
+/// `crate::backend::devices::Device`.
 pub use lplus_ipc::pb::Device;
 
-/// NDJSON wire form of `crate::sdpd::DeviceEvent` for external-bridge
+/// NDJSON wire form of `crate::svc::sdp::DeviceEvent` for external-bridge
 /// subscribers. (The backend type derives `Serialize` only; this mirror
 /// parses the same JSON that `spawn_events_bridge` writes.)
 #[derive(Deserialize)]
@@ -298,9 +298,9 @@ fn init_inner() {
         rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         i.paired_saved = serde_json::to_string_pretty(&rows).unwrap_or_default();
     }
-    let mut rx = crate::sdpd::subscribe_devices();
+    let mut rx = crate::svc::sdp::subscribe_devices();
     // Own thread + tiny current-thread runtime: presence ingest must not
-    // depend on the GUI runtime being up.
+    // depend on a UI runtime being up.
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -703,7 +703,7 @@ mod tests {
         let mut i = Inner::default();
         // Same resolver the production LOCALS set uses, so the row lands
         // on the host side regardless of the machine this runs on.
-        let vip = crate::sdpd::default_vip();
+        let vip = crate::svc::sdp::default_vip();
         ev(&mut i, "epi", &vip, None, true);
         ev(&mut i, "scp_sync", "127.0.0.1", Some("CPH2745"), true);
         assert!(visible_rows(&mut i).is_empty());

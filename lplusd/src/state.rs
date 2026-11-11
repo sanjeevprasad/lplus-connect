@@ -17,7 +17,7 @@ pub fn state_dir() -> PathBuf {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
         _ => directories::ProjectDirs::from("", "", "lplus")
             .map(|p| p.config_dir().to_path_buf())
-            .unwrap_or_else(crate::gui::cast::out_dir),
+            .unwrap_or_else(crate::backend::cast::out_dir),
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("[state] cannot create {}: {e}", dir.display());
@@ -30,7 +30,7 @@ pub fn state_dir() -> PathBuf {
 fn state_file(new: &str, legacy: &str) -> PathBuf {
     let path = state_dir().join(new);
     if !path.exists() {
-        let old = crate::gui::cast::out_dir().join(legacy);
+        let old = crate::backend::cast::out_dir().join(legacy);
         if old != path && old.exists() {
             match std::fs::copy(&old, &path) {
                 Ok(_) => tracing::info!("[state] migrated {legacy} -> {}", path.display()),

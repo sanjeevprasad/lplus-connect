@@ -17,7 +17,7 @@ pub fn set_host_name(name: &str) -> pb::SetHostNameResult {
             error: Some("missing name".into()),
         };
     }
-    crate::gui::ipc::set_host_name(&clean);
+    crate::backend::ipc::set_host_name(&clean);
     pb::SetHostNameResult {
         ok: true,
         name: Some(clean),
@@ -28,7 +28,7 @@ pub fn set_host_name(name: &str) -> pb::SetHostNameResult {
 /// Persistent pairing bonds from the row table (scp_sync / authorized
 /// adb), as the `GetPairedDevices` response.
 pub fn paired_devices() -> pb::PairedDevices {
-    let rows = crate::gui::devices::paired_rows();
+    let rows = crate::backend::devices::paired_rows();
     pb::PairedDevices {
         ok: true,
         entries: rows
@@ -45,13 +45,13 @@ pub fn paired_devices() -> pb::PairedDevices {
 
 /// The `DeviceEvent`-fed visible device wall (`ListDevices` rpc).
 pub fn visible_rows() -> Vec<Device> {
-    crate::gui::devices::visible_device_rows()
+    crate::backend::devices::visible_device_rows()
 }
 
 /// Presence-lane probe (`SidecarStatus` rpc).
 pub fn sidecar_status() -> pb::SidecarLane {
     pb::SidecarLane {
-        running: crate::gui::backend_up(),
+        running: crate::backend::backend_up(),
         log_tailing: "in-process backend".into(),
     }
 }
@@ -60,7 +60,7 @@ pub fn sidecar_status() -> pb::SidecarLane {
 /// backend (LAN SCP dial + EPI sink push run there); the `Ack` reports
 /// the queue verdict, not the link outcome.
 pub fn device_action(connect: bool, ip: &str) -> pb::Ack {
-    use crate::sdpd::{Command, send_command};
+    use crate::svc::epi::{Command, send_command};
     if ip.is_empty() {
         return ack(false, ip, Some("missing ip"));
     }
@@ -90,7 +90,7 @@ pub fn device_action(connect: bool, ip: &str) -> pb::Ack {
 /// KMS input-link lane: push the CastMessage msg-61 bootstrap on the
 /// live :46888 session (`Command::KmsBootstrap`).
 pub fn kms_bootstrap(ip: &str) -> pb::Ack {
-    use crate::sdpd::{Command, send_command};
+    use crate::svc::epi::{Command, send_command};
     if ip.is_empty() {
         return ack(false, ip, Some("missing ip"));
     }
@@ -119,20 +119,20 @@ fn ack(ok: bool, ip: &str, error: Option<&str>) -> pb::Ack {
 mod tests {
     #[test]
     fn host_name_round_trips_and_rejects_blank() {
-        let _guard = crate::gui::ipc::HOST_TEST_LOCK
+        let _guard = crate::backend::ipc::HOST_TEST_LOCK
             .lock()
             .expect("host test lock");
-        let previous = crate::gui::ipc::host_name();
+        let previous = crate::backend::ipc::host_name();
         assert!(super::set_host_name("  boxed  ").ok, "non-blank accepted");
-        assert_eq!(crate::gui::ipc::host_name(), "boxed");
+        assert_eq!(crate::backend::ipc::host_name(), "boxed");
         let refusal = super::set_host_name("   ");
         assert!(!refusal.ok && refusal.error.is_some(), "blank rejected");
         assert_eq!(
-            crate::gui::ipc::host_name(),
+            crate::backend::ipc::host_name(),
             "boxed",
             "rejected set is a no-op"
         );
-        crate::gui::ipc::set_host_name(&previous);
+        crate::backend::ipc::set_host_name(&previous);
     }
 
     #[test]
@@ -142,7 +142,7 @@ mod tests {
                 && super::device_action(true, "").error.as_deref() == Some("missing ip"),
             "blank ip refused before the queue"
         );
-        let _rx = crate::sdpd::subscribe_commands();
+        let _rx = crate::svc::epi::subscribe_commands();
         let act = super::device_action(true, "192.0.2.11");
         assert!(act.ok, "command queues while the backend listens");
         assert_eq!(act.ip.as_deref(), Some("192.0.2.11"));

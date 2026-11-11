@@ -10,7 +10,7 @@ crate: the daemon plus the loopback contract server:
 | Member | Role |
 | --- | --- |
 | `ipc/` (`lplus-ipc`) | the backend contract: `protos/lplus.proto` — `service Lplusd` with one rpc per capability (ping, device wall, connect/disconnect/remove, identity, pairing, probes, event ring, status, cast/ODMF/KMS, sink list/inject, screencast frames), **strictly typed — no JSON carriers**, served as gRPC (`service Lplusd` over tonic/HTTP/2) on `127.0.0.1:1421`; also `Device`, the internal channel structs (`api`, the vendor phone-JSON seam), the event ring and the live-frame bus |
-| `lplusd/` (`lplusd`) | phone stack + loopback backend: `sdpd`, `scp/scpc/rpc`, `kms`, `odmf_pc/rtsp/wfd_sink`, `ble/d2d`, and the contract implementation (`lplusd/src/gui/{ipc,server,devices,cast}.rs`) |
+| `lplusd/` (`lplusd`) | phone stack + loopback backend: `sdpd`, `scp/scpc/rpc`, `kms`, `odmf_pc/rtsp/wfd_sink`, `d2d`, the backend orchestration (`lplusd/src/backend/{api,cast,devices,ipc}.rs`) and the contract implementation (`lplusd/src/contract.rs`) |
 | `.` (`lplus`) | the wiring: CLI + the product binary that starts the daemon and the contract server (`cargo run`, `daemon`, `panel`) |
 | `proto/` | the separate phone↔PC wire contract |
 
@@ -69,7 +69,7 @@ were used to drive this port (call sites, response shapes, boot order).
 
 | Concern | Solution |
 |---|---|
-| `ipcMain` side | the contract server (`lplusd/src/contract.rs`, gRPC on 127.0.0.1:1421) is the only control entry point; the webview-era channel registry in `lplusd/src/gui/ipc.rs` was cut with the parked window (the module now owns only the `settings.json` identity blob) |
+| `ipcMain` side | the contract server (`lplusd/src/contract.rs`, gRPC on 127.0.0.1:1421) is the only control entry point; the webview-era channel registry in `lplusd/src/backend/ipc.rs` was cut with the parked window (the module now owns only the `settings.json` identity blob) |
 | Renderer bus (`ipc_main_event`) | the bus arm left with the window; `GUI_BUS` today carries `devices::tick` row pushes. The ring keeps its `bus`/`log` event variants in the schema (`PollEvents`) for the revived renderer's producers |
 | Console mirror | `lplus_ipc::push_log_event` records mirrored renderer logs; the producer (the webview console bridge) returns with the window |
 | Reference bundle | `vendor/renderer` is served nowhere; the `.html`/`.js`/`.css` keep the historical `app://`→`/` rewrite so RE diffs against the asar stay line-aligned |
@@ -109,15 +109,15 @@ to add as new rpcs.
 | `generic_agent_*` (remaining ~50) | unhandled | typed unhandled + audit |
 | bus `shell_share_locale_changed`, `get_app_config_path_to_contents`, `check_if_exist_remote_device`, `note_get_sidebar_width`, `FILE_QUEUE_AVAILABLE`, `initQueue`, `update_get_update_info` | unhandled (observed on boot) | typed unhandled + audit |
 
-### 3.1 Device model (`lplusd/src/gui/devices.rs`)
+### 3.1 Device model (`lplusd/src/backend/devices.rs`)
 
 ```
 lplus backend (in-process, same binary)
-  sdpd::run(SdpdConfig csp 10152) on the GUI async runtime
+  sdpd::run(SdpdConfig csp 10152) on the backend runtime
   + KMS :36863 · events bridge :14752 · EPI lanes · contract server :1421
   DeviceEvent{kind,ip,name,connected,ts_ms}  tokio broadcast
-    ├─ subscribe_devices() ───────────►   (GUI ingest; `lplus daemon`
-    │                                      mirrors the same lines to stdout)
+    ├─ subscribe_devices() ───────────►   presence logger mirrors the
+    │                                      events to stdout
     └─ LPLUS_EVENTS_PORT=<p[,p…]> ────►   reconnection NDJSON subscribers
                                           (dev aid: follow an external
                                           daemon's bridge)
@@ -182,7 +182,7 @@ EPI sink pushes).
 
 ## 4. Verification reference
 
-- Boot (`./target/debug/lplus panel`): the log shows
+- Boot (`./target/debug/lplus`): the log shows
   `[gui] serving contract server 127.0.0.1:1421 (grpc:
   lplus.backend.v1.Lplusd)`, `[kms] listening :36863`,
   `[events] NDJSON bridge :14752`,

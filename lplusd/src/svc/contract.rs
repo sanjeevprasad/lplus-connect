@@ -74,11 +74,11 @@ fn take_frame_payload() -> Result<Vec<u8>, String> {
 
 /// Run one rpc; `Err(message)` becomes `Frame.error` on the reply.
 fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-    use crate::gui::{api, cast};
+    use crate::backend::{api, cast};
     match method {
         m::PING => Ok(pb::Pong {
             version: env!("CARGO_PKG_VERSION").into(),
-            backend_up: crate::gui::backend_up(),
+            backend_up: crate::backend::backend_up(),
         }
         .encode_to_vec()),
         m::LIST_DEVICES => Ok(pb::Devices {
@@ -101,13 +101,13 @@ fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
             // daemon keeps pairing material in one state dir today.
             let _ = c.remove_state_dir;
             Ok(pb::RemoveDeviceResult {
-                ok: crate::gui::devices::remove_device(&c.device_id),
+                ok: crate::backend::devices::remove_device(&c.device_id),
                 device_id: c.device_id,
             }
             .encode_to_vec())
         }
         m::GET_HOST_NAME => Ok(pb::HostName {
-            host_name: crate::gui::ipc::host_name(),
+            host_name: crate::backend::ipc::host_name(),
         }
         .encode_to_vec()),
         m::SET_HOST_NAME => {
@@ -150,7 +150,7 @@ fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
         m::SINK_LIST => Ok(pb::SinkRoster {
             // Non-blocking probe path; the gRPC handler awaits the
             // mutex directly (see `sink_list`).
-            keys: crate::sdpd::EPI_SINKS
+            keys: crate::svc::epi::EPI_SINKS
                 .try_lock()
                 .map(|s| s.keys().cloned().collect())
                 .unwrap_or_default(),
@@ -159,7 +159,7 @@ fn handle_method(method: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
         m::INJECT_FRAME => {
             let c = decode::<pb::InjectFrameRequest>(method, payload)?;
             let bytes = hex::decode(c.hex.trim()).map_err(|e| format!("bad hex: {e}"))?;
-            let queued = crate::sdpd::send_command(crate::sdpd::Command::SendFrame {
+            let queued = crate::svc::epi::send_command(crate::svc::epi::Command::SendFrame {
                 key_substr: c.key_substr,
                 hex: hex::encode(bytes),
             });
@@ -202,7 +202,7 @@ where
 /// (shared with the phone lanes), so it is awaited — the table above is
 /// synchronous and must stay clear of runtime-parking calls.
 async fn sink_roster_payload() -> Vec<u8> {
-    let keys = crate::sdpd::EPI_SINKS
+    let keys = crate::svc::epi::EPI_SINKS
         .lock()
         .await
         .keys()
@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn poll_events_drains_the_presence_ring() {
         let mut c = client();
-        crate::sdpd::emit_device(
+        crate::svc::sdp::emit_device(
             "epi",
             "192.0.2.210".into(),
             Some("ring-probe-phone".into()),
@@ -613,7 +613,7 @@ mod tests {
             .into_inner();
         let _ = roster.keys;
         // Keep a command subscriber alive so the queue verdict is true.
-        let _rx = crate::sdpd::subscribe_commands();
+        let _rx = crate::svc::epi::subscribe_commands();
         let ack = rt()
             .block_on(c.inject_frame(pb::InjectFrameRequest {
                 key_substr: "46888".into(),
